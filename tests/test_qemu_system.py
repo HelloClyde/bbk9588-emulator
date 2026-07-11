@@ -1941,6 +1941,7 @@ class QemuSystemCommandTests(unittest.TestCase):
             payload = Path(tmp) / "C200.bin"
             payload.write_bytes(b"\0" * 16)
             config = QemuSystemConfig(
+                executable=sys.executable,
                 monitor="none",
                 gdb="none",
                 bbk_input="none",
