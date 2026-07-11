@@ -1,7 +1,7 @@
 # BBK 9588 Emulator
 
 [![CI](https://github.com/HelloClyde/bbk9588-emulator/actions/workflows/ci.yml/badge.svg)](https://github.com/HelloClyde/bbk9588-emulator/actions/workflows/ci.yml)
-[![Release: v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue.svg)](https://github.com/HelloClyde/bbk9588-emulator/releases/tag/v0.1.0)
+[![Release](https://img.shields.io/github/v/release/HelloClyde/bbk9588-emulator?include_prereleases)](https://github.com/HelloClyde/bbk9588-emulator/releases)
 [![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](COPYING)
 
 基于 QEMU 的步步高 BBK 9588 模拟器。项目实现 JZ4740/BBK 9588 设备模型，使用原始
