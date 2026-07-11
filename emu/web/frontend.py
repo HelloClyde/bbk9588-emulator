@@ -52,6 +52,10 @@ HTML = r"""<!doctype html>
     .screen-wrap { width: 100%; min-height: 0; display: flex; justify-content: center; align-items: center; background: #08090b; border: 1px solid #343941; border-radius: 8px; padding: 12px; }
     #screen { display: block; width: min(360px, 100%); height: auto; max-height: 62vh; image-rendering: pixelated; background: #000; cursor: crosshair; touch-action: none; user-select: none; }
     #screen.landscape { width: min(560px, 100%); }
+    .fullscreen-exit { display: none; position: absolute; top: 12px; right: 12px; z-index: 2; background: rgba(32, 35, 39, .86); }
+    .screen-wrap:fullscreen, .screen-wrap:-webkit-full-screen { width: 100vw; height: 100vh; padding: 16px; border: 0; border-radius: 0; background: #000; position: relative; }
+    .screen-wrap:fullscreen #screen, .screen-wrap:-webkit-full-screen #screen { width: auto; height: auto; max-width: none; max-height: none; }
+    .screen-wrap:fullscreen .fullscreen-exit, .screen-wrap:-webkit-full-screen .fullscreen-exit { display: grid; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .panel { border: 1px solid #343941; border-radius: 8px; padding: 12px; background: #1b1e22; margin-bottom: 14px; }
     .kv { display: grid; grid-template-columns: minmax(100px, 120px) minmax(0, 1fr); gap: 5px 10px; font-size: 12px; }
@@ -150,13 +154,15 @@ HTML = r"""<!doctype html>
       </section>
     </aside>
     <main class="emulator-stage">
-      <div class="screen-toolbar" role="toolbar" aria-label="屏幕方向">
+      <div class="screen-toolbar" role="toolbar" aria-label="屏幕控制">
         <button id="rotateLeft" class="secondary icon-button" title="向左旋转 90°" aria-label="向左旋转 90°">↶</button>
         <span id="orientationLabel" class="orientation-label">180°</span>
         <button id="rotateRight" class="secondary icon-button" title="向右旋转 90°" aria-label="向右旋转 90°">↷</button>
+        <button id="toggleFullscreen" class="secondary icon-button" title="全屏" aria-label="全屏">⛶</button>
       </div>
-      <div class="screen-wrap">
+      <div id="screenWrap" class="screen-wrap">
         <canvas id="screen" width="240" height="320"></canvas>
+        <button id="exitFullscreen" class="secondary icon-button fullscreen-exit" title="退出全屏" aria-label="退出全屏">×</button>
       </div>
       <div class="device-controls">
         <div class="device-keypad" aria-label="设备按键">
@@ -216,6 +222,9 @@ const frontendInputCalibrationEl = document.getElementById('frontendInputCalibra
 const imageStatusEl = document.getElementById('imageStatus');
 const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
+const toggleFullscreenEl = document.getElementById('toggleFullscreen');
+const exitFullscreenEl = document.getElementById('exitFullscreen');
+const screenWrapEl = document.getElementById('screenWrap');
 const orientationLabelEl = document.getElementById('orientationLabel');
 const resetKeyBindingsEl = document.getElementById('resetKeyBindings');
 const gamepadStatusEl = document.getElementById('gamepadStatus');
@@ -686,6 +695,38 @@ function formatLastInput(s) {
   }
   return JSON.stringify(ev);
 }
+function currentFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+function updateFullscreenScreenSize() {
+  const active = currentFullscreenElement() === screenWrapEl;
+  toggleFullscreenEl.title = active ? '退出全屏' : '全屏';
+  toggleFullscreenEl.setAttribute('aria-label', active ? '退出全屏' : '全屏');
+  if (!active) {
+    screen.style.removeProperty('width');
+    screen.style.removeProperty('height');
+    return;
+  }
+  const availableWidth = Math.max(1, window.innerWidth - 32);
+  const availableHeight = Math.max(1, window.innerHeight - 32);
+  const scale = Math.min(availableWidth / screen.width, availableHeight / screen.height);
+  screen.style.width = `${Math.max(1, Math.floor(screen.width * scale))}px`;
+  screen.style.height = `${Math.max(1, Math.floor(screen.height * scale))}px`;
+}
+async function toggleFullscreen() {
+  try {
+    if (currentFullscreenElement()) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit) await exit.call(document);
+      return;
+    }
+    const request = screenWrapEl.requestFullscreen || screenWrapEl.webkitRequestFullscreen;
+    if (!request) throw new Error('当前浏览器不支持全屏 API');
+    await request.call(screenWrapEl);
+  } catch (err) {
+    console.error(err);
+  }
+}
 function updateOrientationControls() {
   orientationLabelEl.textContent = orientationLabels[currentOrientation] || currentOrientation;
   const disabled = pendingOrientation !== null;
@@ -807,6 +848,7 @@ function ensureScreenSize(width, height) {
     screenCtx.imageSmoothingEnabled = false;
     rawImageData = null;
   }
+  updateFullscreenScreenSize();
 }
 function reusableImageData(width, height) {
   if (!rawImageData || rawImageData.width !== width || rawImageData.height !== height) {
@@ -1033,6 +1075,15 @@ fileImportInputEl.onchange = () => {
 };
 rotateLeftEl.onclick = () => requestRotation(-1);
 rotateRightEl.onclick = () => requestRotation(1);
+toggleFullscreenEl.onclick = toggleFullscreen;
+exitFullscreenEl.onclick = toggleFullscreen;
+toggleFullscreenEl.disabled = !(
+  document.fullscreenEnabled || document.webkitFullscreenEnabled ||
+  screenWrapEl.requestFullscreen || screenWrapEl.webkitRequestFullscreen
+);
+document.addEventListener('fullscreenchange', updateFullscreenScreenSize);
+document.addEventListener('webkitfullscreenchange', updateFullscreenScreenSize);
+window.addEventListener('resize', updateFullscreenScreenSize);
 
 function loadKeyBindings() {
   const bindings = {...defaultKeyBindings};
@@ -1240,6 +1291,7 @@ window.addEventListener('keydown', ev => {
     assignCapturedBinding(keyBindings, ev.code);
     return;
   }
+  if (ev.code === 'Escape' && currentFullscreenElement() === screenWrapEl) return;
   if (isEditableTarget(ev.target)) return;
   const code = keyCodeFromKeyboard(ev);
   if (code === null || activeKeyboardKeys.has(ev.code)) return;
