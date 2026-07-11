@@ -112,6 +112,7 @@ ninja $ninjaJobs qemu-system-mipsel.exe
 $buildScript = Join-Path $BuildDir ".qemu-build-$PID.sh"
 $buildScriptPosix = Convert-ToMsysPath $buildScript
 try {
+  New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
   [System.IO.File]::WriteAllText(
     $buildScript,
     $configure.Replace("`r`n", "`n"),
