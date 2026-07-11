@@ -254,7 +254,7 @@ let currentNandDirectory = '/';
 let nandFilesBusy = false;
 const minTouchHoldMs = 180;
 const minTouchMoveIntervalMs = 1000 / 30;
-const touchMoveBackpressureMs = 100;
+const touchMoveBackpressureMs = 1000 / 30;
 const minKeyHoldMs = 100;
 const wsIdleReconnectMs = 5000;
 const keyBindingStorageKey = 'bbk9588.keyBindings.v1';
@@ -367,7 +367,7 @@ function sendTouchAt(clientX, clientY, down, phase, source = 'pointer', clamp = 
     phase,
     source,
     advance:false,
-    run:true
+    reply:false
   });
   return true;
 }
@@ -1174,7 +1174,7 @@ function sendKeyButton(btn, down, phase = '') {
     down,
     phase,
     advance:false,
-    run:true,
+    reply:false,
   });
 }
 function beginKeyButton(btn) {
@@ -1246,20 +1246,20 @@ window.addEventListener('keydown', ev => {
   ev.preventDefault();
   activeKeyboardKeys.set(ev.code, code);
   updateDeviceKeyActive(code);
-  wsSend({op:'key', code, down:true, source:'keyboard', advance:false, run:true});
+  wsSend({op:'key', code, down:true, source:'keyboard', advance:false, reply:false});
 });
 window.addEventListener('keyup', ev => {
   const code = activeKeyboardKeys.get(ev.code);
   if (code === undefined) return;
   ev.preventDefault();
   activeKeyboardKeys.delete(ev.code);
-  wsSend({op:'key', code, down:false, source:'keyboard', advance:false, run:true});
+  wsSend({op:'key', code, down:false, source:'keyboard', advance:false, reply:false});
   updateDeviceKeyActive(code);
 });
 function releaseKeyboardInputs(source = 'keyboard-blur') {
   const releasedCodes = new Set(activeKeyboardKeys.values());
   for (const code of activeKeyboardKeys.values()) {
-    wsSend({op:'key', code, down:false, source, advance:false, run:true});
+    wsSend({op:'key', code, down:false, source, advance:false, reply:false});
   }
   activeKeyboardKeys.clear();
   releasedCodes.forEach(updateDeviceKeyActive);
@@ -1297,7 +1297,7 @@ function gamepadBindingActive(gamepad, binding, wasActive) {
   return axis[2] === '+' ? value >= threshold : value <= -threshold;
 }
 function sendGamepadKey(code, down, phase) {
-  wsSend({op:'key', code, down, source:'gamepad', phase, advance:false, run:true});
+  wsSend({op:'key', code, down, source:'gamepad', phase, advance:false, reply:false});
 }
 function beginGamepadInput(sourceId, code) {
   const existing = activeGamepadInputs.get(sourceId);

@@ -5813,12 +5813,48 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="gamepadStatus"', frontend)
         self.assertIn("function readGamepads()", frontend)
         self.assertIn("window.addEventListener('pointerdown', () => { gamepadInputFocused = true; }", frontend)
+        self.assertIn("const touchMoveBackpressureMs = 1000 / 30;", frontend)
+        self.assertIn("reply:false", frontend)
         self.assertIn('self.send_header("Permissions-Policy", "gamepad=(self)")', frontend_server)
+        self.assertIn('if msg.get("reply") is False:', frontend_server)
         self.assertIn(".key-cancel { grid-column: 1; grid-row: 1 / 3; }", frontend)
         self.assertIn(".key-up { grid-column: 3; grid-row: 1; }", frontend)
         self.assertIn(".key-ok { grid-column: 5; grid-row: 1 / 3; }", frontend)
         self.assertEqual(frontend.count('class="device-key '), 6)
         self.assertEqual(frontend.count('data-binding-code="'), 6)
+
+    def test_frontend_touch_without_reply_skips_status_snapshot(self) -> None:
+        state = self._frontend_state_without_qemu(
+            argparse.Namespace(
+                frontend_input_calibration=False,
+                boot_mode="nand",
+                nand_image=None,
+                orientation="rot180",
+                frame_push_min_interval=1.0 / 30.0,
+                frame_info_min_interval=1.0,
+            )
+        )
+        backend = _FakeFrontendQemuBackend()
+        state.qemu_backend = backend  # type: ignore[assignment]
+        publisher = mock.Mock(side_effect=AssertionError("input fast path built a status snapshot"))
+        state._publish_snapshot_locked = publisher  # type: ignore[method-assign]
+
+        result = state.command(
+            {
+                "op": "touch",
+                "x": 120,
+                "y": 160,
+                "down": True,
+                "phase": "move",
+                "reply": False,
+                "run": True,
+            }
+        )
+
+        self.assertEqual(backend.touches, [(120, 160, True)])
+        self.assertEqual(set(result), {"input_accepted", "qemu_input_result"})
+        self.assertTrue(result["input_accepted"])
+        publisher.assert_not_called()
 
     def test_frontend_orientation_command_invalidates_png_cache(self) -> None:
         state = FrontendState.__new__(FrontendState)

@@ -121,6 +121,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if recorder is not None:
                     recorder(op, command_seq)
                 response = self.state.command(msg)
+                if msg.get("reply") is False:
+                    return None
                 if isinstance(response, dict):
                     response = dict(response)
                     response["_ws_op"] = op

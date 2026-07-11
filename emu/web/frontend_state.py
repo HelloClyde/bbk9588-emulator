@@ -1073,7 +1073,14 @@ class FrontendState:
             )
         return int(msg.get("x", 0)), int(msg.get("y", 0))
 
-    def key(self, code: int, down: bool = True, advance: bool | None = None) -> dict[str, object]:
+    def key(
+        self,
+        code: int,
+        down: bool = True,
+        advance: bool | None = None,
+        *,
+        include_snapshot: bool = True,
+    ) -> dict[str, object]:
         code = int(code)
         if code not in KNOWN_FRONTEND_KEY_CODES:
             return {"error": f"unknown key code {code}", "known": sorted(KNOWN_FRONTEND_KEY_CODES)}
@@ -1092,6 +1099,12 @@ class FrontendState:
             self.input_wake_count += 1
             with self.input_lock:
                 self.pending_keys.clear()
+            if not include_snapshot:
+                self._notify_frontend_activity()
+                return {
+                    "input_accepted": event["accepted"],
+                    "qemu_input_result": result,
+                }
             self._publish_snapshot_locked()
             snapshot = self.snapshot()
             snapshot["input_accepted"] = event["accepted"]
@@ -1100,7 +1113,15 @@ class FrontendState:
                 snapshot["warning"] = "advance is ignored by the QEMU process backend"
             return snapshot
 
-    def touch(self, x: int, y: int, down: bool, advance: bool | None = None) -> dict[str, object]:
+    def touch(
+        self,
+        x: int,
+        y: int,
+        down: bool,
+        advance: bool | None = None,
+        *,
+        include_snapshot: bool = True,
+    ) -> dict[str, object]:
         x = max(0, min(239, int(x)))
         y = max(0, min(319, int(y)))
         with self.lock:
@@ -1119,6 +1140,12 @@ class FrontendState:
             self.input_wake_count += 1
             with self.input_lock:
                 self.pending_touches.clear()
+            if not include_snapshot:
+                self._notify_frontend_activity()
+                return {
+                    "input_accepted": event["accepted"],
+                    "qemu_input_result": result,
+                }
             self._publish_snapshot_locked()
             snapshot = self.snapshot()
             snapshot["input_accepted"] = event["accepted"]
@@ -1285,12 +1312,14 @@ class FrontendState:
                 dedupe_blits=self._coerce_optional_bool(msg.get("dedupe_blits")) is True,
             )
         if op == "key":
+            include_snapshot = self._coerce_optional_bool(msg.get("reply")) is not False
             out = self.key(
                 int(msg.get("code", 0)),
                 self._coerce_optional_bool(msg.get("down")) is not False,
                 self._coerce_optional_bool(msg.get("advance")),
+                include_snapshot=include_snapshot,
             )
-            if self._coerce_optional_bool(msg.get("run")) is True:
+            if include_snapshot and self._coerce_optional_bool(msg.get("run")) is True:
                 run_status = self.run_start("qemu-input", 0, 0)
                 for key_name in ("input_accepted", "qemu_input_result", "warning"):
                     if key_name in out:
@@ -1298,12 +1327,14 @@ class FrontendState:
                 return run_status
             return out
         if op == "touch":
+            include_snapshot = self._coerce_optional_bool(msg.get("reply")) is not False
             x, y = self._touch_coordinates_from_message(msg)
             out = self.touch(
                 x,
                 y,
                 self._coerce_optional_bool(msg.get("down")) is not False,
                 self._coerce_optional_bool(msg.get("advance")),
+                include_snapshot=include_snapshot,
             )
             if isinstance(self.last_input_event, dict):
                 self.last_input_event["source"] = msg.get("source") or "message"
@@ -1313,7 +1344,7 @@ class FrontendState:
                     self.last_input_event["display_y"] = int(msg.get("display_y", 0))
                     self.last_input_event["display_width"] = int(msg.get("display_width", 240))
                     self.last_input_event["display_height"] = int(msg.get("display_height", 320))
-            if self._coerce_optional_bool(msg.get("run")) is True:
+            if include_snapshot and self._coerce_optional_bool(msg.get("run")) is True:
                 run_status = self.run_start("qemu-input", 0, 0)
                 for key_name in ("input_accepted", "qemu_input_result", "warning"):
                     if key_name in out:
