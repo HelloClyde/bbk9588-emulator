@@ -1,0 +1,39 @@
+# Local device dump. Keep these out of public repositories.
+/系统/
+/应用/
+
+# Build outputs and hardware probe artifacts.
+/build/
+
+# Persistent emulator runtime data.
+/runtime/
+
+# Python caches and local virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+*.egg-info/
+*.log
+
+# Binary outputs that may be generated inside the source tree.
+*.bda
+*.BDA
+*.dba
+*.DBA
+*.dlx
+*.DLX
+*.elf
+*.bin
+*.o
+*.map
+*.zip
+*.xz
+*.zst
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

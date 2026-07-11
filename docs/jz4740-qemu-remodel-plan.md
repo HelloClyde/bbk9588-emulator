@@ -1,0 +1,491 @@
+# JZ4740 手册驱动的 QEMU 改造计划
+
+本文基于当前 `bbk9588` QEMU 实现、`u_boot_9588_4740.bin` 反汇编结论，以及
+[JZ4740 Programming Manual](https://opennoah.github.io/datasheet/JZ4740_pm.pdf)
+整理后续硬件模型改造范围。
+
+本页于 2026-07-11 按当前分支和 JZ4740 Programming Manual 重新核对。勾选含义如下：
+
+- [x] 默认 `bbk9588` 路径已经实现，并有代码测试或实际启动结果支持。
+- [ ] 尚未完成；标注“部分完成”的条目不能视为最终硬件模型。
+
+## 结论摘要
+
+原计划的方向仍然正确，但“当前状态”已明显过时。当前默认路径已经能从 raw NAND
+冷启动进入系统，并且不再依赖 Python/GDB 固件 hook、QEMU C FAT16 解析或默认固件
+patch。当前版本已经具备可用的启动、显示、输入和存储路径，后续优先级改为：
+
+1. 优先让 Web/QEMU 使用可复用的持久运行 NAND，应用创建或修改的文件必须在停止、
+   Web 重启和 QEMU 冷启动后保留；测试/探针继续使用 disposable copy 隔离基准镜像。
+2. 继续补齐 AIC/I2S、板级 codec 和系统提示音验收；游戏、音乐和 host audio 基线
+   已经可用。
+3. 音频基线稳定后，将 `bbk9588.c` 按设备拆分，降低继续补硬件模型时
+   的回归风险。
+4. 再处理固件 FTL、NAND ECC、LCD mirror、PM 和 USB 等准确性与完整性工作。
+
+这只是执行顺序调整，不表示 FTL、ECC 或固定 LCD mirror 已经完成。当前兼容实现
+继续保留，以“不破坏现有可用版本”为阶段约束。
+
+| 模块 | 当前结论 |
+| --- | --- |
+| BootROM/NAND first-stage | 基本完成，真实 ECC 和完整 boot-select 仍缺失 |
+| raw NAND/EMC | raw 命令/OOB 已完成，C200 自管 FTL 运行路径已确认；掉电恢复和无需 host checkpoint 的冷启动仍未完成 |
+| INTC/TCU/WAIT | INTC、TCU 已拆为独立 QOM device；板级 wake proxy 仍需核实 |
+| LCD | 普通 LCD descriptor/IRQ 已实现，SLCD 和 mirror 收敛未完成 |
+| SADC/Touch/GPIO | 当前交互路径基本完成，板级接线仍是反向确认值 |
+| AIC/I2S/audio codec | 独立 AIC、internal codec、audio DMA、host output、游戏 WAV、音乐和静音后端回归已实现；系统提示音与外部板级 route 仍未完成 |
+| DMAC/MSC/UART/UDC/RTC/PM | CPM、DMAC 已独立；MSC 已与 raw NAND 解耦，独立可选介质、完整 PM 和剩余 DMA request 仍是缺口 |
+| Python/Web 收敛 | 默认路径已完成，旧诊断代码仍可继续删除 |
+| QEMU 文件结构 | 部分完成，AIC、INTC、CPM、DMAC 和 TCU 已独立，其他主要设备仍集中在 `bbk9588.c` |
+
+## 当前阶段优先级
+
+| 优先级 | 范围 | 阶段目标 |
+| --- | --- | --- |
+| P0 | Web/QEMU 运行时 NAND 持久化 | 应用文件跨停止、Web 重启和 QEMU 冷启动保留；显式恢复时才重建持久副本 |
+| P0 | AIC/I2S、audio DMA、codec、主机音频输出 | 系统提示音、游戏和媒体音频可播放，不卡住 guest，不依赖完成状态伪造 |
+| P1 | QEMU 设备结构拆分 | `bbk9588.c` 只保留 machine 和板级连线，各设备拥有独立 state/MMIO/IRQ/reset |
+| P2 | FTL、NAND Hamming/RS ECC、LCD mirror/SLCD | 提高存储、启动和显示的硬件真实性，保持现有镜像兼容 |
+| P3 | PM、USB、剩余 DMA corner case、旧 Python 诊断清理 | 补齐非核心场景和维护性工作 |
+
+P0 和 P1 的边界是：AIC 可以从一开始就作为独立设备新增，避免先写入大 machine
+文件再搬迁；但现有 INTC、DMAC、LCD、SADC 等设备的全面拆分安排在音频通过端到端
+验收之后。
+
+## 手册核对后的修正
+
+- BootROM 章节明确：NAND normal area 从 address `0` 开始，backup area 从
+  `0x2000` 开始，每个区域最多读取 8 KiB，成功后从 `0x80000004` 执行。当前实现
+  的核心地址和大小与此一致。
+- JZ4740 NAND ECC 是 Hamming 或 Reed-Solomon。旧计划中的“ECC/BCH”表述不准确，
+  后续不应把当前 `bch_status` 兼容命名当作真实 JZ4740 BCH 硬件。
+- INTC 的 `ICSR/ICMR/ICMSR/ICMCR/ICPR` 和 source 编号与手册第 7 章一致；
+  `ICPR` 是未屏蔽后的 pending 视图，不应由软件直接清除。
+- JZ4740 TCU 有 8 个 counter channel，旧文档中的“6 个 channel”已经删除。
+- LCD `EOF/SOF/OUF/IFU/LDD/QD`、descriptor 的 `SOFINT/EOFINT/LEN` 语义与手册
+  第 10 章一致。
+- `ADTCH` 是 2x32-bit FIFO 项，含两个 12-bit 数据和 type bit；当前 SADC FIFO
+  建模方向正确。
+- 手册第 24 章开头写 internal Boot ROM 为 8 KiB，但 memory map 又标为 4 KiB；
+  这是手册自身不一致。NAND first-stage 的“最多复制 8 KiB”在 boot sequence 和
+  NAND boot specification 中是一致的，不应把两者混为一谈。
+
+## 目标与当前边界
+
+长期目标保持不变：
+
+1. QEMU 只模拟 JZ4740 SoC、板级外设和 raw NAND 行为。
+2. loader/U-Boot/C200 自己完成 FTL、FAT、资源缓存和 UI 逻辑。
+3. Python 只负责启动、Web 前端、镜像打包、只读诊断和 QEMU 停止后的离线 NAND
+   文件维护；guest 运行时的 FTL/FAT 仍全部由 loader/U-Boot/C200 完成。
+
+主要代码位置：
+
+- `qemu/overlay/hw/mips/bbk9588.c`：machine、板级连线和当前设备主体。
+- `qemu/overlay/hw/misc/jz4740_cpm.c`：独立 JZ4740 CPM/sysctrl
+  寄存器、reset、migration 和板级 wake 配置通知。
+- `qemu/overlay/hw/dma/jz4740_dmac.c`：独立 JZ4740 DMAC channel、
+  descriptor、request、IRQ、RAM/外设搬运和 migration。
+- `qemu/overlay/hw/timer/jz4740_tcu.c`：独立 JZ4740 TCU 8-channel
+  counter、full/half compare、三组 parent IRQ、reset、migration 和诊断状态。
+- `emu/qemu/system.py`：命令构造、进程管理和只读诊断；旧 hook 代码仍保留但
+  `bbk9588` 默认路径禁用。
+- `tools/make_combined_nand.py`：构建 raw boot 区和 FAT 数据区。
+- `tools/stamp_ftl_oob.py`：离线写入当前固件能识别的 OOB FTL 标签。
+- `emu/web/frontend_state.py`：frame/input chardev、Web 状态和测试用自动校准。
+
+手册能定义 SoC 寄存器和时序契约，但不能定义 BBK 私有 FTL 标签、C200 资源格式、
+板级 GPIO 接线、触摸校准参数或 LCD panel 细节。这些仍要靠真机 dump、反汇编和
+运行 trace 确认。
+
+## 设备状态与待办
+
+### 1. BootROM 与 NAND 启动路径：基本完成
+
+已完成：
+
+- [x] 默认 `nand` 模式不预加载 `C200.bin`、U-Boot 或 `kj409588.bin` 到 RAM。
+- [x] BootROM 从 NAND address `0` 复制最多 8 KiB first-stage 到 physical `0`，
+  reset PC 为 `0x80000004`。
+- [x] normal area 擦除或 OOB valid bytes 无效时，会尝试 address `0x2000` 的
+  backup area。
+- [x] QEMU C 已删除 `bootrom-fat-kernel`、`BBKUBOOT` 解析和 FAT 内核查找。
+- [x] `make_combined_nand.py` 默认同时写 normal/backup loader；旧 `BBKUBOOT`
+  header 仅由显式 `--legacy-uboot-header` 生成。
+- [x] 默认启动链已实际进入 C200 主菜单，说明 loader/U-Boot/FAT 路径能够工作。
+
+仍需完成：
+
+- [ ] BootROM 目前只按 OOB bytes 2..4 判断 page valid，没有生成、校验或纠正手册
+  规定的 Reed-Solomon ECC。backup fallback 还不是“真实不可纠正 ECC”触发。
+- [ ] 当前 board 固定为 2 KiB page 的 BBK NAND；没有完整实现 `boot_sel[1:0]`、
+  512-byte page、8/16-bit bus width 和 2/3 address cycle 探测。
+- [ ] normal/backup 都失败时当前直接报错退出，没有实现手册中的 CS4 NOR fallback。
+- [ ] `bootrom-page`/`bootrom-size` 诊断 raw-copy 模式可以保留，但发布文档要持续明确
+  它不是 JZ4740 BootROM 行为。
+
+验收：
+
+- [x] 只提供 NAND 镜像即可完成 BootROM -> loader/U-Boot -> C200 冷启动。
+- [x] normal area 被擦除或 valid OOB 无效时，集成测试可观察到 backup area 启动。
+- [ ] 注入可纠正和不可纠正 RS ECC 错误，分别验证纠正和 backup/NOR fallback。
+
+### 2. NAND/EMC 与 raw NAND 后端：部分完成
+
+已完成：
+
+- [x] `Bbk9588NandState` 已是独立 QOM NAND device，支持 READ ID、page read、
+  program、erase、ready/busy 和 raw OOB。
+- [x] 默认几何为 2048-byte page、64-byte OOB、64 pages/block、4096 blocks。
+- [x] backing 只按 `2048+64` raw stride 或显式 legacy page-only 格式识别，不再
+  通过 FAT boot sector 猜偏移。
+- [x] NAND program 使用 `old & new`，erase 恢复 `0xff`，并写回运行时 NAND copy。
+- [x] QEMU C 已移除 FAT16 boot-sector scan、目录项、cluster/resource fastpath、
+  logical FAT sector helper 和 FAT page protect。
+- [x] NFCSR/NFECCR/NFINTS 等控制寄存器已有 reset、mask 和完成状态基础语义。
+- [x] `stamp_ftl_oob.py` 和 `make_combined_nand.py` 已固定/显式配置真实 NAND 几何。
+- [x] 运行期 trace 已确认 C200 在 `0x80183dc8/0x801843b0` 直接扫描 raw NAND
+  data/OOB；应用启动过程中观察到 1950 次 read、192 次 program 和 3 次 erase，
+  同期 MSC 事件为 0，固件自管 FTL 边界已经找到。
+- [x] 已删除 `bbk9588_msc_build_oob_lba_map()` 和全部 `msc_oob_lba_*` 状态；MSC
+  默认未挂载介质，不再读取或写入 raw NAND backing。移除后冷启动、主菜单、应用
+  资源读取和 C200 raw NAND program/erase 实测通过。
+
+仍需完成：
+
+- [ ] 实现 JZ4740 Hamming/Reed-Solomon ECC data/parity/status/error index/mask；
+  当前所谓 `bch_status` 只模拟 busy/done，应改名或替换。
+- [ ] 将 EMC controller、raw NAND backend 和板级 NAND 参数拆到独立文件；当前
+  只是逻辑上分层，仍集中在 `bbk9588.c`。
+- [ ] 补 bad-block marker、program/erase failure、掉电中断和 OOB 更新的系统测试。
+- [ ] 复现 C200 FTL 的 sequence、valid-page、回收和掉电提交顺序，使运行后的 raw
+  NAND 能由 loader/U-Boot 原样冷启动；完成后删除 host canonical checkpoint。
+- [x] Web 默认使用与基础 NAND 路径绑定的稳定 checkpoint；每次 QEMU 使用隔离 work
+  copy，正常停止且已产生有效画面后，将最新 OOB logical view 压实回 canonical
+  checkpoint。Web 重启和 QEMU 冷启动复用 checkpoint，测试/探针仍默认 disposable。
+- [x] Web 状态展示 persistent/disposable、checkpoint、work image 和提交错误；已有
+  checkpoint commit、异常保留 work copy、跨冷启动恢复应用状态回归。
+- [x] 增加显式“恢复基础镜像”操作；Web 左侧“↺ 恢复”按钮二次确认后调用
+  `restore-nand-image`，只删除所选基础镜像派生的 checkpoint 和受控 work copy。
+- [x] 基础镜像固定为 `runtime/bbk9588_nand.bin`，持久 checkpoint 位于
+  `runtime/qemu_nand_persistent/`，会话 work copy 和 FAT 快照缓存留在 `build/`。
+- [x] Web 右侧增加“状态/文件”标签；文件页支持新建目录、导入/导出、改名和递归
+  删除。写操作先停止 QEMU 并提交 work copy，再原子修改 checkpoint 和重启 QEMU；
+  该离线工具不进入 guest 运行路径，也不改变 QEMU C 不解析 FAT 的边界。
+  普通 reset 不进入恢复路径，基础镜像本身永不删除或修改。
+
+验收：
+
+- [x] QEMU 不认识 FAT boot sector、目录项、文件名或资源对象，主菜单仍可进入。
+- [x] raw NAND program/erase 不再保护构造镜像中的 FAT page range。
+- [x] 删除 MSC OOB FTL 翻译后，固件仍能扫描 OOB、读取资源并执行 raw NAND 写入。
+- [ ] NAND ECC 错误和 bad block 行为与手册/真机 trace 一致。
+
+### 3. INTC/TCU/CPU WAIT：基本完成
+
+已完成：
+
+- [x] INTC 实现 `ICSR/ICMR/ICMSR/ICMCR/ICPR`、reset mask 和手册 source 编号。
+- [x] INTC 已迁移到独立 `hw/intc/jz4740_intc.c`，拥有独立 state、MMIO、32 路 IRQ
+  input、IP2 汇总 output、reset、migration 和诊断接口；`bbk9588.c` 只保留 source
+  连线以及板级 sysctrl wake 合并。
+- [x] LCD、GPIO、UDC、TCU、DMA、RTC、MSC、SADC、UART 等 source 统一汇入 INTC。
+- [x] TCU 实现 8 channel 的 enable/stop、full/half compare、counter、flag、mask、
+  set/clear 和三组 parent IRQ。
+- [x] TCU 已迁移到独立 `hw/timer/jz4740_tcu.c`，拥有独立 state、MMIO、QEMU
+  virtual-clock timer、三路 parent IRQ、事件唤醒 output、reset、migration 和诊断接口；
+  machine 只保留 INTC 接线及 TCU1/wake proxy 合并。
+- [x] TCU 周期由寄存器和时钟选择推导；`tcu-period-ms` 只保留为诊断/性能采样属性。
+- [x] 默认 `bbk9588` firmware patch 列表为空，不再应用 `c200-cp0-*` 或
+  `c200-wait-noop`。
+- [x] MIPS WAIT 不再被 NOP；QEMU 使用真实 IP2 pending，并通过 Config7.WII 处理
+  C200 在 IE 清除窗口进入 WAIT 的情况。
+
+仍需完成：
+
+- [ ] `BBK9588_SYSCTRL_WAKE_PROXY_IRQ` 仍借用 TCU1 parent 表达板级 wake，需要根据
+  真机 PM/GPIO 接线确认后替换为真实 source 或明确为板级逻辑。
+- [ ] 给所有已建模外设增加“raise -> mask -> ICPR -> clear -> lower”的运行时测试，
+  目前很多测试仍是源码契约检查。
+- [ ] 继续核对 TCU 时钟门控、PWM、watchdog/OST 差异和极短 compare 的精度。
+
+验收：
+
+- [x] 默认启动不需要 CP0 IRQ、status restore 或 WAIT firmware patch。
+- [x] GUI tick、触摸、LCD、DMA、RTC 等设备 pending 能通过 INTC 唤醒 CPU。
+- [x] 2026-07-11 独立 INTC 版本通过 Windows QEMU 全量构建和 195 项 Python 测试；
+  默认 NAND 冷启动进入主菜单，方向键和触摸事件均被 guest 接收，且只有一个 QEMU
+  进程运行。
+- [x] 2026-07-11 独立 TCU 版本通过 Windows QEMU 构建、195 项 Python 测试和源树
+  检查；默认 NAND 约 46 秒自动校准进入主菜单，主菜单时钟正常递增，方向键产生新帧，
+  Web 保持一个 frontend 和一个 QEMU 实例。雷霆战机实际战斗 12 秒新增 233 帧，
+  采样约 20.48 fps、1.56 MIPS，随后可正常退出回主菜单。
+- [ ] 去掉 wake proxy 后，待机、按键唤醒和所有应用计时仍稳定。
+
+### 4. LCD/SLCD 输出：部分完成
+
+已完成：
+
+- [x] 普通 LCD controller 已覆盖 config/timing/control/state/IID/DA/SA/FID/CMD。
+- [x] descriptor DMA 会读取 source、frame id、command 和 length，并维护 SOF/EOF、
+  disable done、quick disable、underflow mask 和 LCD IRQ。
+- [x] 默认路径不再注入 `graphics-done`、LCD ready magic 或相关 machine property。
+- [x] frame chardev 只输出 RGB565 帧；WebSocket/PNG 共享同一 QEMU 帧源。
+- [x] 前端已有发送 FPS、QEMU frame FPS、guest IPS、丢帧和延迟指标。
+
+仍需完成：
+
+- [ ] 当前仍会读取 `0x804a6b88` 的 guest LCD mirror 配置作为兼容 scanout 线索；
+  应确认 C200 最终是否能完全由 LCD descriptor 驱动，并逐步删除固定 guest 地址。
+- [ ] 没有独立 Smart LCD/SLCD command/data FIFO 模型；先通过 trace 确认固件是否使用，
+  使用后再实现，不能把它无条件列为必需设备。
+- [ ] 建立稳定截图回归：同一页面连续采样的像素 hash/差异应稳定，旋转不能影响 raw
+  framebuffer 或触摸坐标。
+- [ ] 将 LCD controller 从 machine 文件拆为独立 QEMU device。
+
+验收：
+
+- [x] 主菜单、应用和校准界面都能经同一个 frame chardev 显示。
+- [x] Web 旋转只改变输出和触摸坐标映射，不修改 guest framebuffer。
+- [ ] 不读取固定 guest mirror 配置时，主菜单和应用画面仍完整稳定。
+- [ ] 自动截图回归不出现随机半图标、噪点或局部补绘。
+
+### 5. SADC/Touch/GPIO 输入：基本完成
+
+已完成：
+
+- [x] Web touch/key 通过 input chardev 进入 QEMU C，不再通过 GDB 写 firmware global。
+- [x] SADC 实现 `ADENA/ADCFG/ADCTRL/ADSTATE/ADSAME/ADWAIT/ADTCH/ADBDAT/ADSDAT`。
+- [x] `ADTCH` 使用 2-entry FIFO，支持 X/Y、Z 模式、type bit、DTCH/PEND/PENU 和
+  FIFO 未读时的背压。
+- [x] ADSAME/ADWAIT 延迟按手册 `12 MHz / 128` counter clock 换算。
+- [x] GPIO 实现 4 个 port 的 PIN/DAT/IM/PE/FUN/SEL/DIR/TRG/FLG set/clear 语义和
+  parent IRQ。
+- [x] 触摸与 6 个实体键只通过板级 GPIO/SADC 接线进入固件；无 chardev 时拒绝回退
+  到 guest RAM mailbox/global 写入。
+- [x] 自动校准只存在于 Web `FrontendState` 测试 harness，不再是 machine property。
+- [x] 实际 Web 操作已验证点击持续可用；手动输入和画板连续触摸可工作。
+
+仍需完成：
+
+- [ ] 当前 GPIO pin、active level、触摸 raw calibration、Z1/Z2 和 battery raw 默认值
+  来自反汇编/实测近似，需要真机 trace 固化板级说明。
+- [ ] 增加 SADC FIFO overrun、DMA mode、不同 XYZ/SPZZ/EX_IN 组合的运行时测试。
+
+验收：
+
+- [x] 校准、菜单点击、按键和触摸 release 通过 SADC/GPIO/INTC 完成。
+- [x] 不存在默认 `touch-firmware-globals` 或等价 guest global 写入路径。
+- [ ] 用真机采样数据校验 raw X/Y/Z、电池值和 pen IRQ 时序。
+
+### 6. DMAC/MSC/UART/UDC/RTC/PM：部分完成
+
+已完成：
+
+- [x] DMAC 有 6 channel register、descriptor fetch/link、RAM auto transfer、terminal
+  count、doorbell 和 IRQ，覆盖当前 MSC 以及 AIC DRT24/25 FIFO 搬运路径。
+- [x] DMAC 已迁移到独立 `hw/dma/jz4740_dmac.c`，拥有独立 state/MMIO、32 路
+  request GPIO input、汇总 IRQ output、descriptor/RAM copy、reset 和 migration；
+  AIC request 直接连入 DMAC，machine 只保留 MSC bulk、AIC FIFO 和 trace 适配回调。
+- [x] MSC 有 reset state、command/argument/response、interrupt 和 DMAC completion 基础模型。
+- [x] MSC 与 raw NAND backing 已解耦；默认未挂载 removable medium，不再由 QEMU
+  解释 NAND OOB logical block/sequence。
+- [x] UART0 有 16-byte FIFO、DLAB/divisor、IER/IIR/FCR/LCR/LSR、TX/RX chardev 和 IRQ，
+  不再依赖 `c200-uart-ready`。
+- [x] UDC 在无 USB host 时提供 endpoint、power、enable/pending 和 idle register 语义，
+  不再用虚拟时间伪造 frame counter 推动服务循环。
+- [x] RTC 使用 host/QEMU RTC clock，支持 seconds、1 Hz、alarm、IRQ 和 hibernate/reset
+  status，不再返回固定日期 magic。
+- [x] battery sample 由 SADC PBAT conversion 给出，并可通过 machine property 配置 raw 值。
+- [x] graphics/UART/RTC 的固定 ready override machine properties 已移除。
+
+仍需完成：
+
+- [ ] MSC 尚未实现独立可选 SD/MMC block backend、card detect 和真实响应/error 语义。
+- [ ] DMAC 尚未覆盖所有外设 request、传输宽度、stride、错误和 descriptor corner case；
+  audio request 作为 P0 优先补齐，其余 request 放到 P3。
+- [ ] PM/clock gating 只有独立 CPM register、WAIT wake 和 RTC hibernate 基础行为，尚未
+  完整建模 suspend、reset cause、module clock gating 和低电压关机。
+- [ ] USB device attach/data transfer 未实现；当前 UDC 只满足 no-host idle 路径。
+
+验收：
+
+- [x] 主菜单日期时间来自 RTC 路径，UART 和 UDC 服务循环无需 ready patch。
+- [x] 运行期资源读取、文件写入和块回收不依赖 QEMU OOB map。
+- [ ] 写后 raw NAND 的冷启动仍依赖 host canonical checkpoint，尚未达到真机掉电恢复语义。
+- [ ] USB attach、低电压提示和 suspend/resume 都有可重复的运行时测试。
+
+### 7. AIC/I2S/audio codec：P0，部分完成
+
+当前已新增独立 `hw/audio/jz4740_aic.c`，实现 AIC MMIO、internal codec、FIFO、IRQ、
+DMAC request 和 QEMU host audio。旧的 audio DMA immediate completion 已删除。C200
+反汇编确认播放使用 DMAC channel 3 / DRT 24、16-bit AIC target；2026-07-11 Web 运行
+雷霆战机并开启音效后，模型稳定进入 mono `8000 Hz` 播放，TX DMA samples 与 output
+frames 按约 8k/s 持续增长，FIFO 稳定在 31。DirectSound 首次打开时 underrun 增长到
+约 310 samples 后稳定；WAV backend 同场景从开始播放起保持 underrun/overrun `0/0`。
+
+同次 WAV 端到端采集得到 77.4955 秒、16-bit、双声道 PCM；采样率 8000 Hz，peak
+6426、RMS 1025.87、非零样本 95.38%、绝对值不小于 32 的样本 91.58%、clipping 0，
+左右声道逐帧相同，符合当前 mono-to-stereo 输出。QEMU WAV backend 在 Windows 退出后
+可能保留为 0 的 RIFF/data 长度由 `tests.qemu_audio_wav` 在验证前按实际文件大小修复；
+它不修改 PCM payload。该 WAV 证据只覆盖一个游戏场景；音乐和无声后端由下面的
+运行时基线覆盖，但系统提示音仍缺独立采集。
+
+音乐应用使用测试 NAND 中的 `A:\飞天音乐\1.mp3` 实测为 stereo `22050 Hz`、
+DMAC channel 3 / DRT 24、16-bit sample、每块 1152 个 DMA unit。最初每秒约产生
+700~1000 个 underrun；边界诊断显示约 94% 发生在 terminal count 到固件重装 DMA
+之间。根因不是 32-entry FIFO 或 mono/stereo 解释错误，而是 QEMU 在单次 1ms audio
+timer callback 内跨过 DMA terminal count 后继续批量消费，CPU 无法在同一回调中处理
+完成中断。AIC 现在在 TX DMA 块边界结束当前批次，并将剩余帧债务留给下次 timer；
+这不扩大 FIFO、不自动重装 DMA，也不丢弃虚拟时间。修复后 DirectSound 连续 20 秒
+新增 underrun 为 0；`driver=none` 连续 30 秒输出 645524 帧、完成 1121 个 DMA 块，
+新增 underrun 为 0。播放暂停和退出时固件只 mute codec、未清 `AICCR.ERPL`，所以硬件
+语义下 `TUR/underrun` 仍会累计；恢复播放稳定后 10 秒没有新增 underrun。
+音乐 WAV 回归得到 40.5298 秒、22050 Hz、16-bit 双声道 PCM，peak 14967、RMS
+1401.60、有效样本比例 32.78%、clipping 0；35572 帧左右声道不同，符合 stereo 文件
+而不是 mono copy。对应 20 秒连续播放窗口新增 underrun 为 0。
+
+实施：
+
+- [ ] 先对系统提示音、音乐应用和至少一个游戏采集 trace，确认固件实际使用 I2S
+  还是 AC-link、AIC 寄存器访问顺序、DMA channel/request、采样格式和 codec 控制路径；
+  当前已有 C200 静态反汇编、雷霆战机和音乐应用运行证据，系统提示音场景仍缺。
+- [x] 实现独立 AIC device，包括 config/control/status、TX/RX FIFO、FIFO threshold、
+  underrun/overrun、enable/flush 和 AIC IRQ 18。
+- [x] 将 audio TX/RX FIFO 接入 DMAC 外设 request，不再在启动 channel 时直接伪造
+  terminal count；DMA 节拍应受 FIFO 水位和采样时钟约束。
+- [x] internal codec 路径按 `CDCCR2.SMPR` 生成虚拟采样时钟，支持 mono/stereo 和
+  8/16/18/20/24-bit sample width；虚拟 FIFO 时序不受 host callback 阻塞。
+- [ ] 外部 codec/AC-link 所需的 `I2SCDR`、AIC divider 和外部时钟组合尚未验证。
+- [x] 按 C200 实际使用的 `CDCCR1/CDCCR2` 实现 internal codec mute、音量和最小
+  headphone output route。
+- [ ] 外部功放使能、引脚复用和 BBK 私有板级 route 仍需真机 trace，不能凭空固化。
+- [x] 接入 QEMU host audio backend，支持无声/无音频设备环境，不因 host backend
+  不可用阻塞或改变 guest 时序。
+- [x] 增加寄存器、FIFO、IRQ、DMA 源码契约测试，并通过 frame-info 包在 Web 展示
+  sample rate、FIFO level、DMA samples、output frames、underrun/overrun，以及 DMA
+  completion/rearm 次数、间隙、块大小和边界 FIFO 水位。
+- [x] 增加 deterministic WAV 端到端音频回归：运行时校验 8k/s DMA/output 增长与
+  xrun，采集后校验 WAV sample rate、时长、有效样本、削波和 mono 声道一致性。
+
+验收：
+
+- [ ] 系统提示音、音乐应用和至少一个游戏能连续播放，速度和音调正常。
+- [x] 雷霆战机开启音效后可连续驱动 8000 Hz AIC TX DMA 与 host output，guest 和 CPU
+  未卡住；该单项通过不代表上一条综合验收完成。
+- [ ] 开始、暂停、停止、切换应用和重复播放不会卡住 guest、持续占满 CPU 或遗留 IRQ。
+- [x] 关闭 host audio 或没有音频设备时系统仍能正常启动和操作；`driver=none` 已完成
+  主菜单、音乐应用和连续播放 30 秒验收，guest 未卡住且播放期新增 underrun 为 0。
+- [x] 删除临时 audio DMA completion 后，音频 DMA/IRQ 契约、游戏运行和现有启动回归
+  全部通过（195 项 Python 测试通过；31 项按环境跳过）。
+
+## 结构重构
+
+当前 `bbk9588.c` 约 6300 行。逻辑 helper 已按设备分组，NAND 仍是同文件内的独立
+QOM object；AIC、INTC、CPM、DMAC 和 TCU 已迁移到独立文件，LCD、SADC、GPIO、RTC 等
+仍共享 machine/MMIO state。
+
+- [x] 设备寄存器常量和 helper 已按模块分区，NAND 已有独立 state/reset/ops。
+- [x] P0 新增的 AIC 直接放入独立设备文件，不再扩大 `bbk9588.c`。
+- [ ] 拆分 `hw/mips/bbk9588.c`，只保留 machine、RAM、CPU 和 board wiring。
+- [x] 新建 `hw/intc/jz4740_intc.c`，从 machine 迁移 INTC 寄存器、mask/pending、
+  IRQ 汇总、reset、migration 和诊断状态。
+- [x] 新建 `hw/misc/jz4740_cpm.c`，从通用 MMIO window 迁移 CPCCR/LCR/CPPCR、
+  CLKGR/SCR 和各外设 divider；保留未知寄存器存储、访问宽度约束、reset/migration，
+  并通过回调将板级 wake 配置变化通知 machine。
+- [x] 新建 `hw/timer/jz4740_tcu.c`，包含 8-channel counter、full/half compare、
+  clock/prescale、flag/mask、parent IRQ、reset、migration 和诊断状态。
+- [ ] 新建 `hw/mem/jz4740_emc.c` 和 raw NAND board device。
+- [ ] 新建 `hw/display/jz4740_lcd.c`。
+- [ ] 新建 `hw/input/jz4740_sadc.c` 与 `hw/gpio/jz4740_gpio.c`。
+- [x] 新建 `hw/audio/jz4740_aic.c`，包含独立 state/MMIO/IRQ/reset/migration。
+- [x] 新建 `hw/dma/jz4740_dmac.c`，包含独立 channel/global register、descriptor、
+  RAM/AIC/MSC transfer、request input、IRQ output、reset、migration 和音频 DMA 诊断。
+- [ ] 新建 `hw/rtc/jz4740_rtc.c` 等其余设备文件。
+- [ ] 每个设备使用独立 state、MemoryRegion、IRQ input/output、reset 和迁移状态。
+
+拆文件时不要顺手改变行为；先给当前 MMIO 契约加运行时测试，再做机械迁移。
+
+## Python/Web 收敛
+
+- [x] `default_firmware_patches_for_machine("bbk9588")` 返回空列表；已知 patch 只保留
+  给 legacy/malta 诊断路径。
+- [x] `bbk9588` 默认路径禁用 Python/GDB storage/resource hook 和 guest global seed。
+- [x] frame/input 使用 chardev；Python 负责进程、转发、性能统计和只读状态。
+- [x] 自动校准属于 Web smoke test/harness，不进入 SoC machine property。
+- [x] 自动校准在 PC/RA 尚未可用时先等待 8 秒启动窗口，避免 QEMU/HMP 连接前提前
+  消耗四个校准点；无 PC 环境保留超时 fallback。
+- [x] `KNOWN_STALL_REGIONS` 只用作逆向分类和诊断，不参与默认硬件修复。
+- [ ] `system.py` 仍保留大量 legacy hook、GDB helper 和旧 patch 定义；确认无发布用户后
+  可继续删除，而不是只改成 `legacy_*` 名称。
+- [ ] 把关键 C machine runtime probe 从“读源码字符串”升级为真实 MMIO/IRQ 测试。
+
+## 更新后的实施顺序
+
+1. [x] **当前最高优先级：实现 Web/QEMU 持久运行 NAND。** 同一基础镜像使用稳定
+   canonical checkpoint 和隔离 work copy；正常停止提交 logical view，异常提交失败
+   保留 work copy。跨冷启动已恢复到相同“宠物小管家”应用状态，206 项 Python 测试
+   通过（31 项按环境跳过），测试/probe 仍保持 disposable 隔离。
+2. [x] 固化冷启动、backup BootROM、主菜单、应用、触摸和帧传输基线。
+3. [x] 默认路径移除 firmware patch、Python storage/resource hook 和 QEMU C FAT16。
+4. [x] 实现 raw NAND first-stage/backup boot。
+5. [x] 实现 INTC/8-channel TCU/WAIT 基础硬件路径。
+6. [x] 实现普通 LCD descriptor/state/IRQ 和 frame chardev。
+7. [x] 实现 SADC FIFO、GPIO edge/flag/IRQ 和 input chardev。
+8. [x] 实现 DMAC/UART/UDC/RTC/MSC 的当前基础路径。
+9. [x] 实现独立 AIC、audio DMA request、最小 internal codec 和 host audio 输出，
+   删除临时 audio DMA completion，并完成雷霆战机 DirectSound/WAV 端到端回归。
+10. [ ] 完成音频剩余验收：采集系统提示音和外部 codec/功放路径的 AIC/I2S/DMAC
+   trace；音乐应用和无音频设备的启动/应用性能基线已经固化。
+11. [x] 将 INTC 迁移为独立 QOM device，并保持默认 NAND、输入和音频路径可用。
+12. [x] 将 CPM/sysctrl 迁移为独立 QOM device；Windows QEMU 构建、195 项测试、
+    默认 NAND 主菜单及按键/触摸回归均通过。
+13. [x] 将 DMAC 迁移为独立 QOM device；Windows QEMU 构建和 195 项测试通过。
+    默认 NAND 可进入主菜单；雷霆战机 8000 Hz 播放稳定窗口 10 秒内 DMA/output
+    各增长 80835 帧、completion/rearm 各增长 81、新增 underrun 为 0。
+14. [x] 将 TCU 迁移为独立 QOM device；Windows QEMU 构建、195 项测试、默认 NAND
+    冷启动、主菜单时钟、方向键帧更新和雷霆战机实际战斗均通过。
+15. [ ] 继续按设备拆分 `bbk9588.c`；下一步迁移 LCD，再处理 SADC/GPIO、RTC、EMC
+    等设备，拆分期间不改变现有行为。
+16. [x] 用运行期 trace 找到 C200 raw NAND FTL 边界并删除 MSC OOB LBA map；移除后
+    主菜单、应用资源以及 1950 read / 192 program / 3 erase 的固件写入路径通过。
+17. [ ] 实现 NAND Hamming/RS ECC 和 BootROM 真正的 ECC fallback。
+18. [ ] 删除固定 guest LCD mirror 依赖；按 trace 决定是否实现 SLCD。
+19. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
+
+## 关键验收清单
+
+- [x] 冷启动：只提供 NAND 镜像即可 BootROM -> loader/U-Boot -> C200。
+- [x] BootROM：normal area 失效后会尝试 `0x2000` backup area。
+- [x] 存储层：QEMU C 不解析 FAT boot sector、目录项、cluster 或资源文件。
+- [x] raw 写入：page program/erase/OOB 修改会写入 disposable runtime NAND。
+- [x] 持久写入：Web 默认 checkpoint 跨停止、Web 重启和 QEMU 冷启动复用；实际验证
+  normal stop 提交成功、work copy 删除、再次启动恢复相同应用状态。
+- [x] FTL：资源读取和文件写入不再依赖 `msc_oob_lba_*`；C200 直接执行 raw NAND
+  data/OOB read、page program 和 block erase。
+- [ ] FTL 掉电恢复：不经 host canonical checkpoint，写后的同一 raw NAND 可直接冷启动。
+- [x] 性能：默认 OOB scan 可在可用时间内进入主菜单，前端可观察 FPS/IPS/延迟。
+- [ ] 显示：有自动稳定截图回归，并且不依赖固定 guest mirror 地址。
+- [x] 输入：触摸、按键和 release 通过 SADC/GPIO/INTC，不卡在 guest global hook。
+- [x] 时间：主菜单时间来自 RTC host clock 路径。
+- [ ] 音频：系统、音乐和游戏通过真实 AIC FIFO、DMA request 和 host audio 输出播放。
+- [ ] 电源：低电压、hibernate、wake 有端到端测试。
+- [x] 发布：release 工具只打包运行必需文件，不再携带旧 QEMU patch 安装路径。
+- [ ] 结构：主要 JZ4740 设备已从 `bbk9588.c` 拆分。
+
+## 风险与注意点
+
+- JZ4740 手册是 SoC 级参考，BBK 9588 的板级接线和私有 FTL 仍要靠反汇编、
+  真机 dump 和 trace 确认。
+- 手册对 internal Boot ROM 物理容量有 8 KiB/4 KiB 的自相矛盾描述；NAND loader
+  copy limit 则应按 BootROM 章节的 8 KiB 实现。
+- 不要把当前 `bch_status` done stub 当作 JZ4740 ECC 已完成；手册定义的是
+  Hamming/Reed-Solomon。
+- C200 raw NAND trace 已证明运行期 FTL 由固件持有，因此 MSC OOB map 已删除。仍不能
+  据此宣称私有 FTL 完整：sequence/valid-page 提交、坏块、垃圾回收和掉电恢复必须继续
+  用反汇编、真机 dump/trace 与无 checkpoint 冷启动回归确认。
+- 音频 codec、功放使能、mute 和引脚复用属于板级信息；JZ4740 手册只能确定 AIC/DMAC
+  契约，最终接线和初始化序列仍需结合固件反汇编与运行 trace。
+- LCD 噪点要同时检查 descriptor、cache flush、DMA、资源加载和 frame push，不能只
+  在 Web 前端丢帧或延时掩盖。
+- 诊断 trace 可以保留，但关闭 trace 后 guest 行为必须不变。

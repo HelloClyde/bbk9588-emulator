@@ -1,0 +1,20 @@
+*.md text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.s text eol=lf
+*.asm text eol=lf
+*.txt text eol=lf
+
+# Treat firmware/application/resource outputs as binary if someone force-adds them.
+*.bda binary
+*.BDA binary
+*.dba binary
+*.DBA binary
+*.dlx binary
+*.DLX binary
+*.bin binary
+*.mp3 binary
+*.jpg binary
+*.png binary
+*.zip binary

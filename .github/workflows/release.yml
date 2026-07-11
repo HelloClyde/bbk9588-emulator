@@ -1,0 +1,279 @@
+name: Release emulator
+
+env:
+  QEMU_VERSION: "11.0.0"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release/package version, for example emu-v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "v*"
+      - "emu-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package emulator
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: python -m pip install -e .
+
+      - name: Set up MSYS2 UCRT64 build toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            git
+            tar
+            xz
+            make
+            diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-capstone
+
+      - name: Locate MSYS2 UCRT64 bash
+        run: |
+          $candidates = @()
+          $candidates += Get-Command -All bash.exe -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source
+          if ($env:RUNNER_TEMP) {
+            $candidates += Join-Path $env:RUNNER_TEMP "msys64\usr\bin\bash.exe"
+          }
+          $candidates += "C:\msys64\usr\bin\bash.exe"
+
+          $candidates = $candidates |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+            Sort-Object -Unique
+
+          foreach ($candidate in $candidates) {
+            $msysUsrDir = Split-Path -Parent (Split-Path -Parent $candidate)
+            $msysRoot = Split-Path -Parent $msysUsrDir
+            $gcc = Join-Path $msysRoot "ucrt64\bin\gcc.exe"
+            if (Test-Path -LiteralPath $gcc) {
+              Write-Host "MSYS2_BASH=$candidate"
+              "MSYS2_BASH=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              return
+            }
+            Write-Host "skip MSYS2 candidate without UCRT gcc: $candidate"
+          }
+
+          throw "could not locate MSYS2 UCRT64 bash with gcc.exe; candidates: $($candidates -join ', ')"
+
+      - name: Validate Python and PowerShell files
+        run: |
+          Get-ChildItem emu, tests, tools -Filter *.py -Recurse | ForEach-Object {
+            python -m py_compile $_.FullName
+          }
+
+          foreach ($script in @(
+            "tools/build_runtime_images.ps1",
+            "tools/collect_qemu_runtime.ps1",
+            "tools/package_emulator.ps1",
+            "qemu/scripts/build_qemu_windows.ps1",
+            "packaging/start-web.ps1"
+          )) {
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors) {
+              $errors | ForEach-Object { Write-Error "${script}: $($_.Message)" }
+              throw "PowerShell parse failed: $script"
+            }
+          }
+
+      - name: Run Python tests
+        run: python -m unittest tests.test_qemu_system
+
+      - name: Download QEMU source
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+
+          function Convert-ToMsysPath([string]$Path) {
+            $full = [System.IO.Path]::GetFullPath($Path).Replace("\", "/")
+            if ($full -match "^([A-Za-z]):/(.*)$") {
+              return "/" + $Matches[1].ToLowerInvariant() + "/" + $Matches[2]
+            }
+            return $full
+          }
+
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE "build\downloads"
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE "build\qemu-source"
+          New-Item -ItemType Directory -Force -Path $downloadDir, $sourceRoot | Out-Null
+
+          $archive = Join-Path $downloadDir "qemu-${env:QEMU_VERSION}.tar.xz"
+          Invoke-WebRequest -Uri "https://download.qemu.org/qemu-${env:QEMU_VERSION}.tar.xz" -OutFile $archive
+
+          $sourceRootPosix = Convert-ToMsysPath $sourceRoot
+          $archivePosix = Convert-ToMsysPath $archive
+          $sourceTop = "qemu-${env:QEMU_VERSION}"
+          & $env:MSYS2_BASH -lc "set -euo pipefail; tar -C '$sourceRootPosix' --exclude='$sourceTop/roms' --exclude='$sourceTop/tests/lcitool' -xf '$archivePosix'"
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to extract QEMU source archive"
+          }
+
+      - name: Build bbk9588 QEMU
+        run: |
+          $qemuSource = Join-Path $env:GITHUB_WORKSPACE "build\qemu-source\qemu-${env:QEMU_VERSION}"
+          $qemuBuild = Join-Path $env:GITHUB_WORKSPACE "build\qemu-build"
+          $jobs = [Math]::Max(2, [Math]::Min(4, [int]$env:NUMBER_OF_PROCESSORS))
+          ./qemu/scripts/build_qemu_windows.ps1 `
+            -QemuSource $qemuSource `
+            -BuildDir $qemuBuild `
+            -MsysBash $env:MSYS2_BASH `
+            -UseOverlay `
+            -Jobs $jobs
+
+      - name: Collect bbk9588 QEMU runtime
+        id: qemu-runtime
+        run: |
+          $qemuExe = Join-Path $env:GITHUB_WORKSPACE "build\qemu-build\qemu-system-mipsel.exe"
+          $runtimeDir = Join-Path $env:GITHUB_WORKSPACE "build\qemu-runtime"
+          ./tools/collect_qemu_runtime.ps1 `
+            -QemuExe $qemuExe `
+            -RuntimeDir $runtimeDir `
+            -OutputExeName bbk9588-qemu-system-mipsel.exe `
+            -MsysBash $env:MSYS2_BASH
+
+      - name: Probe packaged emulator binary
+        run: |
+          & "${{ steps.qemu-runtime.outputs.qemu_exe }}" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "packaged QEMU probe failed"
+          }
+
+      - name: Package emulator
+        id: package
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) {
+            $version = "${{ github.ref_name }}"
+          }
+          $pythonRoot = $env:pythonLocation
+          if (-not $pythonRoot) {
+            $pythonRoot = Split-Path -Parent (Get-Command python).Source
+          }
+          ./tools/package_emulator.ps1 `
+            -Version $version `
+            -QemuRuntimeDir "${{ steps.qemu-runtime.outputs.runtime_dir }}" `
+            -PythonRoot $pythonRoot
+
+      - name: Validate release package
+        run: |
+          python ./tools/validate_release_package.py "${{ steps.package.outputs.zip_path }}" --runtime
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.sha256_path }}
+          if-no-files-found: error
+
+      - name: Write release notes
+        id: notes
+        run: |
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $sha256Line = Get-Content -LiteralPath "${{ steps.package.outputs.sha256_path }}"
+          $notes = @(
+            "BBK 9588 emulator package.",
+            "",
+            "Contents:",
+            "- Compiled bbk9588 QEMU runtime: bin/bbk9588-qemu-system-mipsel.exe.",
+            "- Web frontend and root start-web launch scripts.",
+            "- Python runtime and FAT/NAND image construction tools.",
+            "",
+            "Not included:",
+            "- Dumped firmware, NAND images, BDA applications, or local build output.",
+            "- Import your own bbk9588_nand.bin or the separately published NAND release asset on first start.",
+            "",
+            "SHA256:",
+            '```',
+            $sha256Line,
+            '```'
+          )
+          $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
+          "path=$notesPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          function Invoke-Gh {
+            & gh @args
+            if ($LASTEXITCODE -ne 0) {
+              throw "gh failed with exit code ${LASTEXITCODE}: gh $($args -join ' ')"
+            }
+          }
+
+          $version = "${{ steps.package.outputs.version }}"
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $tag = $version
+          }
+
+          $title = "BBK 9588 Emulator $version"
+          $zipPath = "${{ steps.package.outputs.zip_path }}"
+          $shaPath = "${{ steps.package.outputs.sha256_path }}"
+          $notesPath = "${{ steps.notes.outputs.path }}"
+
+          $releaseExists = $false
+          $oldErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          $viewExitCode = $LASTEXITCODE
+          $ErrorActionPreference = $oldErrorActionPreference
+          if ($viewExitCode -eq 0) {
+            $releaseExists = $true
+          }
+
+          if ($releaseExists) {
+            Invoke-Gh release upload $tag $zipPath $shaPath --clobber --repo $env:GITHUB_REPOSITORY
+            Invoke-Gh release edit $tag --title $title --notes-file $notesPath --repo $env:GITHUB_REPOSITORY
+          } else {
+            if ("${{ github.event.inputs.prerelease }}" -eq "true") {
+              Invoke-Gh release create $tag $zipPath $shaPath --title $title --notes-file $notesPath --target "${{ github.sha }}" --repo $env:GITHUB_REPOSITORY --prerelease
+            } else {
+              Invoke-Gh release create $tag $zipPath $shaPath --title $title --notes-file $notesPath --target "${{ github.sha }}" --repo $env:GITHUB_REPOSITORY
+            }
+          }
