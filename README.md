@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/bbk9588-emulator-header.png" alt="BBK 9588 Emulator - JZ4740 QEMU" width="100%">
+</p>
+
 # BBK 9588 Emulator
 
 [![CI](https://github.com/HelloClyde/bbk9588-emulator/actions/workflows/ci.yml/badge.svg)](https://github.com/HelloClyde/bbk9588-emulator/actions/workflows/ci.yml)
