@@ -19,6 +19,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
     state: object
     html: str = ""
 
+    def end_headers(self) -> None:
+        self.send_header("Permissions-Policy", "gamepad=(self)")
+        super().end_headers()
+
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.close_connection = True
         self.connection.settimeout(1.0)

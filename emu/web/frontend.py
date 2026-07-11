@@ -78,6 +78,8 @@ HTML = r"""<!doctype html>
     .binding-control { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: center; gap: 6px; color: #b8c0cc; font-size: 12px; }
     .binding-control button { min-width: 0; height: 32px; padding: 4px 6px; background: #2a2e34; border: 1px solid #414751; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .binding-control button.capturing { border-color: #5794ff; background: #253c62; }
+    .gamepad-status { min-height: 18px; margin-top: 8px; color: #9aa4b2; font-size: 12px; text-align: center; overflow-wrap: anywhere; }
+    .gamepad-status.error { color: #ff9f9f; }
     input, select { color: #e8eaed; background: #111317; border: 1px solid #3b414b; border-radius: 6px; padding: 7px; }
     input { width: 90px; }
     input[type="checkbox"] { width: auto; accent-color: #5794ff; }
@@ -178,6 +180,7 @@ HTML = r"""<!doctype html>
             <div class="binding-control"><span>确定</span><button data-binding-code="10">Space / 手柄 B0</button></div>
             <div class="binding-control"><span>退出</span><button data-binding-code="9">Esc / 手柄 B1</button></div>
           </div>
+          <div id="gamepadStatus" class="gamepad-status" role="status">未检测到手柄；请按任意手柄键</div>
         </section>
       </div>
     </main>
@@ -215,6 +218,7 @@ const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
 const orientationLabelEl = document.getElementById('orientationLabel');
 const resetKeyBindingsEl = document.getElementById('resetKeyBindings');
+const gamepadStatusEl = document.getElementById('gamepadStatus');
 const statusTabButtonEl = document.getElementById('statusTabButton');
 const filesTabButtonEl = document.getElementById('filesTabButton');
 const statusTabEl = document.getElementById('statusTab');
@@ -1107,7 +1111,9 @@ function updateKeyBindingUi() {
   });
 }
 function beginBindingCapture(code) {
+  gamepadInputFocused = true;
   bindingCaptureCode = String(code);
+  updateGamepadStatus('等待输入：请按手柄按钮或推动摇杆');
   updateKeyBindingUi();
 }
 function assignCapturedBinding(bindings, physicalCode) {
@@ -1145,6 +1151,13 @@ const captureSuppressedGamepadInputs = new Set();
 const gamepadPressThreshold = 0.65;
 const gamepadReleaseThreshold = 0.35;
 let gamepadInputFocused = document.hasFocus();
+let gamepadStatusText = '';
+function updateGamepadStatus(text, error = false) {
+  if (gamepadStatusText === text && gamepadStatusEl.classList.contains('error') === error) return;
+  gamepadStatusText = text;
+  gamepadStatusEl.textContent = text;
+  gamepadStatusEl.classList.toggle('error', error);
+}
 function updateDeviceKeyActive(code) {
   const btn = document.querySelector(`[data-key="${code}"]`);
   if (!btn) return;
@@ -1324,13 +1337,29 @@ function releaseGamepadInputs(phase = 'disconnect') {
     endGamepadInput(sourceId, phase, true);
   }
 }
+function readGamepads() {
+  if (typeof navigator.getGamepads !== 'function') {
+    updateGamepadStatus('当前浏览器未提供 Gamepad API', true);
+    return [];
+  }
+  try {
+    return Array.from(navigator.getGamepads()).filter(Boolean);
+  } catch (err) {
+    updateGamepadStatus(`Gamepad API 不可用：${err?.message || err}`, true);
+    return [];
+  }
+}
 function pollGamepads() {
   const visible = document.visibilityState === 'visible';
-  const gamepads = visible && gamepadInputFocused && typeof navigator.getGamepads === 'function'
-    ? Array.from(navigator.getGamepads()).filter(Boolean)
-    : [];
+  const gamepads = visible && gamepadInputFocused ? readGamepads() : [];
   const connected = new Set();
   const seenSources = new Set();
+  if (visible && gamepadInputFocused && gamepads.length === 0 && bindingCaptureCode !== null) {
+    updateGamepadStatus('未检测到手柄；请先按一次手柄按键');
+  } else if (gamepads.length > 0) {
+    const name = String(gamepads[0].id || `手柄 ${gamepads[0].index + 1}`);
+    updateGamepadStatus(`已连接：${name}`);
+  }
   for (const gamepad of gamepads) {
     connected.add(gamepad.index);
     const previous = gamepadPreviousStates.get(gamepad.index);
@@ -1339,6 +1368,7 @@ function pollGamepads() {
       if (captured) {
         captureSuppressedGamepadInputs.add(`${gamepad.index}:${captured}`);
         assignCapturedBinding(gamepadBindings, captured);
+        updateGamepadStatus(`已映射：${gamepadBindingLabel(captured)}`);
       }
     }
     for (const [guestCodeText, binding] of Object.entries(gamepadBindings)) {
@@ -1376,10 +1406,18 @@ window.addEventListener('blur', () => {
   releaseGamepadInputs('gamepad-blur');
 });
 window.addEventListener('focus', () => { gamepadInputFocused = true; });
+window.addEventListener('pointerdown', () => { gamepadInputFocused = true; }, {capture:true});
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') releaseGamepadInputs('gamepad-hidden');
 });
-window.addEventListener('gamepaddisconnected', () => releaseGamepadInputs('gamepad-disconnect'));
+window.addEventListener('gamepadconnected', ev => {
+  gamepadInputFocused = true;
+  updateGamepadStatus(`已连接：${ev.gamepad.id || `手柄 ${ev.gamepad.index + 1}`}`);
+});
+window.addEventListener('gamepaddisconnected', () => {
+  releaseGamepadInputs('gamepad-disconnect');
+  updateGamepadStatus('手柄已断开；请按任意手柄键重新连接');
+});
 requestAnimationFrame(pollGamepads);
 screen.addEventListener('pointerdown', ev => {
   ev.preventDefault();

@@ -5755,6 +5755,7 @@ class QemuSystemCommandTests(unittest.TestCase):
     def test_frontend_layout_rotation_and_custom_keymap_controls(self) -> None:
         root = Path(__file__).resolve().parents[1]
         frontend = (root / "emu/web/frontend.py").read_text(encoding="utf-8")
+        frontend_server = (root / "emu/web/frontend_server.py").read_text(encoding="utf-8")
 
         self.assertIn('class="workspace"', frontend)
         self.assertIn('class="control-sidebar"', frontend)
@@ -5809,6 +5810,10 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("gamepadBindingActive(gamepad, binding, activeGamepadInputs.has(sourceId))", frontend)
         self.assertIn("window.addEventListener('gamepaddisconnected'", frontend)
         self.assertIn("captureSuppressedGamepadInputs", frontend)
+        self.assertIn('id="gamepadStatus"', frontend)
+        self.assertIn("function readGamepads()", frontend)
+        self.assertIn("window.addEventListener('pointerdown', () => { gamepadInputFocused = true; }", frontend)
+        self.assertIn('self.send_header("Permissions-Policy", "gamepad=(self)")', frontend_server)
         self.assertIn(".key-cancel { grid-column: 1; grid-row: 1 / 3; }", frontend)
         self.assertIn(".key-up { grid-column: 3; grid-row: 1; }", frontend)
         self.assertIn(".key-ok { grid-column: 5; grid-row: 1 / 3; }", frontend)
