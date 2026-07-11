@@ -167,16 +167,16 @@ HTML = r"""<!doctype html>
         </div>
         <section class="keymap-panel">
           <div class="keymap-header">
-            <h2>键盘映射</h2>
+            <h2>输入映射</h2>
             <button id="resetKeyBindings" class="secondary icon-button" title="恢复默认映射" aria-label="恢复默认映射">↺</button>
           </div>
           <div class="binding-grid">
-            <div class="binding-control"><span>上</span><button data-binding-code="4">W</button></div>
-            <div class="binding-control"><span>下</span><button data-binding-code="5">S</button></div>
-            <div class="binding-control"><span>左</span><button data-binding-code="6">A</button></div>
-            <div class="binding-control"><span>右</span><button data-binding-code="7">D</button></div>
-            <div class="binding-control"><span>确定</span><button data-binding-code="10">Space</button></div>
-            <div class="binding-control"><span>退出</span><button data-binding-code="9">Esc</button></div>
+            <div class="binding-control"><span>上</span><button data-binding-code="4">W / 手柄↑</button></div>
+            <div class="binding-control"><span>下</span><button data-binding-code="5">S / 手柄↓</button></div>
+            <div class="binding-control"><span>左</span><button data-binding-code="6">A / 手柄←</button></div>
+            <div class="binding-control"><span>右</span><button data-binding-code="7">D / 手柄→</button></div>
+            <div class="binding-control"><span>确定</span><button data-binding-code="10">Space / 手柄 B0</button></div>
+            <div class="binding-control"><span>退出</span><button data-binding-code="9">Esc / 手柄 B1</button></div>
           </div>
         </section>
       </div>
@@ -254,6 +254,7 @@ const touchMoveBackpressureMs = 100;
 const minKeyHoldMs = 100;
 const wsIdleReconnectMs = 5000;
 const keyBindingStorageKey = 'bbk9588.keyBindings.v1';
+const gamepadBindingStorageKey = 'bbk9588.gamepadBindings.v1';
 const defaultKeyBindings = Object.freeze({
   4:'KeyW',
   5:'KeyS',
@@ -262,9 +263,18 @@ const defaultKeyBindings = Object.freeze({
   9:'Escape',
   10:'Space',
 });
+const defaultGamepadBindings = Object.freeze({
+  4:'button:12',
+  5:'button:13',
+  6:'button:14',
+  7:'button:15',
+  9:'button:1',
+  10:'button:0',
+});
 const rotationOrientations = ['raw', 'cw90', 'rot180', 'ccw90'];
 const orientationLabels = {raw:'0°', cw90:'90°', rot180:'180°', ccw90:'270°', hflip:'水平', vflip:'垂直'};
 let keyBindings = loadKeyBindings();
+let gamepadBindings = loadGamepadBindings();
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -1035,8 +1045,28 @@ function loadKeyBindings() {
   }
   return bindings;
 }
+function loadGamepadBindings() {
+  const bindings = {...defaultGamepadBindings};
+  try {
+    const saved = JSON.parse(localStorage.getItem(gamepadBindingStorageKey) || '{}');
+    for (const code of Object.keys(bindings)) {
+      if (typeof saved[code] === 'string' && saved[code]) bindings[code] = saved[code];
+    }
+    if (new Set(Object.values(bindings)).size !== Object.keys(bindings).length) {
+      return {...defaultGamepadBindings};
+    }
+  } catch (err) {
+    console.error(err);
+  }
+  return bindings;
+}
 function saveKeyBindings() {
-  try { localStorage.setItem(keyBindingStorageKey, JSON.stringify(keyBindings)); } catch (err) { console.error(err); }
+  try {
+    localStorage.setItem(keyBindingStorageKey, JSON.stringify(keyBindings));
+    localStorage.setItem(gamepadBindingStorageKey, JSON.stringify(gamepadBindings));
+  } catch (err) {
+    console.error(err);
+  }
 }
 function keyboardCodeLabel(code) {
   if (code === 'Space') return 'Space';
@@ -1049,6 +1079,17 @@ function keyboardCodeLabel(code) {
   if (code.startsWith('Arrow')) return code.slice(5);
   return code;
 }
+function gamepadBindingLabel(binding) {
+  const button = /^button:(\d+)$/.exec(binding || '');
+  if (button) {
+    const index = Number(button[1]);
+    const dpadLabels = {12:'手柄↑', 13:'手柄↓', 14:'手柄←', 15:'手柄→'};
+    return dpadLabels[index] || `手柄 B${index}`;
+  }
+  const axis = /^axis:(\d+):([+-])$/.exec(binding || '');
+  if (axis) return `手柄轴${axis[1]}${axis[2]}`;
+  return binding || '未设置';
+}
 function updateKeyBindingUi() {
   document.querySelectorAll('[data-key-hint]').forEach(el => {
     el.textContent = keyboardCodeLabel(keyBindings[String(el.dataset.keyHint)] || '');
@@ -1057,24 +1098,30 @@ function updateKeyBindingUi() {
     const code = String(btn.dataset.bindingCode);
     const capturing = bindingCaptureCode === code;
     btn.classList.toggle('capturing', capturing);
-    btn.textContent = capturing ? '…' : keyboardCodeLabel(keyBindings[code] || '');
+    const keyboardLabel = keyboardCodeLabel(keyBindings[code] || '');
+    const gamepadLabel = gamepadBindingLabel(gamepadBindings[code] || '');
+    btn.textContent = capturing ? '输入…' : `${keyboardLabel} / ${gamepadLabel}`;
+    btn.title = capturing
+      ? '按键盘、手柄按钮或推动摇杆'
+      : `键盘：${keyboardLabel}；手柄：${gamepadLabel}`;
   });
 }
 function beginBindingCapture(code) {
   bindingCaptureCode = String(code);
   updateKeyBindingUi();
 }
-function assignCapturedBinding(physicalCode) {
+function assignCapturedBinding(bindings, physicalCode) {
   const targetCode = bindingCaptureCode;
-  if (targetCode === null) return;
-  const previous = keyBindings[targetCode];
-  const duplicate = Object.keys(keyBindings).find(code => code !== targetCode && keyBindings[code] === physicalCode);
-  if (duplicate) keyBindings[duplicate] = previous;
-  keyBindings[targetCode] = physicalCode;
+  if (targetCode === null) return false;
+  const previous = bindings[targetCode];
+  const duplicate = Object.keys(bindings).find(code => code !== targetCode && bindings[code] === physicalCode);
+  if (duplicate) bindings[duplicate] = previous;
+  bindings[targetCode] = physicalCode;
   bindingCaptureCode = null;
   saveKeyBindings();
   updateKeyBindingUi();
   if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  return true;
 }
 document.querySelectorAll('[data-binding-code]').forEach(btn => {
   btn.addEventListener('click', ev => {
@@ -1084,6 +1131,7 @@ document.querySelectorAll('[data-binding-code]').forEach(btn => {
 });
 resetKeyBindingsEl.onclick = () => {
   keyBindings = {...defaultKeyBindings};
+  gamepadBindings = {...defaultGamepadBindings};
   bindingCaptureCode = null;
   saveKeyBindings();
   updateKeyBindingUi();
@@ -1091,6 +1139,19 @@ resetKeyBindingsEl.onclick = () => {
 const activeButtonPointers = new Map();
 const buttonKeyStates = new Map();
 const activeKeyboardKeys = new Map();
+const activeGamepadInputs = new Map();
+const gamepadPreviousStates = new Map();
+const captureSuppressedGamepadInputs = new Set();
+const gamepadPressThreshold = 0.65;
+const gamepadReleaseThreshold = 0.35;
+let gamepadInputFocused = document.hasFocus();
+function updateDeviceKeyActive(code) {
+  const btn = document.querySelector(`[data-key="${code}"]`);
+  if (!btn) return;
+  const keyboardActive = Array.from(activeKeyboardKeys.values()).includes(code);
+  const gamepadActive = Array.from(activeGamepadInputs.values()).some(state => state.code === code);
+  btn.classList.toggle('active', buttonKeyStates.has(code) || keyboardActive || gamepadActive);
+}
 function sendKeyButton(btn, down, phase = '') {
   btn.classList.toggle('active', down);
   wsSend({
@@ -1163,7 +1224,7 @@ window.addEventListener('keydown', ev => {
   if (bindingCaptureCode !== null) {
     ev.preventDefault();
     ev.stopPropagation();
-    assignCapturedBinding(ev.code);
+    assignCapturedBinding(keyBindings, ev.code);
     return;
   }
   if (isEditableTarget(ev.target)) return;
@@ -1171,6 +1232,7 @@ window.addEventListener('keydown', ev => {
   if (code === null || activeKeyboardKeys.has(ev.code)) return;
   ev.preventDefault();
   activeKeyboardKeys.set(ev.code, code);
+  updateDeviceKeyActive(code);
   wsSend({op:'key', code, down:true, source:'keyboard', advance:false, run:true});
 });
 window.addEventListener('keyup', ev => {
@@ -1179,13 +1241,146 @@ window.addEventListener('keyup', ev => {
   ev.preventDefault();
   activeKeyboardKeys.delete(ev.code);
   wsSend({op:'key', code, down:false, source:'keyboard', advance:false, run:true});
+  updateDeviceKeyActive(code);
 });
-window.addEventListener('blur', () => {
+function releaseKeyboardInputs(source = 'keyboard-blur') {
+  const releasedCodes = new Set(activeKeyboardKeys.values());
   for (const code of activeKeyboardKeys.values()) {
-    wsSend({op:'key', code, down:false, source:'keyboard-blur', advance:false, run:true});
+    wsSend({op:'key', code, down:false, source, advance:false, run:true});
   }
   activeKeyboardKeys.clear();
+  releasedCodes.forEach(updateDeviceKeyActive);
+}
+function gamepadSnapshot(gamepad) {
+  return {
+    buttons:Array.from(gamepad.buttons, button => Boolean(button.pressed || button.value >= 0.5)),
+    axes:Array.from(gamepad.axes, value => Number(value) || 0),
+  };
+}
+function capturedGamepadBinding(gamepad, previous) {
+  for (let index = 0; index < gamepad.buttons.length; index += 1) {
+    const active = Boolean(gamepad.buttons[index].pressed || gamepad.buttons[index].value >= 0.5);
+    if (active && !previous?.buttons?.[index]) return `button:${index}`;
+  }
+  for (let index = 0; index < gamepad.axes.length; index += 1) {
+    const value = Number(gamepad.axes[index]) || 0;
+    const previousValue = Number(previous?.axes?.[index]) || 0;
+    if (Math.abs(value) >= 0.75 && Math.abs(previousValue) < gamepadReleaseThreshold) {
+      return `axis:${index}:${value < 0 ? '-' : '+'}`;
+    }
+  }
+  return null;
+}
+function gamepadBindingActive(gamepad, binding, wasActive) {
+  const button = /^button:(\d+)$/.exec(binding || '');
+  if (button) {
+    const state = gamepad.buttons[Number(button[1])];
+    return Boolean(state && (state.pressed || state.value >= 0.5));
+  }
+  const axis = /^axis:(\d+):([+-])$/.exec(binding || '');
+  if (!axis) return false;
+  const value = Number(gamepad.axes[Number(axis[1])]) || 0;
+  const threshold = wasActive ? gamepadReleaseThreshold : gamepadPressThreshold;
+  return axis[2] === '+' ? value >= threshold : value <= -threshold;
+}
+function sendGamepadKey(code, down, phase) {
+  wsSend({op:'key', code, down, source:'gamepad', phase, advance:false, run:true});
+}
+function beginGamepadInput(sourceId, code) {
+  const existing = activeGamepadInputs.get(sourceId);
+  if (existing?.releaseTimer) {
+    clearTimeout(existing.releaseTimer);
+    existing.releaseTimer = null;
+    updateDeviceKeyActive(code);
+    return;
+  }
+  if (existing) return;
+  const alreadyDown = Array.from(activeGamepadInputs.values()).some(state => state.code === code);
+  activeGamepadInputs.set(sourceId, {code, downAt:performance.now(), releaseTimer:null});
+  if (!alreadyDown) sendGamepadKey(code, true, 'down');
+  updateDeviceKeyActive(code);
+}
+function endGamepadInput(sourceId, phase = 'up', immediate = false) {
+  const state = activeGamepadInputs.get(sourceId);
+  if (!state || state.releaseTimer) return;
+  const release = () => {
+    activeGamepadInputs.delete(sourceId);
+    const stillDown = Array.from(activeGamepadInputs.values()).some(other => other.code === state.code);
+    if (!stillDown) sendGamepadKey(state.code, false, phase);
+    updateDeviceKeyActive(state.code);
+  };
+  if (immediate) {
+    release();
+    return;
+  }
+  const delay = Math.max(0, minKeyHoldMs - (performance.now() - state.downAt));
+  state.releaseTimer = setTimeout(release, delay);
+}
+function releaseGamepadInputs(phase = 'disconnect') {
+  for (const sourceId of Array.from(activeGamepadInputs.keys())) {
+    const state = activeGamepadInputs.get(sourceId);
+    if (state?.releaseTimer) clearTimeout(state.releaseTimer);
+    if (state) state.releaseTimer = null;
+    endGamepadInput(sourceId, phase, true);
+  }
+}
+function pollGamepads() {
+  const visible = document.visibilityState === 'visible';
+  const gamepads = visible && gamepadInputFocused && typeof navigator.getGamepads === 'function'
+    ? Array.from(navigator.getGamepads()).filter(Boolean)
+    : [];
+  const connected = new Set();
+  const seenSources = new Set();
+  for (const gamepad of gamepads) {
+    connected.add(gamepad.index);
+    const previous = gamepadPreviousStates.get(gamepad.index);
+    if (bindingCaptureCode !== null) {
+      const captured = capturedGamepadBinding(gamepad, previous);
+      if (captured) {
+        captureSuppressedGamepadInputs.add(`${gamepad.index}:${captured}`);
+        assignCapturedBinding(gamepadBindings, captured);
+      }
+    }
+    for (const [guestCodeText, binding] of Object.entries(gamepadBindings)) {
+      const code = Number(guestCodeText);
+      const sourceId = `${gamepad.index}:${code}:${binding}`;
+      seenSources.add(sourceId);
+      const active = gamepadBindingActive(gamepad, binding, activeGamepadInputs.has(sourceId));
+      const suppressionId = `${gamepad.index}:${binding}`;
+      if (captureSuppressedGamepadInputs.has(suppressionId)) {
+        if (!active) captureSuppressedGamepadInputs.delete(suppressionId);
+        endGamepadInput(sourceId, 'capture', true);
+        continue;
+      }
+      if (active) beginGamepadInput(sourceId, code);
+      else endGamepadInput(sourceId);
+    }
+    gamepadPreviousStates.set(gamepad.index, gamepadSnapshot(gamepad));
+  }
+  for (const sourceId of Array.from(activeGamepadInputs.keys())) {
+    if (!seenSources.has(sourceId)) endGamepadInput(sourceId, visible ? 'disconnect' : 'hidden', true);
+  }
+  for (const index of Array.from(gamepadPreviousStates.keys())) {
+    if (!connected.has(index)) {
+      gamepadPreviousStates.delete(index);
+      for (const suppressionId of Array.from(captureSuppressedGamepadInputs)) {
+        if (suppressionId.startsWith(`${index}:`)) captureSuppressedGamepadInputs.delete(suppressionId);
+      }
+    }
+  }
+  requestAnimationFrame(pollGamepads);
+}
+window.addEventListener('blur', () => {
+  gamepadInputFocused = false;
+  releaseKeyboardInputs();
+  releaseGamepadInputs('gamepad-blur');
 });
+window.addEventListener('focus', () => { gamepadInputFocused = true; });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') releaseGamepadInputs('gamepad-hidden');
+});
+window.addEventListener('gamepaddisconnected', () => releaseGamepadInputs('gamepad-disconnect'));
+requestAnimationFrame(pollGamepads);
 screen.addEventListener('pointerdown', ev => {
   ev.preventDefault();
   ev.stopPropagation();
