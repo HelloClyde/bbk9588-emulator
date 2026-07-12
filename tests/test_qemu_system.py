@@ -5969,7 +5969,12 @@ class QemuSystemCommandTests(unittest.TestCase):
         changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
 
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn('git tag --merged $target --list "v[0-9]*" "emu-v*"', workflow)
+        self.assertIn(
+            'git tag --list --merged $target --sort=-version:refname "v[0-9]*" "emu-v*"',
+            workflow,
+        )
+        self.assertIn("$tagExitCode = $LASTEXITCODE", workflow)
+        self.assertLess(workflow.index("$tagExitCode = $LASTEXITCODE"), workflow.index("$previousTag ="))
         self.assertIn('git log --reverse --format="%H%x09%s" $range', workflow)
         self.assertIn("## 本版本更新", workflow)
         self.assertIn("CHANGELOG.md", workflow)

@@ -225,12 +225,14 @@ jobs:
           $target = "${{ github.sha }}"
           $repoUrl = "https://github.com/${{ github.repository }}"
 
-          $previousTag = & git tag --merged $target --list "v[0-9]*" "emu-v*" --sort=-version:refname |
-            Where-Object { $_ -and $_ -ne $tag } |
-            Select-Object -First 1
-          if ($LASTEXITCODE -ne 0) {
+          $emulatorTags = & git tag --list --merged $target --sort=-version:refname "v[0-9]*" "emu-v*"
+          $tagExitCode = $LASTEXITCODE
+          if ($tagExitCode -ne 0) {
             throw "failed to locate previous emulator tag"
           }
+          $previousTag = $emulatorTags |
+            Where-Object { $_ -and $_ -ne $tag } |
+            Select-Object -First 1
 
           $range = $target
           if ($previousTag) {
