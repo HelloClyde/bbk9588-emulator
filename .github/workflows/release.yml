@@ -35,6 +35,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -215,10 +217,61 @@ jobs:
         run: |
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           $sha256Line = Get-Content -LiteralPath "${{ steps.package.outputs.sha256_path }}"
+          $version = "${{ steps.package.outputs.version }}"
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $tag = $version
+          }
+          $target = "${{ github.sha }}"
+          $repoUrl = "https://github.com/${{ github.repository }}"
+
+          $previousTag = & git tag --merged $target --list "v[0-9]*" "emu-v*" --sort=-version:refname |
+            Where-Object { $_ -and $_ -ne $tag } |
+            Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to locate previous emulator tag"
+          }
+
+          $range = $target
+          if ($previousTag) {
+            $range = "$previousTag..$target"
+          }
+          $commitRows = & git log --reverse --format="%H%x09%s" $range
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to generate release change list"
+          }
+          $changes = @()
+          foreach ($row in $commitRows) {
+            $parts = $row -split "`t", 2
+            if ($parts.Count -ne 2) {
+              continue
+            }
+            $commit = $parts[0]
+            $short = $commit.Substring(0, 7)
+            $subject = $parts[1]
+            $changes += "- $subject ([``$short``]($repoUrl/commit/$commit))"
+          }
+          if ($changes.Count -eq 0) {
+            $changes = @("- No commits recorded since the previous emulator release.")
+          }
+
           $notes = @(
-            "BBK 9588 emulator package.",
+            "## 本版本更新",
+            ""
+          )
+          $notes += $changes
+          if ($previousTag) {
+            $notes += @(
+              "",
+              "[查看完整变更]($repoUrl/compare/$previousTag...$tag)"
+            )
+          }
+          $notes += @(
             "",
-            "Contents:",
+            "详细版本摘要见 [CHANGELOG.md]($repoUrl/blob/$tag/CHANGELOG.md)。",
+            "",
+            "## 下载说明",
+            "",
             "- Compiled bbk9588 QEMU runtime: bin/bbk9588-qemu-system-mipsel.exe.",
             "- Web frontend and root start-web launch scripts.",
             "- Python runtime and FAT/NAND image construction tools.",
@@ -227,7 +280,8 @@ jobs:
             "- Dumped firmware, NAND images, BDA applications, or local build output.",
             "- Import your own bbk9588_nand.bin or the separately published NAND release asset on first start.",
             "",
-            "SHA256:",
+            "## SHA256",
+            "",
             '```',
             $sha256Line,
             '```'

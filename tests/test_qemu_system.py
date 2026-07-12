@@ -5963,6 +5963,18 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(frontend.count('class="device-key '), 6)
         self.assertEqual(frontend.count('data-binding-code="'), 6)
 
+    def test_release_workflow_includes_version_change_notes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn('git tag --merged $target --list "v[0-9]*" "emu-v*"', workflow)
+        self.assertIn('git log --reverse --format="%H%x09%s" $range', workflow)
+        self.assertIn("## 本版本更新", workflow)
+        self.assertIn("CHANGELOG.md", workflow)
+        self.assertIn("## [v0.1.2]", changelog)
+
     def test_frontend_touch_without_reply_skips_status_snapshot(self) -> None:
         state = self._frontend_state_without_qemu(
             argparse.Namespace(
