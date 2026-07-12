@@ -67,6 +67,7 @@ from emu.web.frontend_state import (
     WS_AUDIO_MAGIC,
     FrontendState,
     display_to_touch_point,
+    web_qemu_audio_options,
 )
 from tests.qemu_audio_wav import (
     analyze_pcm_wav,
@@ -5763,6 +5764,36 @@ class QemuSystemCommandTests(unittest.TestCase):
         latest = state.audio_packets_after(delivery_seq, max_packets=4)
         self.assertEqual(len(latest), 4)
         self.assertGreater(state.audio_dropped_packets, 0)
+
+    def test_web_qemu_audio_defaults_to_muted_host_backend(self) -> None:
+        machine_options, extra_args = web_qemu_audio_options(
+            ("bootrom-nand=on",),
+            (),
+            host_audio=False,
+        )
+
+        self.assertIn("audiodev=bbk9588-web-none", machine_options)
+        self.assertEqual(
+            extra_args[-2:],
+            ("-audiodev", "driver=none,id=bbk9588-web-none"),
+        )
+
+        self.assertEqual(
+            web_qemu_audio_options(("bootrom-nand=on",), (), host_audio=True),
+            (("bootrom-nand=on",), ()),
+        )
+        custom = web_qemu_audio_options(
+            ("audiodev=wavcap",),
+            ("-audiodev", "driver=wav,id=wavcap,path=capture.wav"),
+            host_audio=False,
+        )
+        self.assertEqual(
+            custom,
+            (
+                ("audiodev=wavcap",),
+                ("-audiodev", "driver=wav,id=wavcap,path=capture.wav"),
+            ),
+        )
 
     def test_frontend_performance_metrics_compute_web_and_png_rates(self) -> None:
         state = self._frontend_state_without_qemu(

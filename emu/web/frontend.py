@@ -1844,6 +1844,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--qemu-gdb", default="none", help="QEMU GDB stub target; use 'auto' to allocate a local port.")
     ap.add_argument("--qemu-timeout", type=float, default=5.0, help="Default bounded-run timeout used by QEMU probes.")
     ap.add_argument(
+        "--qemu-host-audio",
+        action="store_true",
+        default=False,
+        help="Also play QEMU audio on the server host; Web audio remains enabled.",
+    )
+    ap.add_argument(
         "--qemu-machine-option",
         action="append",
         default=[],

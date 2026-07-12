@@ -89,6 +89,28 @@ WS_AUDIO_HEADER = struct.Struct("<8sIIHHI")
 
 KNOWN_FRONTEND_KEY_CODES = {4, 5, 6, 7, 9, 10}
 FRONTEND_ORIENTATIONS = frozenset({"raw", "rot180", "cw90", "ccw90", "hflip", "vflip"})
+WEB_AUDIODEV_ID = "bbk9588-web-none"
+
+
+def web_qemu_audio_options(
+    machine_options: tuple[str, ...],
+    extra_args: tuple[str, ...],
+    *,
+    host_audio: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Mute QEMU's host backend when the browser owns audio playback."""
+
+    has_machine_audiodev = any(
+        str(option).partition("=")[0].strip().lower() == "audiodev"
+        for option in machine_options
+    )
+    has_audiodev_arg = any(str(arg).strip().lower() == "-audiodev" for arg in extra_args)
+    if host_audio or has_machine_audiodev or has_audiodev_arg:
+        return machine_options, extra_args
+    return (
+        (*machine_options, f"audiodev={WEB_AUDIODEV_ID}"),
+        (*extra_args, "-audiodev", f"driver=none,id={WEB_AUDIODEV_ID}"),
+    )
 
 
 def deque_tail(items, limit: int) -> list[object]:
@@ -627,6 +649,11 @@ class FrontendState:
             BUILD.mkdir(parents=True, exist_ok=True)
             self.cancel_run.clear()
             self._reset_runtime_fields_locked()
+            machine_options, extra_args = web_qemu_audio_options(
+                tuple(getattr(self.args, "qemu_machine_option", []) or ()),
+                tuple(getattr(self.args, "qemu_extra_arg", []) or ()),
+                host_audio=bool(getattr(self.args, "qemu_host_audio", False)),
+            )
             config = build_bbk_qemu_config(
                 boot_mode=getattr(self.args, "boot_mode", "nand"),
                 executable=getattr(self.args, "qemu", DEFAULT_QEMU_EXECUTABLE),
@@ -645,8 +672,8 @@ class FrontendState:
                 persist_nand_writes=bool(
                     getattr(self.args, "qemu_persist_nand", True)
                 ),
-                bbk_machine_options=tuple(getattr(self.args, "qemu_machine_option", []) or ()),
-                extra_args=tuple(getattr(self.args, "qemu_extra_arg", []) or ()),
+                bbk_machine_options=machine_options,
+                extra_args=extra_args,
                 firmware_patches=getattr(self.args, "qemu_firmware_patch", None),
             )
             self.qemu_backend = QemuProcessBackend(config)

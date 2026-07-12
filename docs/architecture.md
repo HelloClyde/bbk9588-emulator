@@ -14,6 +14,8 @@ QEMU 设备模型   qemu/overlay/
 `emu/web/frontend.py` 启动本地 HTTP/WebSocket 服务。浏览器中的 canvas 显示 240x320
 framebuffer，触摸和按键事件通过前端 API 送入后端。AIC 的 S16LE PCM 通过独立
 `/audio` WebSocket 送入浏览器 AudioContext；首次用户操作用于解锁 iOS 音频策略。
+Web 启动路径默认选择 QEMU `driver=none`，避免服务器声卡与浏览器重复播放，但不会
+关闭 AIC 时钟、FIFO、DMA 或 PCM 推流。
 
 `emu/web/frontend_state.py` 负责：
 
