@@ -3753,7 +3753,7 @@ class QemuSystemCommandTests(unittest.TestCase):
 
         self.assertIn("function queueTouchMove(clientX, clientY, source = 'pointer')", frontend)
         self.assertIn("const minTouchMoveIntervalMs = 1000 / 30;", frontend)
-        self.assertIn("const touchMoveBackpressureMs = 100;", frontend)
+        self.assertIn("const touchMoveBackpressureMs = 1000 / 30;", frontend)
         self.assertIn("let touchMoveAwaitingFrame = false;", frontend)
         self.assertIn("function schedulePendingTouchMove()", frontend)
         self.assertIn("const rateDelay = minTouchMoveIntervalMs - elapsed;", frontend)
