@@ -25,6 +25,8 @@
 #define JZ4740_AIC_FIFO_DEPTH      32u
 #define JZ4740_AIC_TICK_NS         1000000LL
 #define JZ4740_AIC_MAX_TICK_FRAMES 256u
+#define JZ4740_AIC_STREAM_FRAMES   2048u
+#define JZ4740_AIC_STREAM_HZ       50u
 
 #define AICFR      0x00u
 #define AICCR      0x04u
@@ -153,6 +155,12 @@ struct JZ4740AICState {
     uint64_t input_frames;
     uint64_t underruns;
     uint64_t overruns;
+
+    JZ4740AICOutputCallback output_callback;
+    void *output_callback_opaque;
+    int16_t stream_samples[JZ4740_AIC_STREAM_FRAMES * 2u];
+    uint32_t stream_frames;
+    uint32_t stream_sample_rate;
 };
 
 static const uint32_t jz4740_codec_sample_rates[9] = {
@@ -511,6 +519,58 @@ static int16_t jz4740_aic_next_output_sample(JZ4740AICState *s,
     return 0;
 }
 
+static void jz4740_aic_flush_stream(JZ4740AICState *s)
+{
+    if (s->stream_frames != 0 && s->output_callback) {
+        s->output_callback(s->output_callback_opaque, s->stream_sample_rate,
+                           s->stream_samples, s->stream_frames);
+    }
+    s->stream_frames = 0;
+}
+
+static void jz4740_aic_stream_output(JZ4740AICState *s,
+                                     const int16_t *samples,
+                                     uint32_t frames)
+{
+    uint32_t sample_rate = jz4740_aic_sample_rate(s);
+    uint32_t target_frames = MAX(1u, sample_rate / JZ4740_AIC_STREAM_HZ);
+    unsigned volume = 128 + ((s->cdccr2 & CDCCR2_HPVOL_MASK) * 42);
+    bool muted = jz4740_aic_codec_muted(s);
+
+    if (!s->output_callback) {
+        return;
+    }
+    if (s->stream_frames != 0 && s->stream_sample_rate != sample_rate) {
+        jz4740_aic_flush_stream(s);
+    }
+    s->stream_sample_rate = sample_rate;
+    while (frames != 0) {
+        uint32_t available = JZ4740_AIC_STREAM_FRAMES - s->stream_frames;
+        uint32_t count = MIN(frames, available);
+        int16_t *dest = &s->stream_samples[s->stream_frames * 2u];
+
+        for (uint32_t i = 0; i < count * 2u; i++) {
+            dest[i] = muted ? 0 : ((int32_t)samples[i] * volume) / 255;
+        }
+        s->stream_frames += count;
+        samples += count * 2u;
+        frames -= count;
+        if (s->stream_frames >= target_frames ||
+            s->stream_frames == JZ4740_AIC_STREAM_FRAMES) {
+            jz4740_aic_flush_stream(s);
+        }
+    }
+}
+
+void jz4740_aic_set_output_callback(JZ4740AICState *s,
+                                    JZ4740AICOutputCallback callback,
+                                    void *opaque)
+{
+    jz4740_aic_flush_stream(s);
+    s->output_callback = callback;
+    s->output_callback_opaque = opaque;
+}
+
 static void jz4740_aic_out_cb(void *opaque, int free_bytes)
 {
     JZ4740AICState *s = opaque;
@@ -643,6 +703,7 @@ static uint32_t jz4740_aic_process_output(JZ4740AICState *s,
                 break;
             }
         }
+        jz4740_aic_stream_output(s, output, actual);
         if (s->out_voice && s->out_free_bytes > 0) {
             size_t bytes = actual * 2u * sizeof(int16_t);
             size_t offered = MIN(bytes, (size_t)s->out_free_bytes);
@@ -896,6 +957,8 @@ static void jz4740_aic_reset_hold(Object *obj, ResetType type)
     s->timer_running = false;
     s->input_voice_attempted = false;
     s->tx_dma_boundary = false;
+    s->stream_frames = 0;
+    s->stream_sample_rate = 0;
     timer_del(s->sample_timer);
     jz4740_aic_soft_reset(s);
     jz4740_aic_open_voices(s);

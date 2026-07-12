@@ -12,12 +12,13 @@ QEMU 设备模型   qemu/overlay/
 ## Web 前端
 
 `emu/web/frontend.py` 启动本地 HTTP/WebSocket 服务。浏览器中的 canvas 显示 240x320
-framebuffer，触摸和按键事件通过前端 API 送入后端。
+framebuffer，触摸和按键事件通过前端 API 送入后端。AIC 的 S16LE PCM 通过独立
+`/audio` WebSocket 送入浏览器 AudioContext；首次用户操作用于解锁 iOS 音频策略。
 
 `emu/web/frontend_state.py` 负责：
 
 - 管理长生命周期 QEMU 进程。
-- 接收 frame chardev 数据并推送给浏览器。
+- 接收 frame chardev 中的画面、性能和 PCM 数据，并按画面/音频通道推送给浏览器。
 - 把触摸/按键转换成 QEMU input chardev 事件。
 - 输出诊断状态。
 

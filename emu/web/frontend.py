@@ -178,6 +178,7 @@ HTML = r"""<!doctype html>
         <button id="rotateLeft" class="secondary icon-button" title="向左旋转 90°" aria-label="向左旋转 90°">↶</button>
         <span id="orientationLabel" class="orientation-label">180°</span>
         <button id="rotateRight" class="secondary icon-button" title="向右旋转 90°" aria-label="向右旋转 90°">↷</button>
+        <button id="toggleAudio" class="secondary icon-button" title="关闭声音" aria-label="关闭声音">🔊</button>
         <button id="toggleFullscreen" class="secondary icon-button" title="全屏" aria-label="全屏">⛶</button>
       </div>
       <div id="screenWrap" class="screen-wrap">
@@ -244,6 +245,7 @@ const frontendInputCalibrationEl = document.getElementById('frontendInputCalibra
 const imageStatusEl = document.getElementById('imageStatus');
 const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
+const toggleAudioEl = document.getElementById('toggleAudio');
 const toggleFullscreenEl = document.getElementById('toggleFullscreen');
 const exitFullscreenEl = document.getElementById('exitFullscreen');
 const screenWrapEl = document.getElementById('screenWrap');
@@ -270,6 +272,13 @@ let ws = null;
 let wsOpenPromise = null;
 let wsWatchdog = null;
 let wsLastMessageAt = 0;
+let audioWs = null;
+let audioWsReconnectTimer = null;
+let audioContext = null;
+let audioGain = null;
+let audioNextTime = 0;
+let audioEnabled = true;
+const scheduledAudioSources = new Set();
 let pointerActive = false;
 let activePointerId = null;
 let touchDownAt = 0;
@@ -295,6 +304,9 @@ const minTouchMoveIntervalMs = 1000 / 30;
 const touchMoveBackpressureMs = 1000 / 30;
 const minKeyHoldMs = 100;
 const wsIdleReconnectMs = 5000;
+const audioPacketHeaderBytes = 24;
+const audioTargetLeadSeconds = 0.06;
+const audioMaximumLeadSeconds = 0.3;
 const keyBindingStorageKey = 'bbk9588.keyBindings.v1';
 const gamepadBindingStorageKey = 'bbk9588.gamepadBindings.v1';
 const defaultKeyBindings = Object.freeze({
@@ -532,6 +544,10 @@ function formatAudioMode(audio) {
     audio.playing ? 'play' : audio.recording ? 'record' : 'idle';
   const rate = audio.sample_rate_hz ? ` ${audio.sample_rate_hz} Hz` : '';
   return `${mode}${rate}${audio.muted ? ' muted' : ''}`;
+}
+function formatWebAudio(transport) {
+  const state = !audioEnabled ? 'muted' : audioContext?.state || 'locked';
+  return `${state} / ${transport?.ws_connections ?? 0} clients`;
 }
 async function restoreNandImage() {
   if (!window.confirm('恢复基础镜像会删除这个镜像的全部持久化写入。继续？')) return;
@@ -825,6 +841,7 @@ function renderStatus(s) {
   imageStatusEl.textContent = basename(s.nand_image) || 'bbk9588_nand.bin';
   const qemuPerf = s.qemu?.performance || {};
   const qemuAudio = qemuPerf.audio || {};
+  const audioTransport = s.audio_transport || {};
   const frontendPerf = s.frontend_performance || {};
   const rows = [
     ['running', s.running],
@@ -837,6 +854,7 @@ function renderStatus(s) {
     ['qemu cpu', formatPercent(firstNumber(qemuPerf.qemu_cpu_one_core_percent, qemuPerf.qemu_cpu_host_percent))],
     ['guest ips', formatGuestIps(qemuPerf)],
     ['audio', formatAudioMode(qemuAudio)],
+    ['web audio', formatWebAudio(audioTransport)],
     ['audio fifo', `tx ${qemuAudio.tx_fifo_level ?? 0} / rx ${qemuAudio.rx_fifo_level ?? 0}`],
     ['audio dma', `tx ${formatCounter(qemuAudio.tx_dma_samples)} / rx ${formatCounter(qemuAudio.rx_dma_samples)}`],
     ['audio frames', `out ${formatCounter(qemuAudio.output_frames)} / in ${formatCounter(qemuAudio.input_frames)}`],
@@ -1026,7 +1044,8 @@ function startWsWatchdog() {
 function connectWs() {
   if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(ws);
   if (ws && ws.readyState === WebSocket.CONNECTING) return wsOpenPromise || Promise.resolve(ws);
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}/ws`);
   wsOpenPromise = new Promise((resolve, reject) => {
     ws.addEventListener('open', () => resolve(ws), {once:true});
     ws.addEventListener('error', () => reject(new Error('websocket failed')), {once:true});
@@ -1059,6 +1078,101 @@ function connectWs() {
   ws.onerror = () => ws?.close();
   return wsOpenPromise;
 }
+
+function updateAudioButton() {
+  toggleAudioEl.textContent = audioEnabled ? '🔊' : '🔇';
+  toggleAudioEl.title = audioEnabled ? '关闭声音' : '开启声音';
+  toggleAudioEl.setAttribute('aria-label', toggleAudioEl.title);
+  if (audioGain && audioContext) {
+    audioGain.gain.setValueAtTime(audioEnabled ? 1 : 0, audioContext.currentTime);
+  }
+}
+function ensureAudioContext() {
+  if (audioContext) return audioContext;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    toggleAudioEl.disabled = true;
+    toggleAudioEl.title = '浏览器不支持音频';
+    return null;
+  }
+  audioContext = new AudioContextClass({latencyHint:'interactive'});
+  audioGain = audioContext.createGain();
+  audioGain.gain.value = audioEnabled ? 1 : 0;
+  audioGain.connect(audioContext.destination);
+  return audioContext;
+}
+function stopScheduledAudio() {
+  for (const source of scheduledAudioSources) {
+    try { source.stop(); } catch (_) {}
+  }
+  scheduledAudioSources.clear();
+  audioNextTime = 0;
+}
+function unlockAudio() {
+  if (!audioEnabled) return;
+  const context = ensureAudioContext();
+  if (!context) return;
+  if (context.state !== 'running') {
+    context.resume().then(() => { audioNextTime = 0; }).catch(() => {});
+  }
+}
+function parseAudioPacket(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < audioPacketHeaderBytes) return null;
+  const magic = new Uint8Array(buffer, 0, 8);
+  const expected = [66, 66, 75, 65, 85, 68, 49, 0];
+  if (!expected.every((value, index) => magic[index] === value)) return null;
+  const view = new DataView(buffer);
+  const sequence = view.getUint32(8, true);
+  const sampleRate = view.getUint32(12, true);
+  const channels = view.getUint16(16, true);
+  const bits = view.getUint16(18, true);
+  const payloadBytes = view.getUint32(20, true);
+  if (bits !== 16 || channels < 1 || channels > 2 ||
+      sampleRate < 8000 || sampleRate > 192000 ||
+      payloadBytes === 0 || audioPacketHeaderBytes + payloadBytes !== buffer.byteLength ||
+      payloadBytes % (channels * 2) !== 0) return null;
+  return {sequence, sampleRate, channels, payloadBytes};
+}
+function scheduleAudioPacket(buffer) {
+  if (!audioEnabled) return;
+  const context = ensureAudioContext();
+  if (!context || context.state !== 'running' || !audioGain) return;
+  const packet = parseAudioPacket(buffer);
+  if (!packet) return;
+  const frames = packet.payloadBytes / (packet.channels * 2);
+  const audioBuffer = context.createBuffer(packet.channels, frames, packet.sampleRate);
+  const pcm = new DataView(buffer, audioPacketHeaderBytes, packet.payloadBytes);
+  for (let channel = 0; channel < packet.channels; channel++) {
+    const output = audioBuffer.getChannelData(channel);
+    for (let frame = 0; frame < frames; frame++) {
+      output[frame] = pcm.getInt16((frame * packet.channels + channel) * 2, true) / 32768;
+    }
+  }
+  const now = context.currentTime;
+  if (audioNextTime > now + audioMaximumLeadSeconds) stopScheduledAudio();
+  if (audioNextTime < now + 0.015) audioNextTime = now + audioTargetLeadSeconds;
+  const source = context.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioGain);
+  scheduledAudioSources.add(source);
+  source.onended = () => scheduledAudioSources.delete(source);
+  source.start(audioNextTime);
+  audioNextTime += audioBuffer.duration;
+}
+function connectAudioWs() {
+  if (audioWs && (audioWs.readyState === WebSocket.OPEN || audioWs.readyState === WebSocket.CONNECTING)) return;
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  audioWs = new WebSocket(`${protocol}//${location.host}/audio`);
+  audioWs.binaryType = 'arraybuffer';
+  audioWs.onmessage = ev => scheduleAudioPacket(ev.data);
+  audioWs.onclose = () => {
+    audioWs = null;
+    stopScheduledAudio();
+    clearTimeout(audioWsReconnectTimer);
+    audioWsReconnectTimer = setTimeout(connectAudioWs, 1500);
+  };
+  audioWs.onerror = () => audioWs?.close();
+}
 function stopPolling() {
   if (poller) { clearInterval(poller); poller = null; }
 }
@@ -1086,6 +1200,7 @@ function requestStop() {
 }
 document.getElementById('reset').onclick = async () => {
   stopPolling();
+  stopScheduledAudio();
   wsSend({op:'reset'});
 };
 document.getElementById('stop').onclick = async () => {
@@ -1145,6 +1260,11 @@ fileImportInputEl.onchange = () => {
 };
 rotateLeftEl.onclick = () => requestRotation(-1);
 rotateRightEl.onclick = () => requestRotation(1);
+toggleAudioEl.onclick = () => {
+  audioEnabled = !audioEnabled;
+  if (audioEnabled) unlockAudio(); else stopScheduledAudio();
+  updateAudioButton();
+};
 toggleFullscreenEl.onclick = toggleFullscreen;
 exitFullscreenEl.onclick = toggleFullscreen;
 toggleFullscreenEl.disabled = !(
@@ -1533,9 +1653,18 @@ window.addEventListener('blur', () => {
   releaseGamepadInputs('gamepad-blur');
 });
 window.addEventListener('focus', () => { gamepadInputFocused = true; });
-window.addEventListener('pointerdown', () => { gamepadInputFocused = true; }, {capture:true});
+window.addEventListener('pointerdown', () => {
+  gamepadInputFocused = true;
+  unlockAudio();
+}, {capture:true});
+window.addEventListener('touchend', unlockAudio, {capture:true, passive:true});
+window.addEventListener('keydown', unlockAudio, {capture:true});
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') releaseGamepadInputs('gamepad-hidden');
+  if (document.visibilityState !== 'visible') {
+    releaseGamepadInputs('gamepad-hidden');
+    stopScheduledAudio();
+    audioContext?.suspend().catch(() => {});
+  }
 });
 window.addEventListener('gamepadconnected', ev => {
   gamepadInputFocused = true;
@@ -1637,7 +1766,9 @@ screen.addEventListener('touchend', ev => {
 }, {passive:false});
 updateOrientationControls();
 updateKeyBindingUi();
+updateAudioButton();
 connectWs();
+connectAudioWs();
 refresh().catch(console.error);
 </script>
 </body>

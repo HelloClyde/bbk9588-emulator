@@ -260,6 +260,79 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if connection_unregistrar is not None:
                 connection_unregistrar()
 
+    def _handle_audio_ws(self) -> None:
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._send(400, b"missing websocket key", "text/plain")
+            return
+        accept = websocket_accept_key(key)
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.connection.settimeout(2.0)
+
+        sequence_getter = getattr(self.state, "latest_audio_sequence")
+        packet_getter = getattr(self.state, "audio_packets_after")
+        activity_waiter = getattr(self.state, "wait_for_audio_activity")
+        registrar = getattr(self.state, "register_audio_ws_connection", None)
+        unregistrar = getattr(self.state, "unregister_audio_ws_connection", None)
+        recorder = getattr(self.state, "record_audio_ws_sent", None)
+        last_seq = int(sequence_getter())
+        alive = threading.Event()
+        alive.set()
+
+        def reader() -> None:
+            frame_reader = WebSocketFrameReader(self.connection)
+            try:
+                while alive.is_set():
+                    try:
+                        frame = frame_reader.read_frame()
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    if frame is None or frame[0] == 0x8:
+                        break
+            finally:
+                alive.clear()
+
+        reader_thread = threading.Thread(
+            target=reader,
+            name="hwemu-audio-ws-reader",
+            daemon=True,
+        )
+        if registrar is not None:
+            registrar()
+        reader_thread.start()
+        try:
+            while alive.is_set():
+                packets = packet_getter(last_seq)
+                if not packets:
+                    activity_waiter(last_seq, 0.25)
+                    continue
+                for seq, payload in packets:
+                    self._ws_send_frame(0x2, payload)
+                    last_seq = int(seq)
+                    if recorder is not None:
+                        recorder(len(payload))
+        except OSError:
+            pass
+        finally:
+            alive.clear()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            reader_thread.join(timeout=0.5)
+            if unregistrar is not None:
+                unregistrar()
+
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
@@ -267,6 +340,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._send(200, self.html.encode("utf-8"), "text/html; charset=utf-8")
             elif parsed.path == "/ws":
                 self._handle_ws()
+            elif parsed.path == "/audio":
+                self._handle_audio_ws()
             elif parsed.path == "/api/status":
                 detail = parse_qs(parsed.query).get("detail", ["compact"])[0]
                 if detail in {"full", "traces"}:

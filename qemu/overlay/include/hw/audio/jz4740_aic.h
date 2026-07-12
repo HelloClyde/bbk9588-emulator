@@ -45,6 +45,9 @@ typedef struct JZ4740AICDiagnostics {
     uint64_t overruns;
 } JZ4740AICDiagnostics;
 
+typedef void (*JZ4740AICOutputCallback)(void *opaque, uint32_t sample_rate,
+                                       const int16_t *samples, size_t frames);
+
 bool jz4740_aic_tx_dma_requested(JZ4740AICState *s);
 bool jz4740_aic_rx_dma_requested(JZ4740AICState *s);
 void jz4740_aic_notify_tx_dma_boundary(JZ4740AICState *s);
@@ -55,5 +58,8 @@ size_t jz4740_aic_dma_read_rx(JZ4740AICState *s, uint8_t *buf,
                               size_t bytes, unsigned sample_bytes);
 void jz4740_aic_get_diagnostics(JZ4740AICState *s,
                                 JZ4740AICDiagnostics *diagnostics);
+void jz4740_aic_set_output_callback(JZ4740AICState *s,
+                                    JZ4740AICOutputCallback callback,
+                                    void *opaque);
 
 #endif

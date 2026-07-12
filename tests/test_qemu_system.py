@@ -39,6 +39,8 @@ from emu.qemu.system import (
     DEFAULT_QEMU_NAND_IMAGE,
     KNOWN_STALL_REGIONS,
     QEMU_BBK_AIC_PERF_PAYLOAD,
+    QEMU_BBK_AUDIO_FORMAT_S16LE,
+    QEMU_BBK_AUDIO_MAGIC,
     QEMU_BBK_FRAME_FORMAT_RGB565,
     QEMU_BBK_FRAME_HEADER,
     QEMU_BBK_FRAME_MAGIC,
@@ -61,6 +63,8 @@ from emu.qemu.system import (
 )
 from emu.web.frontend_state import (
     FRONTEND_INPUT_CALIBRATION_TARGETS,
+    WS_AUDIO_HEADER,
+    WS_AUDIO_MAGIC,
     FrontendState,
     display_to_touch_point,
 )
@@ -1616,11 +1620,16 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("s->rx_dma_samples += done / sample_bytes;", source)
         self.assertIn("s->underruns++;", source)
         self.assertIn("s->overruns++;", source)
+        self.assertIn("JZ4740AICOutputCallback output_callback;", source)
+        self.assertIn("jz4740_aic_stream_output(s, output, actual);", source)
+        self.assertIn("JZ4740_AIC_STREAM_HZ       50u", source)
 
         self.assertIn("TYPE_JZ4740_AIC", board)
         self.assertIn("sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0020000u));", board)
         self.assertIn('{ "bbk9588.msc",      0xb0021000, 0x1000', board)
         self.assertIn("machine_add_audiodev_property(mc);", board)
+        self.assertIn("#define BBK9588_AUDIO_MAGIC", board)
+        self.assertIn("jz4740_aic_set_output_callback", board)
         self.assertIn("CONFIG_BBK9588", meson)
         self.assertIn("jz4740_aic.c", meson)
 
@@ -3665,6 +3674,43 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(backend.audio_metrics.get("sample_rate_hz"), 44100)
         self.assertEqual(backend.audio_metrics.get("tx_dma_samples"), 1024)
 
+    def test_qemu_frame_reader_forwards_pcm_audio_packet(self) -> None:
+        payload = struct.pack("<8h", 0, 1000, -1000, 2000, -2000, 3000, -3000, 0)
+        packet = QEMU_BBK_FRAME_HEADER.pack(
+            QEMU_BBK_AUDIO_MAGIC,
+            29,
+            44100,
+            2,
+            4,
+            QEMU_BBK_AUDIO_FORMAT_S16LE,
+            len(payload),
+        ) + payload
+
+        class FrameSocket:
+            def recv(self, size: int) -> bytes:
+                nonlocal packet
+                chunk, packet = packet[:size], packet[size:]
+                return chunk
+
+        backend = QemuProcessBackend(QemuSystemConfig(machine="bbk9588"))
+        backend.bbk_frame_sock = FrameSocket()  # type: ignore[assignment]
+        received: list[tuple[int, int, int, bytes]] = []
+        backend.set_audio_ready_callback(
+            lambda seq, rate, channels, pcm: received.append(
+                (seq, rate, channels, pcm)
+            )
+        )
+
+        backend._frame_reader()
+
+        self.assertEqual(backend.audio_stream_packet_count, 1)
+        self.assertEqual(backend.audio_stream_bytes, len(payload))
+        self.assertEqual(received, [(29, 44100, 2, payload)])
+        self.assertEqual(
+            backend.latest_audio_chardev,
+            (29, mock.ANY, 44100, 2, payload),
+        )
+
     def test_qemu_frame_reader_notifies_frontend_immediately(self) -> None:
         payload = b"\x00\x00" * (240 * 320)
         packet = QEMU_BBK_FRAME_HEADER.pack(
@@ -5687,6 +5733,37 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(state.frame_push_queued_count, 2)
         self.assertEqual(state.frame_push_replace_count, 1)
 
+    def test_frontend_audio_queue_packages_pcm_and_drops_stale_packets(self) -> None:
+        state = self._frontend_state_without_qemu(
+            argparse.Namespace(
+                frontend_input_calibration=False,
+                boot_mode="nand",
+                nand_image=None,
+                orientation="rot180",
+                frame_push_min_interval=1.0 / 30.0,
+                frame_info_min_interval=1.0,
+            )
+        )
+        pcm = struct.pack("<4h", 100, -100, 200, -200)
+        state._on_qemu_audio_ready(7, 44100, 2, pcm)
+
+        packets = state.audio_packets_after(0)
+        self.assertEqual(len(packets), 1)
+        delivery_seq, packet = packets[0]
+        magic, qemu_seq, rate, channels, bits, payload_bytes = WS_AUDIO_HEADER.unpack(
+            packet[: WS_AUDIO_HEADER.size]
+        )
+        self.assertEqual(magic, WS_AUDIO_MAGIC)
+        self.assertEqual((qemu_seq, rate, channels, bits), (7, 44100, 2, 16))
+        self.assertEqual(payload_bytes, len(pcm))
+        self.assertEqual(packet[WS_AUDIO_HEADER.size :], pcm)
+
+        for seq in range(8, 28):
+            state._on_qemu_audio_ready(seq, 44100, 2, pcm)
+        latest = state.audio_packets_after(delivery_seq, max_packets=4)
+        self.assertEqual(len(latest), 4)
+        self.assertGreater(state.audio_dropped_packets, 0)
+
     def test_frontend_performance_metrics_compute_web_and_png_rates(self) -> None:
         state = self._frontend_state_without_qemu(
             argparse.Namespace(
@@ -5800,6 +5877,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="rotateLeft"', frontend)
         self.assertIn('id="rotateRight"', frontend)
         self.assertIn('id="toggleFullscreen"', frontend)
+        self.assertIn('id="toggleAudio"', frontend)
         self.assertIn('id="screenWrap" class="screen-wrap"', frontend)
         self.assertIn('id="exitFullscreen"', frontend)
         self.assertIn("wsSend({op:'set-orientation', orientation:next})", frontend)
@@ -5828,7 +5906,12 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("captureSuppressedGamepadInputs", frontend)
         self.assertIn('id="gamepadStatus"', frontend)
         self.assertIn("function readGamepads()", frontend)
-        self.assertIn("window.addEventListener('pointerdown', () => { gamepadInputFocused = true; }", frontend)
+        self.assertIn("window.addEventListener('pointerdown', () => {", frontend)
+        self.assertIn("const AudioContextClass = window.AudioContext || window.webkitAudioContext;", frontend)
+        self.assertIn("context.resume().then(() => { audioNextTime = 0; })", frontend)
+        self.assertIn("new WebSocket(`${protocol}//${location.host}/audio`)", frontend)
+        self.assertIn("window.addEventListener('touchend', unlockAudio", frontend)
+        self.assertIn('elif parsed.path == "/audio":', frontend_server)
         self.assertIn("const touchMoveBackpressureMs = 1000 / 30;", frontend)
         self.assertIn("reply:false", frontend)
         self.assertIn('self.send_header("Permissions-Policy", "gamepad=(self)")', frontend_server)

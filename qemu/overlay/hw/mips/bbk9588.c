@@ -146,7 +146,9 @@
 #define BBK9588_GUI_EVENT_OBJ_OFF  0xf0u
 #define BBK9588_FRAME_MAGIC        0x464b4242u
 #define BBK9588_PERF_MAGIC         0x504b4242u
+#define BBK9588_AUDIO_MAGIC        0x414b4242u
 #define BBK9588_FRAME_FORMAT_RGB565 0x00005635u
+#define BBK9588_AUDIO_FORMAT_S16LE 0x36314c53u
 #define BBK9588_PERF_FORMAT_GUEST_INSNS 0x00004950u
 #define BBK9588_PERF_PAYLOAD_BYTES 16u
 #define BBK9588_PERF_FORMAT_AIC  0x00434941u
@@ -552,6 +554,7 @@ struct Bbk9588MachineState {
     uint8_t lcd_last_framebuffer[BBK9588_LCD_BYTES];
     uint32_t lcd_frame_seq;
     uint32_t perf_seq;
+    uint32_t audio_seq;
     uint32_t lcd_dma_desc_va;
     uint32_t lcd_dma_frame_va;
     int64_t lcd_scanout_not_before_ms;
@@ -1472,6 +1475,33 @@ static bool bbk9588_lcd_send_frame(Bbk9588MachineState *board)
         return false;
     }
     return true;
+}
+
+static void bbk9588_audio_output(void *opaque, uint32_t sample_rate,
+                                 const int16_t *samples, size_t frames)
+{
+    Bbk9588MachineState *board = opaque;
+    uint32_t header[7];
+    size_t payload_bytes = frames * 2u * sizeof(int16_t);
+
+    if (frames == 0 || !qemu_chr_fe_backend_connected(&board->frame_chr)) {
+        return;
+    }
+    board->audio_seq++;
+    header[0] = cpu_to_le32(BBK9588_AUDIO_MAGIC);
+    header[1] = cpu_to_le32(board->audio_seq);
+    header[2] = cpu_to_le32(sample_rate);
+    header[3] = cpu_to_le32(2u);
+    header[4] = cpu_to_le32(2u * sizeof(int16_t));
+    header[5] = cpu_to_le32(BBK9588_AUDIO_FORMAT_S16LE);
+    header[6] = cpu_to_le32(payload_bytes);
+
+    if (qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)header,
+                              sizeof(header)) < 0) {
+        return;
+    }
+    qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)samples,
+                          payload_bytes);
 }
 
 static bool bbk9588_perf_send_metrics(Bbk9588MachineState *board,
@@ -5303,6 +5333,7 @@ static void bbk9588_create_aic_device(MachineState *machine,
                        qdev_get_gpio_in(DEVICE(board->dmac),
                                         JZ4740_DMAC_REQUEST_AIC_RX));
     board->aic = JZ4740_AIC(dev);
+    jz4740_aic_set_output_callback(board->aic, bbk9588_audio_output, board);
 }
 
 static void bbk9588_create_intc_device(Bbk9588MachineState *board)

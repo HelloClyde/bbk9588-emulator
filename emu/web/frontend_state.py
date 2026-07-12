@@ -83,6 +83,9 @@ WS_RAW_FRAME_MAGIC = b"BBKRAW1\0"
 WS_RAW_FRAME_FORMAT_RGB565 = 1
 WS_RAW_FRAME_HEADER = struct.Struct("<8sIHHHH")
 WS_RAW_FRAME_HEADER_SIZE = WS_RAW_FRAME_HEADER.size
+WS_AUDIO_MAGIC = b"BBKAUD1\0"
+WS_AUDIO_FORMAT_S16LE = 1
+WS_AUDIO_HEADER = struct.Struct("<8sIIHHI")
 
 KNOWN_FRONTEND_KEY_CODES = {4, 5, 6, 7, 9, 10}
 FRONTEND_ORIENTATIONS = frozenset({"raw", "rot180", "cw90", "ccw90", "hflip", "vflip"})
@@ -222,6 +225,7 @@ class FrontendState:
         self.lock = threading.RLock()
         self.status_lock = threading.RLock()
         self.frontend_activity_condition = threading.Condition()
+        self.audio_activity_condition = threading.Condition()
         self.input_lock = threading.RLock()
         self.frame_io_lock = threading.Lock()
 
@@ -301,6 +305,15 @@ class FrontendState:
         self.ws_connection_count = 0
         self.ws_connection_peak = 0
         self.frontend_activity_seq = 0
+        self.audio_delivery_seq = 0
+        self.audio_packets: deque[tuple[int, bytes]] = deque(maxlen=128)
+        self.audio_received_packets = 0
+        self.audio_received_bytes = 0
+        self.audio_dropped_packets = 0
+        self.audio_ws_sent_packets = 0
+        self.audio_ws_sent_bytes = 0
+        self.audio_ws_connection_count = 0
+        self.audio_ws_connection_peak = 0
         self.nand_files_lock = threading.Lock()
         self.nand_files_cache_path = BUILD / "nand_fs_cache" / "bbk9588_fat.img"
         self.nand_files_cache_signature: tuple[str, int, int] | None = None
@@ -584,6 +597,14 @@ class FrontendState:
         self._perf_last_ws_frame_sent_count = 0
         self._perf_last_frame_push_queued_count = 0
         self._perf_last_screen_png_count = 0
+        with self.audio_activity_condition:
+            self.audio_packets.clear()
+            self.audio_received_packets = 0
+            self.audio_received_bytes = 0
+            self.audio_dropped_packets = 0
+            self.audio_ws_sent_packets = 0
+            self.audio_ws_sent_bytes = 0
+            self.audio_activity_condition.notify_all()
         with self.input_lock:
             self.pending_touches.clear()
             self.pending_keys.clear()
@@ -594,6 +615,9 @@ class FrontendState:
             callback_setter = getattr(old_backend, "set_frame_ready_callback", None)
             if callback_setter is not None:
                 callback_setter(None)
+            audio_callback_setter = getattr(old_backend, "set_audio_ready_callback", None)
+            if audio_callback_setter is not None:
+                audio_callback_setter(None)
             old_backend.stop()
         self.cancel_run.set()
         if self.qemu_worker is not None and self.qemu_worker.is_alive() and self.qemu_worker is not threading.current_thread():
@@ -627,6 +651,7 @@ class FrontendState:
             )
             self.qemu_backend = QemuProcessBackend(config)
             self.qemu_backend.set_frame_ready_callback(self._on_qemu_frame_ready)
+            self.qemu_backend.set_audio_ready_callback(self._on_qemu_audio_ready)
             try:
                 self.qemu_backend.start()
                 self.running = bool(self._backend_snapshot(self.qemu_backend, refresh=False).get("running"))
@@ -704,6 +729,86 @@ class FrontendState:
     def _on_qemu_frame_ready(self) -> None:
         self.frame_push_hook_count += 1
         self._notify_frontend_activity()
+
+    def _on_qemu_audio_ready(
+        self,
+        qemu_seq: int,
+        sample_rate: int,
+        channels: int,
+        pcm: bytes,
+    ) -> None:
+        packet = WS_AUDIO_HEADER.pack(
+            WS_AUDIO_MAGIC,
+            int(qemu_seq) & 0xFFFFFFFF,
+            int(sample_rate),
+            int(channels),
+            16,
+            len(pcm),
+        ) + pcm
+        with self.audio_activity_condition:
+            self.audio_delivery_seq += 1
+            self.audio_packets.append((self.audio_delivery_seq, packet))
+            self.audio_received_packets += 1
+            self.audio_received_bytes += len(pcm)
+            self.audio_activity_condition.notify_all()
+
+    def latest_audio_sequence(self) -> int:
+        with self.audio_activity_condition:
+            return self.audio_delivery_seq
+
+    def audio_packets_after(
+        self,
+        last_seq: int,
+        max_packets: int = 12,
+    ) -> list[tuple[int, bytes]]:
+        with self.audio_activity_condition:
+            packets = [entry for entry in self.audio_packets if entry[0] > last_seq]
+            max_packets = max(1, int(max_packets))
+            if len(packets) > max_packets:
+                dropped = len(packets) - max_packets
+                self.audio_dropped_packets += dropped
+                packets = packets[-max_packets:]
+            return packets
+
+    def wait_for_audio_activity(self, last_seq: int, timeout: float) -> int:
+        deadline = time.time() + max(0.0, timeout)
+        with self.audio_activity_condition:
+            while self.audio_delivery_seq == last_seq:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self.audio_activity_condition.wait(timeout=remaining)
+            return self.audio_delivery_seq
+
+    def register_audio_ws_connection(self) -> None:
+        with self.audio_activity_condition:
+            self.audio_ws_connection_count += 1
+            self.audio_ws_connection_peak = max(
+                self.audio_ws_connection_peak,
+                self.audio_ws_connection_count,
+            )
+
+    def unregister_audio_ws_connection(self) -> None:
+        with self.audio_activity_condition:
+            self.audio_ws_connection_count = max(0, self.audio_ws_connection_count - 1)
+
+    def record_audio_ws_sent(self, payload_bytes: int) -> None:
+        with self.audio_activity_condition:
+            self.audio_ws_sent_packets += 1
+            self.audio_ws_sent_bytes += max(0, int(payload_bytes))
+
+    def _audio_transport_snapshot(self) -> dict[str, object]:
+        with self.audio_activity_condition:
+            return {
+                "received_packets": self.audio_received_packets,
+                "received_bytes": self.audio_received_bytes,
+                "queued_packets": len(self.audio_packets),
+                "dropped_packets": self.audio_dropped_packets,
+                "ws_sent_packets": self.audio_ws_sent_packets,
+                "ws_sent_bytes": self.audio_ws_sent_bytes,
+                "ws_connections": self.audio_ws_connection_count,
+                "ws_connection_peak": self.audio_ws_connection_peak,
+            }
 
     def pop_queued_frame(self) -> bytes | None:
         return None
@@ -1563,6 +1668,7 @@ class FrontendState:
             "framebuffer_dirty_last": None,
             "queued_frames": 0,
             "frontend_performance": frontend_performance,
+            "audio_transport": self._audio_transport_snapshot(),
             "frame_push": {
                 "min_interval": self.frame_push_min_interval,
                 "hook_count": self.frame_push_hook_count,

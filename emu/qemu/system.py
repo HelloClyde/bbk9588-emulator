@@ -33,7 +33,9 @@ DEFAULT_QEMU_BBK_INPUT_CHR_ID = "bbk9588-input"
 DEFAULT_QEMU_BBK_FRAME_CHR_ID = "bbk9588-frame"
 QEMU_BBK_FRAME_MAGIC = 0x464B4242
 QEMU_BBK_PERF_MAGIC = 0x504B4242
+QEMU_BBK_AUDIO_MAGIC = 0x414B4242
 QEMU_BBK_FRAME_FORMAT_RGB565 = 0x00005635
+QEMU_BBK_AUDIO_FORMAT_S16LE = 0x36314C53
 QEMU_BBK_PERF_FORMAT_GUEST_INSNS = 0x00004950
 QEMU_BBK_PERF_FORMAT_AIC = 0x00434941
 QEMU_BBK_FRAME_HEADER = struct.Struct("<IIIIIII")
@@ -549,6 +551,11 @@ class QemuProcessBackend:
         self.last_frame_chardev_error: str | None = None
         self.latest_frame_chardev: tuple[int, float, bytes] | None = None
         self.frame_ready_callback: Callable[[], None] | None = None
+        self.latest_audio_chardev: tuple[int, float, int, int, bytes] | None = None
+        self.audio_stream_packet_count = 0
+        self.audio_stream_bytes = 0
+        self.last_audio_stream_error: str | None = None
+        self.audio_ready_callback: Callable[[int, int, int, bytes], None] | None = None
         self.performance_metrics: dict[str, object] = {}
         self.guest_insn_count: int | None = None
         self.guest_insn_count_at: float = 0.0
@@ -751,6 +758,10 @@ class QemuProcessBackend:
             self.frame_chardev_count = 0
             self.last_frame_chardev_error = None
             self.latest_frame_chardev = None
+            self.latest_audio_chardev = None
+            self.audio_stream_packet_count = 0
+            self.audio_stream_bytes = 0
+            self.last_audio_stream_error = None
             self.performance_metrics = {}
             self.guest_insn_count = None
             self.guest_insn_count_at = 0.0
@@ -969,6 +980,13 @@ class QemuProcessBackend:
         with self._lock:
             self.frame_ready_callback = callback
 
+    def set_audio_ready_callback(
+        self,
+        callback: Callable[[int, int, int, bytes], None] | None,
+    ) -> None:
+        with self._lock:
+            self.audio_ready_callback = callback
+
     def _frame_reader(self) -> None:
         sock = self.bbk_frame_sock
         if sock is None:
@@ -977,6 +995,45 @@ class QemuProcessBackend:
             while True:
                 header = self._recv_exact(sock, QEMU_BBK_FRAME_HEADER.size)
                 magic, seq, width, height, stride, fmt, payload_len = QEMU_BBK_FRAME_HEADER.unpack(header)
+                if magic == QEMU_BBK_AUDIO_MAGIC:
+                    sample_rate = width
+                    channels = height
+                    if (
+                        sample_rate < 8000
+                        or sample_rate > 192000
+                        or channels not in (1, 2)
+                        or stride != channels * 2
+                        or fmt != QEMU_BBK_AUDIO_FORMAT_S16LE
+                        or payload_len == 0
+                        or payload_len > 256 * 1024
+                        or payload_len % stride != 0
+                    ):
+                        raise ValueError(
+                            "invalid audio chardev header "
+                            f"seq={seq} rate={sample_rate} channels={channels} "
+                            f"stride={stride} fmt=0x{fmt:08x} len={payload_len}"
+                        )
+                    payload = self._recv_exact(sock, payload_len)
+                    captured_at = time.time()
+                    with self._lock:
+                        self.latest_audio_chardev = (
+                            seq,
+                            captured_at,
+                            sample_rate,
+                            channels,
+                            payload,
+                        )
+                        self.audio_stream_packet_count += 1
+                        self.audio_stream_bytes += payload_len
+                        self.last_audio_stream_error = None
+                        audio_ready_callback = self.audio_ready_callback
+                    if audio_ready_callback is not None:
+                        try:
+                            audio_ready_callback(seq, sample_rate, channels, payload)
+                        except Exception:
+                            # Browser delivery must never stop chardev ingestion.
+                            pass
+                    continue
                 if magic == QEMU_BBK_PERF_MAGIC:
                     if width != 1:
                         raise ValueError(
@@ -1035,6 +1092,8 @@ class QemuProcessBackend:
         except Exception as exc:
             with self._lock:
                 self.last_frame_chardev_error = f"{type(exc).__name__}: {exc}"
+                if "audio" in str(exc).lower():
+                    self.last_audio_stream_error = self.last_frame_chardev_error
                 if "perf" in str(exc).lower():
                     self.last_guest_insn_error = self.last_frame_chardev_error
 
@@ -7290,6 +7349,9 @@ class QemuProcessBackend:
                 "bbk_frame_connected": self.bbk_frame_sock is not None,
                 "frame_chardev_count": self.frame_chardev_count,
                 "last_frame_chardev_error": self.last_frame_chardev_error,
+                "audio_stream_packet_count": self.audio_stream_packet_count,
+                "audio_stream_bytes": self.audio_stream_bytes,
+                "last_audio_stream_error": self.last_audio_stream_error,
                 "last_guest_insn_error": self.last_guest_insn_error,
                 "performance": performance,
                 "gdb_read_count": self.gdb_read_count,
