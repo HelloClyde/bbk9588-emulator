@@ -42,7 +42,7 @@ HTML = r"""<!doctype html>
     h1 { font-size: 18px; margin: 0; font-weight: 650; }
     h2 { font-size: 13px; margin: 0 0 10px; color: #b8c0cc; font-weight: 600; }
     button, input, select { font: inherit; }
-    button { background: #2f6fed; color: white; border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+    button { background: #2f6fed; color: white; border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
     button.secondary { background: #343941; }
     button.warn { background: #9b3b3b; }
     button:disabled { opacity: .55; cursor: default; }
@@ -50,7 +50,7 @@ HTML = r"""<!doctype html>
     .screen-toolbar { width: min(560px, 100%); display: flex; justify-content: center; align-items: center; gap: 8px; }
     .orientation-label { min-width: 54px; text-align: center; color: #c9d1d9; font-size: 12px; font-variant-numeric: tabular-nums; }
     .screen-wrap { width: 100%; min-height: 0; display: flex; justify-content: center; align-items: center; background: #08090b; border: 1px solid #343941; border-radius: 8px; padding: 12px; }
-    #screen { display: block; width: min(360px, 100%); height: auto; max-height: 62vh; image-rendering: pixelated; background: #000; cursor: crosshair; touch-action: none; user-select: none; }
+    #screen { display: block; width: min(360px, 100%); height: auto; max-height: 62vh; image-rendering: pixelated; background: #000; cursor: crosshair; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     #screen.landscape { width: min(560px, 100%); }
     .fullscreen-exit { display: none; position: absolute; top: 12px; right: 12px; z-index: 2; background: rgba(32, 35, 39, .86); }
     .screen-wrap:fullscreen, .screen-wrap:-webkit-full-screen { width: 100vw; height: 100vh; padding: 16px; border: 0; border-radius: 0; background: #000; position: relative; }
@@ -63,7 +63,8 @@ HTML = r"""<!doctype html>
     .kv-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .device-controls { width: min(560px, 100%); display: flex; flex-direction: column; align-items: center; gap: 14px; }
     .device-keypad { display: grid; grid-template-columns: repeat(5, 54px); grid-template-rows: repeat(2, 48px); gap: 8px; justify-content: center; }
-    .device-key { min-width: 0; min-height: 0; padding: 5px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; background: #343941; }
+    .device-key { min-width: 0; min-height: 0; padding: 5px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; background: #343941; touch-action: none; }
+    .device-key > * { pointer-events: none; user-select: none; -webkit-user-select: none; }
     .device-key.active { background: #5794ff; }
     .device-key .key-symbol { font-size: 19px; line-height: 1; }
     .device-key kbd { min-width: 24px; color: #adb7c5; font-size: 10px; font-family: inherit; font-weight: 500; }
@@ -1530,6 +1531,9 @@ function endKeyButton(btn, phase) {
   }, delay);
 }
 document.querySelectorAll('[data-key]').forEach(btn => {
+  btn.addEventListener('contextmenu', ev => ev.preventDefault());
+  btn.addEventListener('selectstart', ev => ev.preventDefault());
+  btn.addEventListener('dblclick', ev => ev.preventDefault());
   btn.addEventListener('pointerdown', ev => {
     ev.preventDefault();
     if (activeButtonPointers.has(ev.pointerId)) return;

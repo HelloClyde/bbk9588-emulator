@@ -5955,6 +5955,11 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn(".key-cancel { grid-column: 1; grid-row: 1 / 3; }", frontend)
         self.assertIn(".key-up { grid-column: 3; grid-row: 1; }", frontend)
         self.assertIn(".key-ok { grid-column: 5; grid-row: 1 / 3; }", frontend)
+        self.assertIn("touch-action: manipulation; user-select: none; -webkit-user-select: none;", frontend)
+        self.assertIn(".device-key > * { pointer-events: none;", frontend)
+        self.assertIn("btn.addEventListener('contextmenu', ev => ev.preventDefault());", frontend)
+        self.assertIn("btn.addEventListener('selectstart', ev => ev.preventDefault());", frontend)
+        self.assertIn("btn.addEventListener('dblclick', ev => ev.preventDefault());", frontend)
         self.assertEqual(frontend.count('class="device-key '), 6)
         self.assertEqual(frontend.count('data-binding-code="'), 6)
 
