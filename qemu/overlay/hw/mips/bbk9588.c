@@ -14,7 +14,6 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
-#include "system/rtc.h"
 #include "system/system.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
@@ -28,9 +27,13 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "hw/audio/jz4740_aic.h"
+#include "hw/display/jz4740_lcd.h"
 #include "hw/dma/jz4740_dmac.h"
+#include "hw/gpio/jz4740_gpio.h"
+#include "hw/input/jz4740_sadc.h"
 #include "hw/intc/jz4740_intc.h"
 #include "hw/misc/jz4740_cpm.h"
+#include "hw/rtc/jz4740_rtc.h"
 #include "hw/timer/jz4740_tcu.h"
 #include "qemu/error-report.h"
 #include "qemu/atomic.h"
@@ -77,72 +80,6 @@
 #define BBK9588_LCD_MIRROR_CONFIG  0x804a6b88u
 #define BBK9588_LCD_STATUS_FRAME_DONE 0x00000001u
 #define BBK9588_LCD_STATUS_READY      0x00000080u
-#define BBK9588_JZ_LCD_IRQ         JZ4740_INTC_IRQ_LCD
-#define BBK9588_JZ_LCD_CTRL_BST_MASK  0x30000000u
-#define BBK9588_JZ_LCD_CTRL_RGB       0x08000000u
-#define BBK9588_JZ_LCD_CTRL_OFUP      0x04000000u
-#define BBK9588_JZ_LCD_CTRL_FRC_MASK  0x03000000u
-#define BBK9588_JZ_LCD_CTRL_PDD_MASK  0x00ff0000u
-#define BBK9588_JZ_LCD_CTRL_EOFM      0x00002000u
-#define BBK9588_JZ_LCD_CTRL_SOFM      0x00001000u
-#define BBK9588_JZ_LCD_CTRL_OFUM      0x00000800u
-#define BBK9588_JZ_LCD_CTRL_IFUM0     0x00000400u
-#define BBK9588_JZ_LCD_CTRL_IFUM1     0x00000200u
-#define BBK9588_JZ_LCD_CTRL_LDDM      0x00000100u
-#define BBK9588_JZ_LCD_CTRL_QDM       0x00000080u
-#define BBK9588_JZ_LCD_CTRL_BEDN      0x00000040u
-#define BBK9588_JZ_LCD_CTRL_PEDN      0x00000020u
-#define BBK9588_JZ_LCD_CTRL_DIS       0x00000010u
-#define BBK9588_JZ_LCD_CTRL_ENA       0x00000008u
-#define BBK9588_JZ_LCD_CTRL_BPP_MASK  0x00000007u
-#define BBK9588_JZ_LCD_CTRL_RW_MASK   0x3fff3fffu
-#define BBK9588_JZ_LCD_CFG_RW_MASK    0x80ffffbfu
-#define BBK9588_JZ_LCD_VSYNC_RW_MASK  0x000007ffu
-#define BBK9588_JZ_LCD_TIMING_RW_MASK 0x07ff07ffu
-#define BBK9588_JZ_LCD_REV_RW_MASK    0x07ff0000u
-#define BBK9588_JZ_LCD_STATE_QD       0x00000080u
-#define BBK9588_JZ_LCD_STATE_EOF      0x00000020u
-#define BBK9588_JZ_LCD_STATE_SOF      0x00000010u
-#define BBK9588_JZ_LCD_STATE_OUF      0x00000008u
-#define BBK9588_JZ_LCD_STATE_IFU0     0x00000004u
-#define BBK9588_JZ_LCD_STATE_IFU1     0x00000002u
-#define BBK9588_JZ_LCD_STATE_LDD      0x00000001u
-#define BBK9588_JZ_LCD_STATE_MASK     0x000000bfu
-#define BBK9588_JZ_LCD_DA_ALIGN_MASK  0x0000000fu
-#define BBK9588_JZ_LCD_CMD_SOFINT     0x80000000u
-#define BBK9588_JZ_LCD_CMD_EOFINT     0x40000000u
-#define BBK9588_JZ_LCD_CMD_PAL        0x10000000u
-#define BBK9588_JZ_LCD_CMD_LEN_MASK   0x00ffffffu
-#define BBK9588_JZ_LCD_CMD_RW_MASK    \
-    (BBK9588_JZ_LCD_CMD_SOFINT | BBK9588_JZ_LCD_CMD_EOFINT | \
-     BBK9588_JZ_LCD_CMD_PAL | BBK9588_JZ_LCD_CMD_LEN_MASK)
-#define BBK9588_JZ_LCD_CFG_OFF        0x00u
-#define BBK9588_JZ_LCD_VSYNC_OFF      0x04u
-#define BBK9588_JZ_LCD_HSYNC_OFF      0x08u
-#define BBK9588_JZ_LCD_VAT_OFF        0x0cu
-#define BBK9588_JZ_LCD_DAH_OFF        0x10u
-#define BBK9588_JZ_LCD_DAV_OFF        0x14u
-#define BBK9588_JZ_LCD_PS_OFF         0x18u
-#define BBK9588_JZ_LCD_CLS_OFF        0x1cu
-#define BBK9588_JZ_LCD_SPL_OFF        0x20u
-#define BBK9588_JZ_LCD_REV_OFF        0x24u
-#define BBK9588_JZ_LCD_CTRL_OFF       0x30u
-#define BBK9588_JZ_LCD_STATE_OFF      0x34u
-#define BBK9588_JZ_LCD_IID_OFF        0x38u
-#define BBK9588_JZ_LCD_DA0_OFF        0x40u
-#define BBK9588_JZ_LCD_SA0_OFF        0x44u
-#define BBK9588_JZ_LCD_FID0_OFF       0x48u
-#define BBK9588_JZ_LCD_CMD0_OFF       0x4cu
-#define BBK9588_JZ_LCD_DA1_OFF        0x50u
-#define BBK9588_JZ_LCD_SA1_OFF        0x54u
-#define BBK9588_JZ_LCD_FID1_OFF       0x58u
-#define BBK9588_JZ_LCD_CMD1_OFF       0x5cu
-#define BBK9588_JZ_LCD_DMA_STRIDE     0x10u
-#define BBK9588_JZ_LCD_DESC_BYTES     16u
-#define BBK9588_JZ_LCD_DESC_NEXT_OFF  0x00u
-#define BBK9588_JZ_LCD_DESC_SOURCE_OFF 0x04u
-#define BBK9588_JZ_LCD_DESC_FID_OFF   0x08u
-#define BBK9588_JZ_LCD_DESC_CMD_OFF   0x0cu
 #define BBK9588_GUI_EVENT_OBJ_OFF  0xf0u
 #define BBK9588_FRAME_MAGIC        0x464b4242u
 #define BBK9588_PERF_MAGIC         0x504b4242u
@@ -156,79 +93,6 @@
 #define BBK9588_AIC_PERF_PAYLOAD_BYTES \
     (BBK9588_AIC_PERF_WORDS * sizeof(uint64_t))
 #define BBK9588_PERF_PERIOD_MS     1000u
-#define BBK9588_SADC_DEFAULT_BATTERY_RAW 0x0e68u
-#define BBK9588_SADC_DEFAULT_SADCIN_RAW  0x0000u
-#define BBK9588_SADC_DATA_MASK     0x0fffu
-#define BBK9588_SADC_CONFIG_RESET  0x0002002cu
-#define BBK9588_SADC_ADENA_OFF     0x00u
-#define BBK9588_SADC_ADCFG_OFF     0x04u
-#define BBK9588_SADC_ADCTRL_OFF    0x08u
-#define BBK9588_SADC_ADSTATE_OFF   0x0cu
-#define BBK9588_SADC_ADSAME_OFF    0x10u
-#define BBK9588_SADC_ADWAIT_OFF    0x14u
-#define BBK9588_SADC_ADTCH_OFF     0x18u
-#define BBK9588_SADC_ADBDAT_OFF    0x1cu
-#define BBK9588_SADC_ADSDAT_OFF    0x20u
-#define BBK9588_SADC_CONFIG_SPZZ   0x80000000u
-#define BBK9588_SADC_CONFIG_EX_IN  0x40000000u
-#define BBK9588_SADC_CONFIG_XYZ_MASK 0x00006000u
-#define BBK9588_SADC_CONFIG_XYZ_SHIFT 13u
-#define BBK9588_SADC_CONFIG_XYZ_XY 0u
-#define BBK9588_SADC_CONFIG_XYZ_ZS 1u
-#define BBK9588_SADC_CONFIG_XYZ_Z12 2u
-#define BBK9588_SADC_CONFIG_XYZ_RESERVED 3u
-#define BBK9588_SADC_FIFO_DEPTH    2u
-#define BBK9588_SADC_ADENA_SADCINEN 0x01u
-#define BBK9588_SADC_ADENA_PBATEN   0x02u
-#define BBK9588_SADC_ADENA_TCHEN    0x04u
-#define BBK9588_SADC_STATE_SRDY     0x01u
-#define BBK9588_SADC_STATE_DRDY     0x02u
-#define BBK9588_SADC_STATE_DTCH     0x04u
-#define BBK9588_SADC_STATE_PENU     0x08u
-#define BBK9588_SADC_STATE_PEND     0x10u
-#define BBK9588_SADC_STATE_MASK     0x1fu
-#define BBK9588_SADC_TOUCH_TYPE0    0x00008000u
-#define BBK9588_SADC_TOUCH_TYPE1    0x80000000u
-#define BBK9588_SADC_TOUCH_ZS_RAW   0x0800u
-#define BBK9588_SADC_TOUCH_Z1_RAW   0x0400u
-#define BBK9588_SADC_TOUCH_Z2_RAW   0x0c00u
-#define BBK9588_SADC_TOUCH_Z3_RAW   0x0400u
-#define BBK9588_SADC_TOUCH_Z4_RAW   0x0c00u
-#define BBK9588_SADC_IRQ            JZ4740_INTC_IRQ_SADC
-#define BBK9588_GPIO_PORTS          4u
-#define BBK9588_GPIO_PORT_STRIDE    0x100u
-#define BBK9588_GPIO_PIN_OFF        0x00u
-#define BBK9588_GPIO_DAT_OFF        0x10u
-#define BBK9588_GPIO_DATS_OFF       0x14u
-#define BBK9588_GPIO_FLGC_OFF       BBK9588_GPIO_DATS_OFF
-#define BBK9588_GPIO_DATC_OFF       0x18u
-#define BBK9588_GPIO_IM_OFF         0x20u
-#define BBK9588_GPIO_IMS_OFF        0x24u
-#define BBK9588_GPIO_IMC_OFF        0x28u
-#define BBK9588_GPIO_PE_OFF         0x30u
-#define BBK9588_GPIO_PES_OFF        0x34u
-#define BBK9588_GPIO_PEC_OFF        0x38u
-#define BBK9588_GPIO_FUN_OFF        0x40u
-#define BBK9588_GPIO_FUNS_OFF       0x44u
-#define BBK9588_GPIO_FUNC_OFF       0x48u
-#define BBK9588_GPIO_SEL_OFF        0x50u
-#define BBK9588_GPIO_SELS_OFF       0x54u
-#define BBK9588_GPIO_SELC_OFF       0x58u
-#define BBK9588_GPIO_DIR_OFF        0x60u
-#define BBK9588_GPIO_DIRS_OFF       0x64u
-#define BBK9588_GPIO_DIRC_OFF       0x68u
-#define BBK9588_GPIO_TRG_OFF        0x70u
-#define BBK9588_GPIO_TRGS_OFF       0x74u
-#define BBK9588_GPIO_TRGC_OFF       0x78u
-#define BBK9588_GPIO_FLG_OFF        0x80u
-#define BBK9588_GPIO_IM_RESET       0xffffffffu
-#define BBK9588_GPIO_PORT_B_OFF     0x100u
-#define BBK9588_GPIO_PORT_C_OFF     0x200u
-#define BBK9588_GPIO_PORT_D_OFF     0x300u
-#define BBK9588_GPIO_IRQ_PORT_B     JZ4740_INTC_IRQ_GPIO1
-#define BBK9588_GPIO_IRQ_PORT_C     JZ4740_INTC_IRQ_GPIO2
-#define BBK9588_GPIO_IRQ_PORT_D     JZ4740_INTC_IRQ_GPIO3
-#define BBK9588_NAND_READY_IRQ      BBK9588_GPIO_IRQ_PORT_C
 #define BBK9588_UART_FIFO_SIZE     16u
 #define BBK9588_UART_IRQ           JZ4740_INTC_IRQ_UART0
 #define BBK9588_UART_RBR_OFF       0x00u
@@ -392,30 +256,6 @@
 #define BBK9588_NAND_TARGET_PAGE 0x256au
 #define BBK9588_NAND_TARGET_EVENT_ERASE 1u
 #define BBK9588_NAND_TARGET_EVENT_PROGRAM 2u
-#define BBK9588_RTC_MAGIC          0x87654321u
-#define BBK9588_RTC_RTCCR_RESET    0x00000081u
-#define BBK9588_RTC_RTCCR_WRDY     0x00000080u
-#define BBK9588_RTC_RTCCR_1HZ      0x00000040u
-#define BBK9588_RTC_RTCCR_1HZIE    0x00000020u
-#define BBK9588_RTC_RTCCR_AF       0x00000010u
-#define BBK9588_RTC_RTCCR_AIE      0x00000008u
-#define BBK9588_RTC_RTCCR_AE       0x00000004u
-#define BBK9588_RTC_RTCCR_RTCE     0x00000001u
-#define BBK9588_RTC_RTCCR_RW_MASK  \
-    (BBK9588_RTC_RTCCR_1HZIE | BBK9588_RTC_RTCCR_AIE | \
-     BBK9588_RTC_RTCCR_AE | BBK9588_RTC_RTCCR_RTCE)
-#define BBK9588_RTC_IRQ            JZ4740_INTC_IRQ_RTC
-#define BBK9588_RTC_RTCGR_RW_MASK  0x83ffffffu
-#define BBK9588_RTC_RTCGR_LOCK     0x80000000u
-#define BBK9588_RTC_HCR_PD         0x00000001u
-#define BBK9588_RTC_HWFCR_MASK     0x0000ffe0u
-#define BBK9588_RTC_HRCR_MASK      0x00000fe0u
-#define BBK9588_RTC_HWCR_EALM      0x00000001u
-#define BBK9588_RTC_HWRSR_MASK     0x00000033u
-#define BBK9588_RTC_HWRSR_HR       0x00000020u
-#define BBK9588_RTC_HWRSR_PPR      0x00000010u
-#define BBK9588_RTC_HWRSR_PIN      0x00000002u
-#define BBK9588_RTC_HWRSR_ALM      0x00000001u
 #define BBK9588_NAND_NFCSR_OFF         0x050u
 #define BBK9588_NAND_NFECCR_OFF        0x100u
 #define BBK9588_NAND_NFECC_OFF         0x104u
@@ -441,14 +281,12 @@
 #define KSEG1_TO_PHYS(addr)        ((addr) & 0x1fffffff)
 
 typedef enum Bbk9588MmioKind {
-    BBK9588_MMIO_GPIO,
     BBK9588_MMIO_EXTGPIO,
     BBK9588_MMIO_GRAPHICS,
     BBK9588_MMIO_UART,
     BBK9588_MMIO_UDC,
     BBK9588_MMIO_LCD,
     BBK9588_MMIO_MISC,
-    BBK9588_MMIO_RTC,
 } Bbk9588MmioKind;
 
 typedef struct Bbk9588MmioWindow {
@@ -518,25 +356,8 @@ struct Bbk9588MachineState {
     uint16_t udc_in_csr[BBK9588_UDC_EP_COUNT];
     uint16_t udc_out_maxp[BBK9588_UDC_EP_COUNT];
     uint16_t udc_out_csr[BBK9588_UDC_EP_COUNT];
-    uint32_t rtc_control;
-    uint32_t rtc_base_seconds;
-    int64_t rtc_base_ns;
-    uint32_t rtc_regulator;
-    uint32_t rtc_alarm_seconds;
-    uint32_t rtc_1hz_latched_seconds;
-    bool rtc_alarm_latched;
-    uint32_t rtc_hcr;
-    uint32_t rtc_hwfcr;
-    uint32_t rtc_hrcr;
-    uint32_t rtc_hwcr;
-    uint32_t rtc_hwrsr;
-    uint32_t rtc_scratch;
     uint32_t lcd_status;
     uint32_t lcd_irq_status;
-    uint32_t jz_lcd_ctrl;
-    uint32_t jz_lcd_state;
-    uint32_t jz_lcd_iid;
-    uint32_t jz_lcd_cmd[2];
     MIPSCPU *cpu;
     qemu_irq cpu_irq;
     qemu_irq aic_irq;
@@ -544,8 +365,6 @@ struct Bbk9588MachineState {
     qemu_irq dmac_irq;
     qemu_irq tcu_irq[JZ4740_TCU_NUM_OUTPUTS];
     QEMUTimer *intc_resample_timer;
-    QEMUTimer *rtc_timer;
-    QEMUTimer *sadc_timer;
     QEMUTimer *progress_trace_timer;
     QEMUTimer *lcd_refresh_timer;
     QemuConsole *lcd_console;
@@ -555,56 +374,28 @@ struct Bbk9588MachineState {
     uint32_t lcd_frame_seq;
     uint32_t perf_seq;
     uint32_t audio_seq;
-    uint32_t lcd_dma_desc_va;
-    uint32_t lcd_dma_frame_va;
     int64_t lcd_scanout_not_before_ms;
     int64_t lcd_frame_stable_not_before_ms;
     int64_t perf_last_send_ms;
     bool lcd_last_frame_valid;
-    bool lcd_dma_desc_valid;
-    bool lcd_dma_frame_valid;
     bool lcd_frame_chardev_sent_valid;
     bool cpu_irq_output_enabled;
     bool intc_output_level;
     uint32_t tcu_period_ms;
     uint32_t progress_trace_period_ms;
     uint32_t lcd_refresh_period_ms;
-    bool touch_down;
-    bool touch_move_pending;
-    uint16_t touch_raw_x;
-    uint16_t touch_raw_y;
-    uint8_t sadc_enable;
-    uint32_t sadc_config;
-    uint8_t sadc_control;
-    uint8_t sadc_status_event;
-    uint8_t sadc_pending_enable;
-    uint16_t sadc_same_time;
-    uint16_t sadc_wait_time;
-    bool sadc_touch_sample_is_move;
-    uint16_t sadc_battery_data;
-    uint16_t sadc_sadcin_data;
     uint32_t sadc_battery_raw;
     uint32_t sadc_sadcin_raw;
-    uint32_t sadc_touch_fifo[BBK9588_SADC_FIFO_DEPTH];
-    unsigned sadc_touch_fifo_head;
-    unsigned sadc_touch_fifo_count;
-    unsigned sadc_next_axis;
-    unsigned sadc_conversion_events_remaining;
-    uint32_t sadc_last_read_offset;
-    uint32_t sadc_last_read_value;
-    uint32_t sadc_last_write_offset;
-    uint32_t sadc_last_write_value;
-    uint32_t gpio_last_read_offset;
-    uint32_t gpio_last_read_value;
-    uint32_t gpio_last_flag_offset;
-    uint32_t gpio_last_flag_value;
     uint32_t intc_last_cp0_status;
     uint32_t intc_last_cp0_cause;
-    Bbk9588MmioState *jz_lcd_mmio;
     JZ4740AICState *aic;
+    JZ4740LCDState *lcd;
     JZ4740INTCState *intc;
     JZ4740CPMState *cpm;
     JZ4740DMACState *dmac;
+    JZ4740GPIOState *gpio;
+    JZ4740RTCState *rtc;
+    JZ4740SADCState *sadc;
     JZ4740TCUState *tcu;
     uint32_t extgpio_wake_enable_80;
     bool sysctrl_wake_pending;
@@ -630,12 +421,6 @@ struct Bbk9588MachineState {
     uint32_t input_event_count;
     uint32_t input_event_words[BBK9588_EVENT_QUEUE_SLOTS]
                               [BBK9588_EVENT_QUEUE_WORDS];
-    uint32_t key_gpio_down_100;
-    uint32_t key_gpio_down_200;
-    uint32_t key_gpio_down_300;
-    uint32_t gpio_flag_100;
-    uint32_t gpio_flag_200;
-    uint32_t gpio_flag_300;
     uint8_t uart_rx_fifo[BBK9588_UART_FIFO_SIZE];
     unsigned uart_rx_head;
     unsigned uart_rx_len;
@@ -730,23 +515,17 @@ static void bbk9588_nand_detect_geometry(Bbk9588NandState *nand)
 }
 
 static const Bbk9588MmioWindow bbk9588_mmio_windows[] = {
-    { "bbk9588.rtc",      0xb0003000, 0x1000, BBK9588_MMIO_RTC },
-    { "bbk9588.gpio",     0xb0010000, 0x1000, BBK9588_MMIO_GPIO },
     { "bbk9588.extgpio",  0xb3010000, 0x10000, BBK9588_MMIO_EXTGPIO },
     { "bbk9588.msc",      0xb0021000, 0x1000, BBK9588_MMIO_GRAPHICS },
     { "bbk9588.uart",     0xb0030000, 0x1000, BBK9588_MMIO_UART },
-    { "bbk9588.misc7",    0xb0070000, 0x1000, BBK9588_MMIO_MISC },
     { "bbk9588.udc",      0xb3040000, 0x1000, BBK9588_MMIO_UDC },
-    { "bbk9588.display0", 0xb3050000, 0x1000, BBK9588_MMIO_GRAPHICS },
     { "bbk9588.misc306",  0xb3060000, 0x1000, BBK9588_MMIO_MISC },
     { "bbk9588.lcd",      0xb0043000, 0x1000, BBK9588_MMIO_LCD },
 };
 
 static void bbk9588_touch_set_state(Bbk9588MachineState *board,
-                                    uint16_t raw_x, uint16_t raw_y,
-                                    bool down);
-static uint32_t bbk9588_sadc_touch_delay_ms(Bbk9588MachineState *board,
-                                            bool same_point);
+                                     uint16_t raw_x, uint16_t raw_y,
+                                     bool down);
 static void bbk9588_queue_input_event(Bbk9588MachineState *board,
                                       uint32_t kind, uint32_t arg0,
                                       uint32_t arg1, uint32_t arg2);
@@ -756,8 +535,6 @@ static void bbk9588_lcd_schedule_vblank(Bbk9588MachineState *board);
 
 static void bbk9588_nand_realize(DeviceState *dev, Error **errp);
 static void bbk9588_update_irq(Bbk9588MachineState *board);
-static bool bbk9588_rtc_irq_pending(Bbk9588MachineState *board);
-static void bbk9588_rtc_schedule(Bbk9588MachineState *board);
 static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
                                        uint32_t reason);
 static void bbk9588_progress_trace_sample(Bbk9588MachineState *board,
@@ -812,12 +589,6 @@ static uint8_t bbk9588_phys_read_u8(hwaddr addr)
     return value;
 }
 
-static bool bbk9588_try_wait_irq_service(Bbk9588MachineState *board)
-{
-    (void)board;
-    return false;
-}
-
 static void bbk9588_wake_cpu(Bbk9588MachineState *board)
 {
     if (board && board->cpu) {
@@ -841,45 +612,6 @@ static void bbk9588_sync_tcu_irq_sources(Bbk9588MachineState *board)
     jz4740_intc_set_irq(
         board->intc, JZ4740_INTC_IRQ_TCU2,
         jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU2));
-}
-
-static bool bbk9588_jz_lcd_irq_pending(Bbk9588MachineState *board)
-{
-    uint32_t state = board->jz_lcd_state;
-    uint32_t ctrl = board->jz_lcd_ctrl;
-
-    return ((state & BBK9588_JZ_LCD_STATE_EOF) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_EOFM)) ||
-           ((state & BBK9588_JZ_LCD_STATE_SOF) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_SOFM)) ||
-           ((state & BBK9588_JZ_LCD_STATE_OUF) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_OFUM)) ||
-           ((state & BBK9588_JZ_LCD_STATE_IFU0) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_IFUM0)) ||
-           ((state & BBK9588_JZ_LCD_STATE_IFU1) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_IFUM1)) ||
-           ((state & BBK9588_JZ_LCD_STATE_LDD) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_LDDM)) ||
-           ((state & BBK9588_JZ_LCD_STATE_QD) &&
-            (ctrl & BBK9588_JZ_LCD_CTRL_QDM));
-}
-
-static void bbk9588_jz_lcd_latch_iid(Bbk9588MachineState *board,
-                                      uint32_t state_bit,
-                                      uint32_t ctrl_bit,
-                                      uint32_t fid)
-{
-    if ((board->jz_lcd_ctrl & ctrl_bit) &&
-        !bbk9588_jz_lcd_irq_pending(board)) {
-        board->jz_lcd_iid = fid;
-    }
-    board->jz_lcd_state |= state_bit;
-}
-
-static bool bbk9588_sadc_irq_pending(Bbk9588MachineState *board)
-{
-    return (board->sadc_status_event & ~board->sadc_control &
-            BBK9588_SADC_STATE_MASK) != 0;
 }
 
 static unsigned bbk9588_uart_rx_trigger_level(Bbk9588MachineState *board)
@@ -963,12 +695,6 @@ static bool bbk9588_udc_irq_pending(Bbk9588MachineState *board)
 static void bbk9588_sync_level_irq_sources(Bbk9588MachineState *board)
 {
     bbk9588_sync_tcu_irq_sources(board);
-    jz4740_intc_set_irq(board->intc, BBK9588_JZ_LCD_IRQ,
-                        bbk9588_jz_lcd_irq_pending(board));
-    jz4740_intc_set_irq(board->intc, BBK9588_SADC_IRQ,
-                        bbk9588_sadc_irq_pending(board));
-    jz4740_intc_set_irq(board->intc, BBK9588_RTC_IRQ,
-                        bbk9588_rtc_irq_pending(board));
     jz4740_intc_set_irq(board->intc, BBK9588_UART_IRQ,
                         bbk9588_uart_irq_pending(board));
     jz4740_intc_set_irq(board->intc, BBK9588_UDC_IRQ,
@@ -1067,9 +793,7 @@ static void bbk9588_nand_raise_ready(Bbk9588MachineState *board)
         return;
     }
     board->nand_ready_raise_count++;
-    board->gpio_flag_200 |= 0x40000000u;
-    jz4740_intc_set_irq(board->intc, BBK9588_NAND_READY_IRQ, true);
-    bbk9588_update_irq(board);
+    jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C, 0x40000000u);
     bbk9588_touch_trace_update(board, 0x52);
 }
 
@@ -1195,217 +919,22 @@ static void bbk9588_event_queue_mirror_all(Bbk9588MachineState *board)
     }
 }
 
-static bool bbk9588_lcd_candidate_frame_va(uint32_t value, uint32_t *frame_va)
-{
-    uint32_t candidates[] = {
-        value,
-        0x80000000u | BBK9588_KSEG_TO_PHYS(value),
-        0xa0000000u | BBK9588_KSEG_TO_PHYS(value),
-    };
-
-    for (unsigned i = 0; i < ARRAY_SIZE(candidates); i++) {
-        uint32_t candidate = candidates[i];
-
-        if ((candidate & 3) != 0 ||
-            BBK9588_KSEG_TO_PHYS(candidate) < 0x1000) {
-            continue;
-        }
-        if (bbk9588_guest_ram_va_valid(candidate, BBK9588_LCD_BYTES)) {
-            *frame_va = candidate;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool bbk9588_lcd_candidate_desc_va(uint32_t value, uint32_t *desc_va)
-{
-    uint32_t candidates[] = {
-        value,
-        0x80000000u | BBK9588_KSEG_TO_PHYS(value),
-        0xa0000000u | BBK9588_KSEG_TO_PHYS(value),
-    };
-
-    for (unsigned i = 0; i < ARRAY_SIZE(candidates); i++) {
-        uint32_t candidate = candidates[i];
-
-        if ((candidate & 3) != 0 ||
-            BBK9588_KSEG_TO_PHYS(candidate) < 0x1000) {
-            continue;
-        }
-        if (bbk9588_guest_ram_va_valid(candidate,
-                                       BBK9588_JZ_LCD_DESC_BYTES)) {
-            *desc_va = candidate;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool bbk9588_lcd_update_frame_from_desc(Bbk9588MachineState *board)
-{
-    uint32_t frame_va;
-    uint32_t raw_frame;
-
-    if (!board->lcd_dma_desc_valid ||
-        !bbk9588_guest_ram_va_valid(board->lcd_dma_desc_va,
-                                    BBK9588_JZ_LCD_DESC_BYTES)) {
-        return false;
-    }
-
-    /*
-     * JZ47xx LCD DMA descriptors are four words:
-     * next descriptor, framebuffer address, frame id, command/length.
-     */
-    raw_frame = bbk9588_phys_read_le32(board->lcd_dma_desc_va +
-                                       BBK9588_JZ_LCD_DESC_SOURCE_OFF);
-    if (!bbk9588_lcd_candidate_frame_va(raw_frame, &frame_va)) {
-        return false;
-    }
-    board->lcd_dma_frame_va = frame_va;
-    board->lcd_dma_frame_valid = true;
-    return true;
-}
-
-static bool bbk9588_is_jz_lcd_window(Bbk9588MmioState *s)
-{
-    return s->window->kind == BBK9588_MMIO_GRAPHICS &&
-           s->window->kseg1_base == 0xb3050000;
-}
-
 static bool bbk9588_is_msc_window(Bbk9588MmioState *s)
 {
     return s->window->kind == BBK9588_MMIO_GRAPHICS &&
            s->window->kseg1_base == 0xb0021000;
 }
 
-static bool bbk9588_jz_lcd_fetch_descriptor(Bbk9588MmioState *s,
-                                            unsigned channel)
+static void bbk9588_lcd_frame_source_changed(void *opaque)
 {
-    Bbk9588MachineState *board = s->board;
-    hwaddr base = channel ? BBK9588_JZ_LCD_DA1_OFF :
-                            BBK9588_JZ_LCD_DA0_OFF;
-    uint32_t desc_raw = s->regs[base / sizeof(uint32_t)];
-    uint32_t desc_va;
-    uint32_t next;
-    uint32_t source;
-    uint32_t fid;
-    uint32_t command;
-    uint32_t frame_va;
+    Bbk9588MachineState *board = opaque;
 
-    if (!bbk9588_lcd_candidate_desc_va(desc_raw, &desc_va)) {
-        return false;
-    }
-
-    next = bbk9588_phys_read_le32(desc_va + BBK9588_JZ_LCD_DESC_NEXT_OFF);
-    source = bbk9588_phys_read_le32(desc_va + BBK9588_JZ_LCD_DESC_SOURCE_OFF);
-    fid = bbk9588_phys_read_le32(desc_va + BBK9588_JZ_LCD_DESC_FID_OFF);
-    command = bbk9588_phys_read_le32(desc_va + BBK9588_JZ_LCD_DESC_CMD_OFF) &
-              BBK9588_JZ_LCD_CMD_RW_MASK;
-    s->regs[(base + BBK9588_JZ_LCD_DESC_NEXT_OFF) / sizeof(uint32_t)] = next;
-    s->regs[(base + BBK9588_JZ_LCD_DESC_SOURCE_OFF) / sizeof(uint32_t)] =
-        source;
-    s->regs[(base + BBK9588_JZ_LCD_DESC_FID_OFF) / sizeof(uint32_t)] = fid;
-    s->regs[(base + BBK9588_JZ_LCD_DESC_CMD_OFF) / sizeof(uint32_t)] =
-        command;
-    board->jz_lcd_cmd[channel ? 1 : 0] = command;
-    board->lcd_dma_desc_va = desc_va;
-    board->lcd_dma_desc_valid = true;
-    if (command & BBK9588_JZ_LCD_CMD_SOFINT) {
-        bbk9588_jz_lcd_latch_iid(board, BBK9588_JZ_LCD_STATE_SOF,
-                                  BBK9588_JZ_LCD_CTRL_SOFM, fid);
-    }
-    if (bbk9588_lcd_candidate_frame_va(source, &frame_va)) {
-        board->lcd_dma_frame_va = frame_va;
-        board->lcd_dma_frame_valid = true;
-        return true;
-    }
-    return false;
-}
-
-static void bbk9588_jz_lcd_finish_channel(Bbk9588MmioState *s,
-                                          unsigned channel)
-{
-    Bbk9588MachineState *board = s->board;
-    hwaddr base = channel ? BBK9588_JZ_LCD_DA1_OFF :
-                            BBK9588_JZ_LCD_DA0_OFF;
-    uint32_t cmd;
-
-    if (channel >= ARRAY_SIZE(board->jz_lcd_cmd)) {
-        return;
-    }
-
-    cmd = board->jz_lcd_cmd[channel];
-    if (cmd == 0) {
-        return;
-    }
-
-    board->jz_lcd_cmd[channel] = cmd & ~BBK9588_JZ_LCD_CMD_LEN_MASK;
-    s->regs[(base + BBK9588_JZ_LCD_DESC_CMD_OFF) / sizeof(uint32_t)] =
-        board->jz_lcd_cmd[channel];
-    if (cmd & BBK9588_JZ_LCD_CMD_EOFINT) {
-        bbk9588_jz_lcd_latch_iid(
-            board, BBK9588_JZ_LCD_STATE_EOF,
-            BBK9588_JZ_LCD_CTRL_EOFM,
-            s->regs[(base + BBK9588_JZ_LCD_DESC_FID_OFF) / sizeof(uint32_t)]);
-    }
-    if (s->regs[base / sizeof(uint32_t)] != 0) {
-        bbk9588_jz_lcd_fetch_descriptor(s, channel);
-    }
-}
-
-static void bbk9588_jz_lcd_signal_frame_done(Bbk9588MachineState *board)
-{
-    Bbk9588MmioState *s = board->jz_lcd_mmio;
-
-    if (!(board->jz_lcd_ctrl & BBK9588_JZ_LCD_CTRL_ENA)) {
-        return;
-    }
-    if (s) {
-        bbk9588_jz_lcd_finish_channel(s, 0);
-        if (s->regs[BBK9588_JZ_LCD_DA1_OFF / sizeof(uint32_t)] != 0 ||
-            board->jz_lcd_cmd[1] != 0) {
-            bbk9588_jz_lcd_finish_channel(s, 1);
-        }
-    }
-    bbk9588_update_irq(board);
-}
-
-static bool bbk9588_lcd_observe_mmio_write(Bbk9588MachineState *board,
-                                           hwaddr offset, uint32_t value)
-{
-    uint32_t desc_va;
-    uint32_t frame_va;
-
-    /*
-     * LCDDA0/LCDDA1 hold DMA descriptor addresses.  Prefer the descriptor's
-     * framebuffer word over a generic address guess when the guest programs
-     * those registers.
-     */
-    if ((offset == BBK9588_JZ_LCD_DA0_OFF ||
-         offset == BBK9588_JZ_LCD_DA1_OFF) &&
-        bbk9588_lcd_candidate_desc_va(value, &desc_va)) {
-        board->lcd_dma_desc_va = desc_va;
-        board->lcd_dma_desc_valid = true;
-        if (bbk9588_lcd_update_frame_from_desc(board)) {
-            board->lcd_irq_status |= BBK9588_LCD_STATUS_FRAME_DONE;
-            return true;
-        }
-        return false;
-    }
-
-    /*
-     * The firmware can also write raw frame addresses through LCD/display
-     * aliases.  Treat only values that can hold one full 240x320 RGB565 frame
-     * as scanout candidates.
-     */
-    if (bbk9588_lcd_candidate_frame_va(value, &frame_va)) {
-        board->lcd_dma_frame_va = frame_va;
-        board->lcd_dma_frame_valid = true;
-        board->lcd_irq_status |= BBK9588_LCD_STATUS_FRAME_DONE;
-        return true;
-    }
-    return false;
+    board->lcd_irq_status |= BBK9588_LCD_STATUS_FRAME_DONE;
+    board->lcd_frame_chardev_sent_valid = false;
+    board->lcd_scanout_not_before_ms =
+        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+        board->lcd_refresh_period_ms;
+    bbk9588_lcd_schedule_vblank(board);
 }
 
 static void bbk9588_lcd_copy_framebuffer(Bbk9588MachineState *board)
@@ -1426,12 +955,10 @@ static void bbk9588_lcd_copy_framebuffer(Bbk9588MachineState *board)
         height != BBK9588_LCD_HEIGHT ||
         enabled == 0 ||
         !bbk9588_guest_ram_va_valid(fb_va, sizeof(board->lcd_framebuffer))) {
-        bbk9588_lcd_update_frame_from_desc(board);
-        if (board->lcd_dma_frame_valid &&
-            bbk9588_guest_ram_va_valid(board->lcd_dma_frame_va,
-                                       sizeof(board->lcd_framebuffer))) {
-            fb_va = board->lcd_dma_frame_va;
-        } else {
+        jz4740_lcd_refresh_frame_source(board->lcd);
+        if (!jz4740_lcd_get_frame_source(board->lcd, &fb_va) ||
+            !bbk9588_guest_ram_va_valid(fb_va,
+                                        sizeof(board->lcd_framebuffer))) {
             fb_va = BBK9588_FRAMEBUFFER_VA;
         }
     }
@@ -1623,7 +1150,7 @@ static void bbk9588_lcd_gfx_update(void *opaque)
     changed = bbk9588_lcd_frame_changed(board);
     if (changed) {
         board->lcd_irq_status |= BBK9588_LCD_STATUS_FRAME_DONE;
-        bbk9588_jz_lcd_signal_frame_done(board);
+        jz4740_lcd_signal_frame_done(board->lcd);
         board->lcd_frame_chardev_sent_valid = false;
         board->lcd_frame_stable_not_before_ms = now;
     }
@@ -1760,32 +1287,32 @@ static void bbk9588_touch_apply_host_input(Bbk9588MachineState *board,
     bbk9588_touch_set_state(board, raw_x, raw_y, down);
 }
 
-static bool bbk9588_key_gpio_bits(uint32_t key_code, hwaddr *offset,
+static bool bbk9588_key_gpio_bits(uint32_t key_code, unsigned *port,
                                   uint32_t *mask)
 {
     switch (key_code) {
     case 10:
-        *offset = BBK9588_GPIO_PORT_B_OFF;
+        *port = JZ4740_GPIO_PORT_B;
         *mask = 0x40000000u;
         return true;
     case 5:
-        *offset = BBK9588_GPIO_PORT_B_OFF;
+        *port = JZ4740_GPIO_PORT_B;
         *mask = 0x10000000u;
         return true;
     case 7:
-        *offset = BBK9588_GPIO_PORT_B_OFF;
+        *port = JZ4740_GPIO_PORT_B;
         *mask = 0x08000000u;
         return true;
     case 6:
-        *offset = BBK9588_GPIO_PORT_B_OFF;
+        *port = JZ4740_GPIO_PORT_B;
         *mask = 0x20000000u;
         return true;
     case 9:
-        *offset = BBK9588_GPIO_PORT_C_OFF;
+        *port = JZ4740_GPIO_PORT_C;
         *mask = 0x08000000u;
         return true;
     case 4:
-        *offset = BBK9588_GPIO_PORT_D_OFF;
+        *port = JZ4740_GPIO_PORT_D;
         *mask = 0x00200000u;
         return true;
     default:
@@ -1796,52 +1323,14 @@ static bool bbk9588_key_gpio_bits(uint32_t key_code, hwaddr *offset,
 static bool bbk9588_key_gpio_set_state(Bbk9588MachineState *board,
                                        uint32_t key_code, bool down)
 {
-    hwaddr offset = 0;
+    unsigned port = 0;
     uint32_t mask = 0;
-    uint32_t *down_mask = NULL;
-    uint32_t *flag = NULL;
-    int main_irq = -1;
-    bool was_down;
 
-    if (!bbk9588_key_gpio_bits(key_code, &offset, &mask)) {
+    if (!bbk9588_key_gpio_bits(key_code, &port, &mask)) {
         return false;
     }
-
-    switch (offset) {
-    case BBK9588_GPIO_PORT_B_OFF:
-        down_mask = &board->key_gpio_down_100;
-        flag = &board->gpio_flag_100;
-        main_irq = BBK9588_GPIO_IRQ_PORT_B;
-        break;
-    case BBK9588_GPIO_PORT_C_OFF:
-        down_mask = &board->key_gpio_down_200;
-        flag = &board->gpio_flag_200;
-        main_irq = BBK9588_GPIO_IRQ_PORT_C;
-        break;
-    case BBK9588_GPIO_PORT_D_OFF:
-        down_mask = &board->key_gpio_down_300;
-        flag = &board->gpio_flag_300;
-        main_irq = BBK9588_GPIO_IRQ_PORT_D;
-        break;
-    default:
-        return false;
-    }
-
-    was_down = (*down_mask & mask) != 0;
-    if (down) {
-        *down_mask |= mask;
-    } else {
-        *down_mask &= ~mask;
-    }
-    if (was_down != down) {
-        *flag |= mask;
-        if (main_irq >= 0) {
-            jz4740_intc_set_irq(board->intc, main_irq, true);
-            bbk9588_update_irq(board);
-        }
-        return true;
-    }
-    return false;
+    return jz4740_gpio_set_input_level(board->gpio, port, mask,
+                                       !down, true);
 }
 
 static void bbk9588_key_apply_host_input(Bbk9588MachineState *board,
@@ -3297,7 +2786,9 @@ static void bbk9588_touch_sync_latch(Bbk9588MachineState *board)
 static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
                                         uint32_t reason)
 {
+    JZ4740GPIODiagnostics gpio_diag;
     JZ4740INTCDiagnostics intc_diag;
+    JZ4740SADCDiagnostics sadc_diag;
     JZ4740TCUDiagnostics tcu_diag;
 
     if (!board || !board->touch_trace_enabled ||
@@ -3307,7 +2798,9 @@ static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
 
     uint32_t pc = board->cpu ? board->cpu->env.active_tc.PC : 0;
 
+    jz4740_gpio_get_diagnostics(board->gpio, &gpio_diag);
     jz4740_intc_get_diagnostics(board->intc, &intc_diag);
+    jz4740_sadc_get_diagnostics(board->sadc, &sadc_diag);
     jz4740_tcu_get_diagnostics(board->tcu, &tcu_diag);
 
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x00,
@@ -3316,39 +2809,39 @@ static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x08, 0);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x0c, 0);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x10,
-                            board->touch_down ? 1u : 0u);
+                            sadc_diag.touch_down ? 1u : 0u);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x14,
-                            board->touch_raw_x);
+                            sadc_diag.touch_raw_x);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x18,
-                            board->touch_raw_y);
+                            sadc_diag.touch_raw_y);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x1c,
-                            board->sadc_status_event);
+                            sadc_diag.status);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x20,
-                            board->sadc_next_axis);
+                            sadc_diag.next_axis);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x24,
                             intc_diag.pending);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x28, pc);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x2c, reason);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x30,
-                            board->sadc_conversion_events_remaining);
+                            sadc_diag.conversion_events_remaining);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x34,
-                            board->sadc_control);
+                            sadc_diag.control);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x38,
-                            board->sadc_last_read_offset);
+                            sadc_diag.last_read_offset);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x3c,
-                            board->sadc_last_read_value);
+                            sadc_diag.last_read_value);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x40,
-                            board->sadc_last_write_offset);
+                            sadc_diag.last_write_offset);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x44,
-                            board->sadc_last_write_value);
+                            sadc_diag.last_write_value);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x48,
-                            board->gpio_last_read_offset);
+                            gpio_diag.last_read_offset);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x4c,
-                            board->gpio_last_read_value);
+                            gpio_diag.last_read_value);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x50,
-                            board->gpio_last_flag_offset);
+                            gpio_diag.last_flag_offset);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x54,
-                            board->gpio_last_flag_value);
+                            gpio_diag.last_flag_value);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x58,
                             intc_diag.mask);
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x5c,
@@ -3462,7 +2955,7 @@ static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
         bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x118,
                                 board->nand_dev->addr_count);
         bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x11c,
-                                board->gpio_flag_200);
+                                gpio_diag.flag[JZ4740_GPIO_PORT_C]);
     }
     bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x120,
                             jz4740_cpm_clkgr_wake_mask(board->cpm));
@@ -3484,314 +2977,33 @@ static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
                             (uint32_t)(tcu_diag.deadline_ns[4] / SCALE_MS));
 }
 
-static void bbk9588_sadc_touch_fifo_clear(Bbk9588MachineState *board)
+static void bbk9588_sadc_trace(void *opaque, uint32_t reason)
 {
-    board->sadc_touch_fifo_head = 0;
-    board->sadc_touch_fifo_count = 0;
-    memset(board->sadc_touch_fifo, 0, sizeof(board->sadc_touch_fifo));
-}
-
-static uint32_t bbk9588_sadc_pack_touch_pair(uint16_t data0, uint16_t data1,
-                                             bool type0, bool type1)
-{
-    uint32_t value = ((uint32_t)(data1 & BBK9588_SADC_DATA_MASK) << 16) |
-                     (uint32_t)(data0 & BBK9588_SADC_DATA_MASK);
-
-    if (type0) {
-        value |= BBK9588_SADC_TOUCH_TYPE0;
-    }
-    if (type1) {
-        value |= BBK9588_SADC_TOUCH_TYPE1;
-    }
-    return value;
-}
-
-static void bbk9588_sadc_touch_fifo_push(Bbk9588MachineState *board,
-                                         uint32_t sample)
-{
-    unsigned index;
-
-    if (board->sadc_touch_fifo_count == BBK9588_SADC_FIFO_DEPTH) {
-        board->sadc_touch_fifo_head =
-            (board->sadc_touch_fifo_head + 1) % BBK9588_SADC_FIFO_DEPTH;
-        board->sadc_touch_fifo_count--;
-    }
-    index = (board->sadc_touch_fifo_head + board->sadc_touch_fifo_count) %
-            BBK9588_SADC_FIFO_DEPTH;
-    board->sadc_touch_fifo[index] = sample;
-    board->sadc_touch_fifo_count++;
-}
-
-static uint32_t bbk9588_sadc_touch_fifo_pop(Bbk9588MachineState *board)
-{
-    uint32_t sample;
-
-    if (board->sadc_touch_fifo_count == 0) {
-        return 0;
-    }
-    sample = board->sadc_touch_fifo[board->sadc_touch_fifo_head];
-    board->sadc_touch_fifo[board->sadc_touch_fifo_head] = 0;
-    board->sadc_touch_fifo_head =
-        (board->sadc_touch_fifo_head + 1) % BBK9588_SADC_FIFO_DEPTH;
-    board->sadc_touch_fifo_count--;
-    board->sadc_next_axis++;
-    return sample;
-}
-
-static unsigned bbk9588_sadc_touch_xyz_mode(Bbk9588MachineState *board)
-{
-    return (board->sadc_config & BBK9588_SADC_CONFIG_XYZ_MASK) >>
-           BBK9588_SADC_CONFIG_XYZ_SHIFT;
-}
-
-static void bbk9588_sadc_queue_touch_sample(Bbk9588MachineState *board)
-{
-    unsigned mode = bbk9588_sadc_touch_xyz_mode(board);
-
-    bbk9588_sadc_touch_fifo_clear(board);
-    board->sadc_next_axis = 0;
-
-    switch (mode) {
-    case BBK9588_SADC_CONFIG_XYZ_ZS:
-        bbk9588_sadc_touch_fifo_push(
-            board,
-            bbk9588_sadc_pack_touch_pair(board->touch_raw_x,
-                                         board->touch_raw_y,
-                                         false, false));
-        bbk9588_sadc_touch_fifo_push(
-            board,
-            bbk9588_sadc_pack_touch_pair(BBK9588_SADC_TOUCH_ZS_RAW, 0,
-                                         false, false));
-        break;
-    case BBK9588_SADC_CONFIG_XYZ_Z12:
-        bbk9588_sadc_touch_fifo_push(
-            board,
-            bbk9588_sadc_pack_touch_pair(board->touch_raw_x,
-                                         board->touch_raw_y,
-                                         true, true));
-        bbk9588_sadc_touch_fifo_push(
-            board,
-            bbk9588_sadc_pack_touch_pair(BBK9588_SADC_TOUCH_Z1_RAW,
-                                         BBK9588_SADC_TOUCH_Z2_RAW,
-                                         true, true));
-        break;
-    case BBK9588_SADC_CONFIG_XYZ_RESERVED:
-    case BBK9588_SADC_CONFIG_XYZ_XY:
-    default:
-        bbk9588_sadc_touch_fifo_push(
-            board,
-            bbk9588_sadc_pack_touch_pair(board->touch_raw_x,
-                                         board->touch_raw_y,
-                                         false, false));
-        break;
-    }
-    board->sadc_status_event |= BBK9588_SADC_STATE_DTCH;
-}
-
-static bool bbk9588_sadc_queue_next_touch_sample(Bbk9588MachineState *board)
-{
-    bool conversion_pending;
-
-    if (!board->touch_down ||
-        !(board->sadc_enable & BBK9588_SADC_ADENA_TCHEN) ||
-        (board->sadc_status_event & BBK9588_SADC_STATE_DTCH) ||
-        board->sadc_touch_fifo_count != 0 ||
-        (board->sadc_pending_enable & BBK9588_SADC_ADENA_TCHEN)) {
-        return false;
-    }
-    conversion_pending = board->sadc_pending_enable != 0;
-    if (board->sadc_conversion_events_remaining > 0) {
-        board->sadc_touch_sample_is_move = false;
-        board->sadc_pending_enable |= BBK9588_SADC_ADENA_TCHEN;
-        if (!conversion_pending) {
-            timer_mod(board->sadc_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                      bbk9588_sadc_touch_delay_ms(board, true));
-        }
-        return true;
-    }
-    if (board->touch_move_pending) {
-        board->sadc_touch_sample_is_move = true;
-        board->sadc_pending_enable |= BBK9588_SADC_ADENA_TCHEN;
-        if (!conversion_pending) {
-            timer_mod(board->sadc_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                      bbk9588_sadc_touch_delay_ms(board, false));
-        }
-        return true;
-    }
-    return false;
-}
-
-static void bbk9588_sadc_sync_irq(Bbk9588MachineState *board)
-{
-    jz4740_intc_set_irq(board->intc, BBK9588_SADC_IRQ,
-                        bbk9588_sadc_irq_pending(board));
-    if (!bbk9588_try_wait_irq_service(board)) {
-        bbk9588_update_irq(board);
-    }
-}
-
-static void bbk9588_sadc_complete_cpu_samples(Bbk9588MachineState *board,
-                                              uint8_t requested)
-{
-    if (requested & BBK9588_SADC_ADENA_SADCINEN) {
-        board->sadc_sadcin_data =
-            board->sadc_sadcin_raw & BBK9588_SADC_DATA_MASK;
-        board->sadc_status_event |= BBK9588_SADC_STATE_SRDY;
-        board->sadc_enable &= ~BBK9588_SADC_ADENA_SADCINEN;
-    }
-    if (requested & BBK9588_SADC_ADENA_PBATEN) {
-        board->sadc_battery_data =
-            board->sadc_battery_raw & BBK9588_SADC_DATA_MASK;
-        board->sadc_status_event |= BBK9588_SADC_STATE_DRDY;
-        board->sadc_enable &= ~BBK9588_SADC_ADENA_PBATEN;
-    }
-}
-
-static uint32_t bbk9588_sadc_touch_delay_ms(Bbk9588MachineState *board,
-                                            bool same_point)
-{
-    uint32_t ticks = same_point ? board->sadc_same_time :
-                                 board->sadc_wait_time;
-    uint64_t scaled = (uint64_t)ticks * 128u;
-
-    /* ADSAME/ADWAIT use the manual's 12 MHz / 128 counter clock. */
-    return MAX(1u, (uint32_t)((scaled + 11999u) / 12000u));
-}
-
-static void bbk9588_sadc_schedule_conversion(Bbk9588MachineState *board,
-                                             uint8_t requested)
-{
-    const uint8_t cpu_channels = BBK9588_SADC_ADENA_SADCINEN |
-                                 BBK9588_SADC_ADENA_PBATEN;
-    uint8_t previous_pending = board->sadc_pending_enable;
-    uint8_t new_cpu_channels = requested & cpu_channels & ~previous_pending;
-    uint32_t delay_ms;
-
-    board->sadc_pending_enable |= requested;
-    if (!board->sadc_timer) {
-        bbk9588_sadc_complete_cpu_samples(board, requested);
-        if ((requested & BBK9588_SADC_ADENA_TCHEN) && board->touch_down) {
-            bbk9588_sadc_queue_touch_sample(board);
-            board->touch_move_pending = false;
-        }
-        return;
-    }
-
-    if (previous_pending && !new_cpu_channels) {
-        return;
-    }
-    delay_ms = new_cpu_channels ? 1u :
-               bbk9588_sadc_touch_delay_ms(board, false);
-    timer_mod(board->sadc_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + delay_ms);
-}
-
-static void bbk9588_sadc_timer_cb(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-    uint8_t requested = board->sadc_pending_enable;
-
-    board->sadc_pending_enable = 0;
-    bbk9588_sadc_complete_cpu_samples(board, requested);
-    if ((requested & BBK9588_SADC_ADENA_TCHEN) && board->touch_down) {
-        bbk9588_sadc_queue_touch_sample(board);
-        if (board->sadc_touch_sample_is_move) {
-            board->touch_move_pending = false;
-        }
-    }
-    board->sadc_touch_sample_is_move = false;
-    bbk9588_sadc_sync_irq(board);
-    bbk9588_touch_trace_update(board, 13u);
+    bbk9588_touch_trace_update(opaque, reason);
 }
 
 static void bbk9588_touch_set_state(Bbk9588MachineState *board,
                                     uint16_t raw_x, uint16_t raw_y,
                                     bool down)
 {
-    bool was_down = board->touch_down;
-    bool position_changed = board->touch_raw_x != raw_x ||
-                            board->touch_raw_y != raw_y;
-    bool irq_needs_sync = was_down != down;
-
-    board->touch_raw_x = raw_x;
-    board->touch_raw_y = raw_y;
-    board->touch_down = down;
-    if (down) {
-        if (!was_down) {
-            board->sadc_status_event =
-                (board->sadc_status_event & ~BBK9588_SADC_STATE_PENU) |
-                BBK9588_SADC_STATE_PEND;
-            board->touch_move_pending = false;
-            board->sadc_conversion_events_remaining = 5;
-            bbk9588_sadc_queue_next_touch_sample(board);
-        } else if (position_changed) {
-            board->touch_move_pending = true;
-            bbk9588_sadc_queue_next_touch_sample(board);
-        }
-    } else if (was_down) {
-        board->touch_move_pending = false;
-        board->sadc_pending_enable &= ~BBK9588_SADC_ADENA_TCHEN;
-        board->sadc_touch_sample_is_move = false;
-        board->sadc_conversion_events_remaining = 0;
-        board->sadc_status_event =
-            (board->sadc_status_event & ~BBK9588_SADC_STATE_PEND) |
-            BBK9588_SADC_STATE_PENU;
-    }
-    if (irq_needs_sync) {
-        bbk9588_sadc_sync_irq(board);
-    }
-    bbk9588_touch_sync_latch(board);
-    bbk9588_touch_trace_update(board, down ? 1u : 2u);
+    jz4740_sadc_set_touch(board->sadc, raw_x, raw_y, down);
+    jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_B,
+                                0x00040000u, !down, false);
+    jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_C,
+                                0x08000000u, !down, false);
 }
 
-static uint32_t bbk9588_gpio_idle_level(hwaddr offset)
+static void bbk9588_gpio_trace(void *opaque, uint32_t reason)
 {
-    switch (offset) {
-    case BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_PIN_OFF:
-        return 0x78040000;
-    case BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_PIN_OFF:
-        return 0x48000000;
-    case BBK9588_GPIO_PORT_D_OFF + BBK9588_GPIO_PIN_OFF:
-        return 0x00200000;
-    default:
-        return 0;
-    }
+    bbk9588_touch_trace_update(opaque, reason);
 }
 
-static bool bbk9588_gpio_decode_offset(hwaddr offset, hwaddr *port_base,
-                                       hwaddr *reg_offset)
+static uint32_t bbk9588_gpio_sample_input(void *opaque, unsigned port,
+                                          uint32_t level)
 {
-    if (offset >= BBK9588_GPIO_PORTS * BBK9588_GPIO_PORT_STRIDE) {
-        return false;
-    }
-    *port_base = offset & ~(BBK9588_GPIO_PORT_STRIDE - 1u);
-    *reg_offset = offset & (BBK9588_GPIO_PORT_STRIDE - 1u);
-    return true;
-}
+    Bbk9588MachineState *board = opaque;
 
-static uint32_t bbk9588_gpio_level(Bbk9588MachineState *board, hwaddr offset,
-                                   uint32_t stored)
-{
-    uint32_t level = stored | bbk9588_gpio_idle_level(offset);
-
-    if (board->touch_down) {
-        if (offset == BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_PIN_OFF) {
-            level &= ~0x00040000;
-        } else if (offset == BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_PIN_OFF) {
-            level &= ~0x08000000;
-        }
-    }
-    switch (offset) {
-    case BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_PIN_OFF:
-        level &= ~board->key_gpio_down_100;
-        break;
-    case BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_PIN_OFF:
-        level &= ~board->key_gpio_down_200;
-        break;
-    case BBK9588_GPIO_PORT_D_OFF + BBK9588_GPIO_PIN_OFF:
-        level &= ~board->key_gpio_down_300;
+    if (port == JZ4740_GPIO_PORT_D) {
         if (board->gpio300_wake_pulse_available) {
             level |= 0x20000000u;
             board->gpio300_wake_pulse_available = false;
@@ -3800,283 +3012,13 @@ static uint32_t bbk9588_gpio_level(Bbk9588MachineState *board, hwaddr offset,
         } else {
             level &= ~0x20000000u;
         }
-        break;
-    default:
-        break;
     }
-    if (offset == BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_PIN_OFF &&
+    if (port == JZ4740_GPIO_PORT_C &&
         board->nand_dev && board->nand_dev->busy_reads > 0) {
         board->nand_dev->busy_reads--;
         level &= ~0x40000000;
     }
-    board->gpio_last_read_offset = (uint32_t)offset;
-    board->gpio_last_read_value = level;
-    bbk9588_touch_trace_update(board, 11u);
     return level;
-}
-
-static uint32_t bbk9588_gpio_flag(Bbk9588MachineState *board, hwaddr offset,
-                                  uint32_t stored)
-{
-    switch (offset) {
-    case BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_FLG_OFF:
-        stored |= board->gpio_flag_100;
-        break;
-    case BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_FLG_OFF:
-        stored |= board->gpio_flag_200;
-        break;
-    case BBK9588_GPIO_PORT_D_OFF + BBK9588_GPIO_FLG_OFF:
-        stored |= board->gpio_flag_300;
-        break;
-    default:
-        break;
-    }
-    board->gpio_last_flag_offset = (uint32_t)offset;
-    board->gpio_last_flag_value = stored;
-    bbk9588_touch_trace_update(board, 12u);
-    return stored;
-}
-
-static void bbk9588_gpio_sync_irq(Bbk9588MachineState *board, uint32_t flag,
-                                  int irq)
-{
-    if (irq < 0) {
-        return;
-    }
-    jz4740_intc_set_irq(board->intc, irq, flag != 0);
-    bbk9588_update_irq(board);
-}
-
-static void bbk9588_gpio_clear_flag(Bbk9588MachineState *board, hwaddr offset,
-                                    uint32_t value)
-{
-    switch (offset) {
-    case BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_FLGC_OFF:
-        board->gpio_flag_100 &= ~value;
-        bbk9588_gpio_sync_irq(board, board->gpio_flag_100,
-                              BBK9588_GPIO_IRQ_PORT_B);
-        break;
-    case BBK9588_GPIO_PORT_C_OFF + BBK9588_GPIO_FLGC_OFF:
-        board->gpio_flag_200 &= ~value;
-        bbk9588_gpio_sync_irq(board, board->gpio_flag_200,
-                              BBK9588_GPIO_IRQ_PORT_C);
-        break;
-    case BBK9588_GPIO_PORT_D_OFF + BBK9588_GPIO_FLGC_OFF:
-        board->gpio_flag_300 &= ~value;
-        bbk9588_gpio_sync_irq(board, board->gpio_flag_300,
-                              BBK9588_GPIO_IRQ_PORT_D);
-        break;
-    default:
-        break;
-    }
-}
-
-static void bbk9588_gpio_apply_write(Bbk9588MmioState *s, hwaddr offset,
-                                     uint32_t value)
-{
-    hwaddr port_base;
-    hwaddr reg_offset;
-    uint32_t *reg;
-    uint32_t *write_only;
-
-    if (!bbk9588_gpio_decode_offset(offset, &port_base, &reg_offset)) {
-        return;
-    }
-    write_only = &s->regs[offset / sizeof(uint32_t)];
-    switch (reg_offset) {
-    case BBK9588_GPIO_DATS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_DAT_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        bbk9588_gpio_clear_flag(s->board, offset, value);
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_DATC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_DAT_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_IMS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_IM_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_IMC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_IM_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_PES_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_PE_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_PEC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_PE_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_FUNS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_FUN_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_FUNC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_FUN_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_SELS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_SEL_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_SELC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_SEL_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_DIRS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_DIR_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_DIRC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_DIR_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_TRGS_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_TRG_OFF) / sizeof(uint32_t)];
-        *reg |= value;
-        *write_only = 0;
-        break;
-    case BBK9588_GPIO_TRGC_OFF:
-        reg = &s->regs[(port_base + BBK9588_GPIO_TRG_OFF) / sizeof(uint32_t)];
-        *reg &= ~value;
-        *write_only = 0;
-        break;
-    default:
-        break;
-    }
-}
-
-static uint32_t bbk9588_sadc_read(Bbk9588MachineState *board, hwaddr offset)
-{
-    uint32_t value;
-
-    switch (offset) {
-    case BBK9588_SADC_ADENA_OFF: /* ADENA */
-        value = board->sadc_enable;
-        break;
-    case BBK9588_SADC_ADCFG_OFF: /* ADCFG */
-        value = board->sadc_config;
-        break;
-    case BBK9588_SADC_ADCTRL_OFF: /* ADCTRL */
-        value = board->sadc_control;
-        break;
-    case BBK9588_SADC_ADSTATE_OFF: /* ADSTATE */
-        value = board->sadc_status_event;
-        break;
-    case BBK9588_SADC_ADSAME_OFF: /* ADSAME */
-        value = board->sadc_same_time;
-        break;
-    case BBK9588_SADC_ADWAIT_OFF: /* ADWAIT */
-        value = board->sadc_wait_time;
-        break;
-    case BBK9588_SADC_ADTCH_OFF: /* ADTCH */
-        if (board->sadc_touch_fifo_count > 0) {
-            value = bbk9588_sadc_touch_fifo_pop(board);
-            if (board->sadc_touch_fifo_count == 0 &&
-                bbk9588_sadc_queue_next_touch_sample(board)) {
-                bbk9588_sadc_sync_irq(board);
-            }
-        } else {
-            value = 0;
-        }
-        break;
-    case BBK9588_SADC_ADBDAT_OFF: /* ADBDAT */
-        value = board->sadc_battery_data & BBK9588_SADC_DATA_MASK;
-        break;
-    case BBK9588_SADC_ADSDAT_OFF: /* ADSDAT */
-        value = board->sadc_sadcin_data & BBK9588_SADC_DATA_MASK;
-        break;
-    default:
-        value = 0;
-        break;
-    }
-    board->sadc_last_read_offset = (uint32_t)offset;
-    board->sadc_last_read_value = value;
-    bbk9588_touch_trace_update(board, 9u);
-    return value;
-}
-
-static void bbk9588_sadc_write(Bbk9588MachineState *board, hwaddr offset,
-                               uint64_t value)
-{
-    board->sadc_last_write_offset = (uint32_t)offset;
-    board->sadc_last_write_value = (uint32_t)value;
-    if (offset == BBK9588_SADC_ADENA_OFF) { /* ADENA */
-        uint8_t requested = (uint8_t)value &
-                            (BBK9588_SADC_ADENA_SADCINEN |
-                             BBK9588_SADC_ADENA_PBATEN |
-                             BBK9588_SADC_ADENA_TCHEN);
-
-        board->sadc_enable = requested;
-        if (requested) {
-            bbk9588_sadc_schedule_conversion(board, requested);
-        } else {
-            board->sadc_pending_enable = 0;
-            if (board->sadc_timer) {
-                timer_del(board->sadc_timer);
-            }
-        }
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 8u);
-    } else if (offset == BBK9588_SADC_ADCFG_OFF) { /* ADCFG */
-        board->sadc_config = (uint32_t)value;
-        bbk9588_touch_trace_update(board, 8u);
-    } else if (offset == BBK9588_SADC_ADCTRL_OFF) { /* ADCTRL */
-        board->sadc_control = (uint8_t)value & BBK9588_SADC_STATE_MASK;
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 8u);
-    } else if (offset == BBK9588_SADC_ADSTATE_OFF) { /* ADSTATE */
-        bool cleared_conversion =
-            (value & BBK9588_SADC_STATE_DTCH) != 0;
-
-        board->sadc_status_event &= ~((uint8_t)value &
-                                      BBK9588_SADC_STATE_MASK);
-        if (cleared_conversion &&
-            board->sadc_conversion_events_remaining > 0) {
-            board->sadc_conversion_events_remaining--;
-        }
-        if (cleared_conversion) {
-            bbk9588_sadc_queue_next_touch_sample(board);
-        }
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 7u);
-    } else if (offset == BBK9588_SADC_ADSAME_OFF) { /* ADSAME */
-        board->sadc_same_time = (uint16_t)value;
-        bbk9588_touch_trace_update(board, 8u);
-    } else if (offset == BBK9588_SADC_ADWAIT_OFF) { /* ADWAIT */
-        board->sadc_wait_time = (uint16_t)value;
-        bbk9588_touch_trace_update(board, 8u);
-    } else if (offset == BBK9588_SADC_ADTCH_OFF) { /* ADTCH */
-        bbk9588_sadc_touch_fifo_clear(board);
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 7u);
-    } else if (offset == BBK9588_SADC_ADBDAT_OFF) { /* ADBDAT */
-        board->sadc_battery_data = 0;
-        board->sadc_status_event &= ~BBK9588_SADC_STATE_DRDY;
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 7u);
-    } else if (offset == BBK9588_SADC_ADSDAT_OFF) { /* ADSDAT */
-        board->sadc_sadcin_data = 0;
-        board->sadc_status_event &= ~BBK9588_SADC_STATE_SRDY;
-        bbk9588_sadc_sync_irq(board);
-        bbk9588_touch_trace_update(board, 7u);
-    } else {
-        bbk9588_touch_trace_update(board, 10u);
-    }
 }
 
 static int bbk9588_uart_can_read(void *opaque)
@@ -4534,6 +3476,7 @@ static void bbk9588_graphics_trace_write(Bbk9588MmioState *s, hwaddr offset,
                                          uint64_t value, unsigned size)
 {
     Bbk9588MachineState *board = s->board;
+    JZ4740LCDDiagnostics lcd;
 
     if (!board || !board->graphics_trace_enabled) {
         return;
@@ -4544,6 +3487,7 @@ static void bbk9588_graphics_trace_write(Bbk9588MmioState *s, hwaddr offset,
     if (board->graphics_trace_count++ >= 4096) {
         return;
     }
+    jz4740_lcd_get_diagnostics(board->lcd, &lcd);
     error_report(
         "bbk9588-mmio[%u] win=0x%08" HWADDR_PRIx
         " kind=%u off=0x%04" HWADDR_PRIx
@@ -4580,8 +3524,8 @@ static void bbk9588_graphics_trace_write(Bbk9588MmioState *s, hwaddr offset,
         s->regs[0x0044 / sizeof(uint32_t)],
         s->regs[0x0048 / sizeof(uint32_t)],
         s->regs[0x004c / sizeof(uint32_t)],
-        board->lcd_dma_desc_va,
-        board->lcd_dma_frame_va);
+        lcd.descriptor_address,
+        lcd.framebuffer_address);
 }
 
 static void bbk9588_uart_write(Bbk9588MmioState *s, hwaddr offset,
@@ -4681,368 +3625,6 @@ static void bbk9588_uart_write(Bbk9588MmioState *s, hwaddr offset,
     bbk9588_uart_sync_irq(board);
 }
 
-static uint32_t bbk9588_rtc_seconds(Bbk9588MachineState *board)
-{
-    int64_t now_ns = qemu_clock_get_ns(rtc_clock);
-    uint64_t elapsed = 0;
-
-    if (!(board->rtc_control & BBK9588_RTC_RTCCR_RTCE)) {
-        return board->rtc_base_seconds;
-    }
-    if (now_ns > board->rtc_base_ns) {
-        elapsed = (uint64_t)(now_ns - board->rtc_base_ns) / NANOSECONDS_PER_SECOND;
-    }
-    return board->rtc_base_seconds + (uint32_t)elapsed;
-}
-
-static uint32_t bbk9588_rtc_host_seconds(void)
-{
-    struct tm tm;
-    time_t seconds;
-
-    qemu_get_timedate(&tm, 0);
-    seconds = mktimegm(&tm);
-    if (seconds < 0) {
-        return 0;
-    }
-    return (uint32_t)seconds;
-}
-
-static uint32_t bbk9588_rtc_latch_flags(Bbk9588MachineState *board)
-{
-    uint32_t control = board->rtc_control;
-    uint32_t seconds = bbk9588_rtc_seconds(board);
-
-    if ((control & BBK9588_RTC_RTCCR_RTCE) &&
-        seconds != board->rtc_1hz_latched_seconds) {
-        control |= BBK9588_RTC_RTCCR_1HZ;
-        board->rtc_1hz_latched_seconds = seconds;
-    }
-    if ((control & (BBK9588_RTC_RTCCR_RTCE |
-                    BBK9588_RTC_RTCCR_AE)) ==
-        (BBK9588_RTC_RTCCR_RTCE | BBK9588_RTC_RTCCR_AE) &&
-        seconds >= board->rtc_alarm_seconds &&
-        !board->rtc_alarm_latched) {
-        control |= BBK9588_RTC_RTCCR_AF;
-        board->rtc_alarm_latched = true;
-        if ((board->rtc_hcr & BBK9588_RTC_HCR_PD) &&
-            (board->rtc_hwcr & BBK9588_RTC_HWCR_EALM)) {
-            board->rtc_hwrsr |= BBK9588_RTC_HWRSR_ALM;
-            board->rtc_hcr &= ~BBK9588_RTC_HCR_PD;
-        }
-    }
-    board->rtc_control = control;
-    return control;
-}
-
-static bool bbk9588_rtc_irq_pending(Bbk9588MachineState *board)
-{
-    uint32_t control = bbk9588_rtc_latch_flags(board);
-
-    return ((control & (BBK9588_RTC_RTCCR_1HZ |
-                        BBK9588_RTC_RTCCR_1HZIE)) ==
-            (BBK9588_RTC_RTCCR_1HZ | BBK9588_RTC_RTCCR_1HZIE)) ||
-           ((control & (BBK9588_RTC_RTCCR_AF |
-                        BBK9588_RTC_RTCCR_AIE)) ==
-            (BBK9588_RTC_RTCCR_AF | BBK9588_RTC_RTCCR_AIE));
-}
-
-static uint32_t bbk9588_rtc_control(Bbk9588MachineState *board)
-{
-    return bbk9588_rtc_latch_flags(board) | BBK9588_RTC_RTCCR_WRDY;
-}
-
-static void bbk9588_rtc_schedule(Bbk9588MachineState *board)
-{
-    uint32_t control = board->rtc_control;
-    uint32_t seconds;
-    uint64_t elapsed;
-    int64_t now_ns;
-    int64_t next_ns = 0;
-
-    if (!board->rtc_timer) {
-        return;
-    }
-    if (!(control & BBK9588_RTC_RTCCR_RTCE)) {
-        timer_del(board->rtc_timer);
-        return;
-    }
-
-    now_ns = qemu_clock_get_ns(rtc_clock);
-    seconds = bbk9588_rtc_seconds(board);
-    if ((control & BBK9588_RTC_RTCCR_1HZIE) &&
-        !(control & BBK9588_RTC_RTCCR_1HZ)) {
-        elapsed = now_ns > board->rtc_base_ns ?
-            (uint64_t)(now_ns - board->rtc_base_ns) /
-                NANOSECONDS_PER_SECOND : 0;
-        next_ns = board->rtc_base_ns +
-                  (int64_t)((elapsed + 1) * NANOSECONDS_PER_SECOND);
-        if (next_ns <= now_ns) {
-            next_ns = now_ns + NANOSECONDS_PER_SECOND;
-        }
-    }
-    if ((control & BBK9588_RTC_RTCCR_AE) && !board->rtc_alarm_latched) {
-        int64_t alarm_ns = now_ns;
-
-        if (seconds < board->rtc_alarm_seconds) {
-            alarm_ns +=
-                (int64_t)(board->rtc_alarm_seconds - seconds) *
-                NANOSECONDS_PER_SECOND;
-        }
-        if (next_ns == 0 || alarm_ns < next_ns) {
-            next_ns = alarm_ns;
-        }
-    }
-
-    if (next_ns == 0) {
-        timer_del(board->rtc_timer);
-    } else {
-        timer_mod(board->rtc_timer, next_ns);
-    }
-}
-
-static void bbk9588_rtc_timer_cb(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-
-    bbk9588_update_irq(board);
-    bbk9588_rtc_schedule(board);
-}
-
-static uint32_t bbk9588_rtc_read(Bbk9588MachineState *board, hwaddr offset)
-{
-    switch (offset) {
-    case 0x00: /* RTCCR */
-        return bbk9588_rtc_control(board);
-    case 0x04: /* RTCSR */
-        return bbk9588_rtc_seconds(board);
-    case 0x08: /* RTCSAR */
-        return board->rtc_alarm_seconds;
-    case 0x0c: /* RTCGR */
-        return board->rtc_regulator & BBK9588_RTC_RTCGR_RW_MASK;
-    case 0x20: /* HCR */
-        return board->rtc_hcr & BBK9588_RTC_HCR_PD;
-    case 0x24: /* HWFCR */
-        return board->rtc_hwfcr & BBK9588_RTC_HWFCR_MASK;
-    case 0x28: /* HRCR */
-        return board->rtc_hrcr & BBK9588_RTC_HRCR_MASK;
-    case 0x2c: /* HWCR */
-        return board->rtc_hwcr & BBK9588_RTC_HWCR_EALM;
-    case 0x30: /* HWRSR */
-        return board->rtc_hwrsr & BBK9588_RTC_HWRSR_MASK;
-    case 0x34: /* HSPR */
-        return board->rtc_scratch;
-    default:
-        return 0;
-    }
-}
-
-static void bbk9588_rtc_enter_hibernate(Bbk9588MachineState *board)
-{
-    board->rtc_hcr |= BBK9588_RTC_HCR_PD;
-    board->rtc_hwrsr &= ~(BBK9588_RTC_HWRSR_ALM | BBK9588_RTC_HWRSR_PIN);
-}
-
-static void bbk9588_rtc_write_while_hibernating(Bbk9588MachineState *board,
-                                                hwaddr offset, uint32_t value)
-{
-    if (offset != 0x00) {
-        return;
-    }
-    if (!(value & BBK9588_RTC_RTCCR_1HZ)) {
-        board->rtc_control &= ~BBK9588_RTC_RTCCR_1HZ;
-    }
-    board->rtc_control =
-        (board->rtc_control & ~BBK9588_RTC_RTCCR_1HZIE) |
-        (value & BBK9588_RTC_RTCCR_1HZIE);
-}
-
-static void bbk9588_rtc_write(Bbk9588MachineState *board, hwaddr offset,
-                              uint32_t value)
-{
-    uint32_t flags = board->rtc_control &
-                     (BBK9588_RTC_RTCCR_1HZ | BBK9588_RTC_RTCCR_AF);
-    bool was_enabled = (board->rtc_control & BBK9588_RTC_RTCCR_RTCE) != 0;
-
-    if (board->rtc_hcr & BBK9588_RTC_HCR_PD) {
-        bbk9588_rtc_write_while_hibernating(board, offset, value);
-        bbk9588_rtc_schedule(board);
-        return;
-    }
-
-    switch (offset) {
-    case 0x00: /* RTCCR */
-        if (!(value & BBK9588_RTC_RTCCR_1HZ)) {
-            flags &= ~BBK9588_RTC_RTCCR_1HZ;
-        }
-        if (!(value & BBK9588_RTC_RTCCR_AF)) {
-            flags &= ~BBK9588_RTC_RTCCR_AF;
-        }
-        board->rtc_control = flags | (value & BBK9588_RTC_RTCCR_RW_MASK);
-        if (!was_enabled && (board->rtc_control & BBK9588_RTC_RTCCR_RTCE)) {
-            board->rtc_base_ns = qemu_clock_get_ns(rtc_clock);
-            board->rtc_1hz_latched_seconds = board->rtc_base_seconds;
-        }
-        break;
-    case 0x04: /* RTCSR */
-        board->rtc_base_seconds = value;
-        board->rtc_base_ns = qemu_clock_get_ns(rtc_clock);
-        board->rtc_1hz_latched_seconds = board->rtc_base_seconds;
-        if (value < board->rtc_alarm_seconds) {
-            board->rtc_alarm_latched = false;
-        }
-        board->rtc_control &= ~BBK9588_RTC_RTCCR_1HZ;
-        break;
-    case 0x08: /* RTCSAR */
-        board->rtc_alarm_seconds = value;
-        board->rtc_alarm_latched = false;
-        board->rtc_control &= ~BBK9588_RTC_RTCCR_AF;
-        break;
-    case 0x0c: /* RTCGR */
-        if (!(board->rtc_regulator & BBK9588_RTC_RTCGR_LOCK)) {
-            board->rtc_regulator = value & BBK9588_RTC_RTCGR_RW_MASK;
-        }
-        break;
-    case 0x20: /* HCR */
-        if (value & BBK9588_RTC_HCR_PD) {
-            bbk9588_rtc_enter_hibernate(board);
-        } else {
-            board->rtc_hcr = 0;
-        }
-        break;
-    case 0x24: /* HWFCR */
-        board->rtc_hwfcr = value & BBK9588_RTC_HWFCR_MASK;
-        break;
-    case 0x28: /* HRCR */
-        board->rtc_hrcr = value & BBK9588_RTC_HRCR_MASK;
-        break;
-    case 0x2c: /* HWCR */
-        board->rtc_hwcr = value & BBK9588_RTC_HWCR_EALM;
-        break;
-    case 0x30: /* HWRSR: writable status bits are cleared by writing 0. */
-        board->rtc_hwrsr &= value & BBK9588_RTC_HWRSR_MASK;
-        break;
-    case 0x34: /* HSPR */
-        board->rtc_scratch = value;
-        break;
-    default:
-        break;
-    }
-    bbk9588_rtc_schedule(board);
-}
-
-static uint32_t bbk9588_jz_lcd_read(Bbk9588MmioState *s, hwaddr offset)
-{
-    Bbk9588MachineState *board = s->board;
-
-    switch (offset) {
-    case BBK9588_JZ_LCD_STATE_OFF:
-        return board->jz_lcd_state & BBK9588_JZ_LCD_STATE_MASK;
-    case BBK9588_JZ_LCD_IID_OFF:
-        return board->jz_lcd_iid;
-    default:
-        return s->regs[offset / sizeof(uint32_t)];
-    }
-}
-
-static bool bbk9588_jz_lcd_dma_reg_readonly(hwaddr offset)
-{
-    switch (offset) {
-    case BBK9588_JZ_LCD_IID_OFF:
-    case BBK9588_JZ_LCD_SA0_OFF:
-    case BBK9588_JZ_LCD_FID0_OFF:
-    case BBK9588_JZ_LCD_CMD0_OFF:
-    case BBK9588_JZ_LCD_SA1_OFF:
-    case BBK9588_JZ_LCD_FID1_OFF:
-    case BBK9588_JZ_LCD_CMD1_OFF:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static void bbk9588_jz_lcd_note_frame_source(Bbk9588MachineState *board)
-{
-    board->lcd_frame_chardev_sent_valid = false;
-    board->lcd_scanout_not_before_ms =
-        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-        board->lcd_refresh_period_ms;
-    bbk9588_lcd_schedule_vblank(board);
-}
-
-static void bbk9588_jz_lcd_write(Bbk9588MmioState *s, hwaddr offset,
-                                 uint32_t old_reg, uint32_t value)
-{
-    Bbk9588MachineState *board = s->board;
-    uint32_t index = offset / sizeof(uint32_t);
-    bool frame_source_changed = false;
-
-    switch (offset) {
-    case BBK9588_JZ_LCD_CFG_OFF:
-        s->regs[index] = value & BBK9588_JZ_LCD_CFG_RW_MASK;
-        break;
-    case BBK9588_JZ_LCD_VSYNC_OFF:
-        s->regs[index] = value & BBK9588_JZ_LCD_VSYNC_RW_MASK;
-        break;
-    case BBK9588_JZ_LCD_HSYNC_OFF:
-    case BBK9588_JZ_LCD_VAT_OFF:
-    case BBK9588_JZ_LCD_DAH_OFF:
-    case BBK9588_JZ_LCD_DAV_OFF:
-    case BBK9588_JZ_LCD_PS_OFF:
-    case BBK9588_JZ_LCD_CLS_OFF:
-    case BBK9588_JZ_LCD_SPL_OFF:
-        s->regs[index] = value & BBK9588_JZ_LCD_TIMING_RW_MASK;
-        break;
-    case BBK9588_JZ_LCD_REV_OFF:
-        s->regs[index] = value & BBK9588_JZ_LCD_REV_RW_MASK;
-        break;
-    case BBK9588_JZ_LCD_CTRL_OFF:
-        s->regs[index] = value & BBK9588_JZ_LCD_CTRL_RW_MASK;
-        board->jz_lcd_ctrl = s->regs[index];
-        if (value & BBK9588_JZ_LCD_CTRL_DIS) {
-            s->regs[index] &= ~BBK9588_JZ_LCD_CTRL_ENA;
-            board->jz_lcd_ctrl = s->regs[index];
-            board->jz_lcd_state |= BBK9588_JZ_LCD_STATE_LDD;
-        } else if ((old_reg & BBK9588_JZ_LCD_CTRL_ENA) &&
-                   !(value & BBK9588_JZ_LCD_CTRL_ENA)) {
-            board->jz_lcd_state |= BBK9588_JZ_LCD_STATE_QD;
-        }
-        if (value & BBK9588_JZ_LCD_CTRL_ENA) {
-            board->jz_lcd_state &=
-                ~(BBK9588_JZ_LCD_STATE_LDD | BBK9588_JZ_LCD_STATE_QD);
-            frame_source_changed |= bbk9588_jz_lcd_fetch_descriptor(s, 0);
-            if (s->regs[BBK9588_JZ_LCD_DA1_OFF / sizeof(uint32_t)] != 0) {
-                frame_source_changed |= bbk9588_jz_lcd_fetch_descriptor(s, 1);
-            }
-        }
-        break;
-    case BBK9588_JZ_LCD_STATE_OFF:
-        board->jz_lcd_state &= ~(value & BBK9588_JZ_LCD_STATE_MASK);
-        s->regs[index] = board->jz_lcd_state;
-        break;
-    case BBK9588_JZ_LCD_DA0_OFF:
-    case BBK9588_JZ_LCD_DA1_OFF:
-        s->regs[index] = value & ~BBK9588_JZ_LCD_DA_ALIGN_MASK;
-        if (s->regs[BBK9588_JZ_LCD_CTRL_OFF / sizeof(uint32_t)] &
-            BBK9588_JZ_LCD_CTRL_ENA) {
-            frame_source_changed =
-                bbk9588_jz_lcd_fetch_descriptor(
-                    s, offset == BBK9588_JZ_LCD_DA1_OFF ? 1 : 0);
-        }
-        break;
-    default:
-        if (bbk9588_jz_lcd_dma_reg_readonly(offset)) {
-            s->regs[index] = old_reg;
-        }
-        break;
-    }
-
-    if (frame_source_changed) {
-        bbk9588_jz_lcd_note_frame_source(board);
-    }
-    bbk9588_update_irq(board);
-}
-
 static uint64_t bbk9588_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     Bbk9588MmioState *s = opaque;
@@ -5076,28 +3658,8 @@ static uint64_t bbk9588_mmio_read(void *opaque, hwaddr offset, unsigned size)
         }
         break;
     case BBK9588_MMIO_MISC:
-        if (s->window->kseg1_base == 0xb0070000) {
-            return bbk9588_sadc_read(board, offset);
-        }
-        break;
-    case BBK9588_MMIO_RTC:
-        return bbk9588_mmio_extract32(bbk9588_rtc_read(board, offset & ~3),
-                                      offset, size);
-    case BBK9588_MMIO_GPIO:
-        if ((offset & (BBK9588_GPIO_PORT_STRIDE - 1u)) ==
-            BBK9588_GPIO_PIN_OFF) {
-            return bbk9588_gpio_level(board, offset, s->regs[index]);
-        }
-        if ((offset & (BBK9588_GPIO_PORT_STRIDE - 1u)) ==
-            BBK9588_GPIO_FLG_OFF) {
-            return bbk9588_gpio_flag(board, offset, s->regs[index]);
-        }
         break;
     case BBK9588_MMIO_GRAPHICS:
-        if (bbk9588_is_jz_lcd_window(s)) {
-            return bbk9588_mmio_extract32(
-                bbk9588_jz_lcd_read(s, offset & ~3), offset, size);
-        }
         if (bbk9588_is_msc_window(s) &&
             offset == BBK9588_MSC_RES_OFF) {
             return bbk9588_msc_read_response(s, size);
@@ -5143,7 +3705,6 @@ static void bbk9588_mmio_write(void *opaque, hwaddr offset,
     hwaddr aligned_offset = offset & ~3;
     uint32_t mask;
     uint32_t lane_value;
-    uint32_t old_reg;
     uint32_t reg;
 
     switch (size) {
@@ -5158,8 +3719,7 @@ static void bbk9588_mmio_write(void *opaque, hwaddr offset,
         shift = 0;
         break;
     }
-    old_reg = s->regs[index];
-    reg = old_reg;
+    reg = s->regs[index];
     lane_value = ((uint32_t)value << shift) & mask;
     reg = (reg & ~mask) | lane_value;
     s->regs[index] = reg;
@@ -5185,34 +3745,11 @@ static void bbk9588_mmio_write(void *opaque, hwaddr offset,
         bbk9588_sysctrl_sync_wake(board);
         bbk9588_update_irq(board);
     }
-    if (s->window->kind == BBK9588_MMIO_RTC) {
-        bbk9588_rtc_write(board, aligned_offset, reg);
-        reg = s->regs[index] = bbk9588_rtc_read(board, aligned_offset);
-        bbk9588_update_irq(board);
-    }
-    if (s->window->kind == BBK9588_MMIO_MISC &&
-        s->window->kseg1_base == 0xb0070000) {
-        bbk9588_sadc_write(board, offset, value);
-    }
-    if (bbk9588_is_jz_lcd_window(s)) {
-        bbk9588_jz_lcd_write(s, aligned_offset, old_reg, reg);
-        reg = s->regs[index];
-    }
     if (s->window->kind == BBK9588_MMIO_LCD) {
         bbk9588_lcd_write(board, offset, value);
     }
-    if (s->window->kind == BBK9588_MMIO_GPIO) {
-        bbk9588_gpio_apply_write(s, aligned_offset, lane_value);
-    }
-    if (s->window->kind == BBK9588_MMIO_LCD ||
-        (s->window->kind == BBK9588_MMIO_GRAPHICS &&
-         s->window->kseg1_base == 0xb3050000)) {
-        if (bbk9588_lcd_observe_mmio_write(board, offset, reg)) {
-            board->lcd_scanout_not_before_ms =
-                qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                board->lcd_refresh_period_ms;
-            bbk9588_lcd_schedule_vblank(board);
-        }
+    if (s->window->kind == BBK9588_MMIO_LCD) {
+        jz4740_lcd_observe_alias_write(board->lcd, offset, reg);
     }
     if (s->window->kind == BBK9588_MMIO_UART) {
         bbk9588_uart_write(s, offset, reg);
@@ -5362,6 +3899,82 @@ static void bbk9588_create_cpm_device(Bbk9588MachineState *board)
     jz4740_cpm_set_update(board->cpm, bbk9588_cpm_update, board);
 }
 
+static void bbk9588_create_lcd_device(MachineState *machine,
+                                       Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_JZ4740_LCD);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_uint64(dev, "ram-size", machine->ram_size);
+    qdev_prop_set_uint32(dev, "frame-bytes", BBK9588_LCD_BYTES);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3050000u));
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(board->intc),
+                                        JZ4740_INTC_IRQ_LCD));
+    board->lcd = JZ4740_LCD(dev);
+    jz4740_lcd_set_frame_source_callback(
+        board->lcd, bbk9588_lcd_frame_source_changed, board);
+    jz4740_lcd_set_trace_enabled(board->lcd,
+                                  board->graphics_trace_enabled);
+}
+
+static void bbk9588_create_sadc_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_JZ4740_SADC);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_uint32(dev, "battery-raw", board->sadc_battery_raw);
+    qdev_prop_set_uint32(dev, "sadcin-raw", board->sadc_sadcin_raw);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0070000u));
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(board->intc),
+                                        JZ4740_INTC_IRQ_SADC));
+    board->sadc = JZ4740_SADC(dev);
+    jz4740_sadc_set_trace_callback(board->sadc, bbk9588_sadc_trace, board);
+}
+
+static void bbk9588_create_gpio_device(Bbk9588MachineState *board)
+{
+    static const unsigned irq_source[JZ4740_GPIO_NUM_PORTS] = {
+        JZ4740_INTC_IRQ_GPIO0,
+        JZ4740_INTC_IRQ_GPIO1,
+        JZ4740_INTC_IRQ_GPIO2,
+        JZ4740_INTC_IRQ_GPIO3,
+    };
+    DeviceState *dev = qdev_new(TYPE_JZ4740_GPIO);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_uint32(dev, "input-reset-b", 0x78040000u);
+    qdev_prop_set_uint32(dev, "input-reset-c", 0x48000000u);
+    qdev_prop_set_uint32(dev, "input-reset-d", 0x00200000u);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0010000u));
+    for (unsigned port = 0; port < JZ4740_GPIO_NUM_PORTS; port++) {
+        sysbus_connect_irq(sbd, port,
+                           qdev_get_gpio_in(DEVICE(board->intc),
+                                            irq_source[port]));
+    }
+    board->gpio = JZ4740_GPIO(dev);
+    jz4740_gpio_set_input_sample_callback(
+        board->gpio, bbk9588_gpio_sample_input, board);
+    jz4740_gpio_set_trace_callback(board->gpio, bbk9588_gpio_trace, board);
+}
+
+static void bbk9588_create_rtc_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_JZ4740_RTC);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0003000u));
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(board->intc),
+                                        JZ4740_INTC_IRQ_RTC));
+    board->rtc = JZ4740_RTC(dev);
+}
+
 static void bbk9588_create_tcu_device(Bbk9588MachineState *board)
 {
     DeviceState *dev = qdev_new(TYPE_JZ4740_TCU);
@@ -5407,10 +4020,6 @@ static void bbk9588_map_mmio_window(MachineState *machine,
 
     s->window = window;
     s->board = board;
-    if (window->kind == BBK9588_MMIO_GRAPHICS &&
-        window->kseg1_base == 0xb3050000) {
-        board->jz_lcd_mmio = s;
-    }
     if (bbk9588_is_msc_window(s)) {
         s->regs[BBK9588_MSC_STAT_OFF / sizeof(uint32_t)] =
             BBK9588_MSC_STAT_RESET;
@@ -5420,15 +4029,6 @@ static void bbk9588_map_mmio_window(MachineState *machine,
             BBK9588_MSC_RDTO_RESET;
         s->regs[BBK9588_MSC_IMASK_OFF / sizeof(uint32_t)] =
             BBK9588_MSC_IMASK_RESET;
-    }
-    if (window->kind == BBK9588_MMIO_GPIO &&
-        window->kseg1_base == 0xb0010000) {
-        for (unsigned port = 0; port < BBK9588_GPIO_PORTS; port++) {
-            hwaddr base = port * BBK9588_GPIO_PORT_STRIDE;
-
-            s->regs[(base + BBK9588_GPIO_IM_OFF) / sizeof(uint32_t)] =
-                BBK9588_GPIO_IM_RESET;
-        }
     }
     memory_region_init_io(&s->mr, OBJECT(machine), &bbk9588_mmio_ops, s,
                           window->name, window->size);
@@ -5581,6 +4181,7 @@ static void bbk9588_set_graphics_trace(Object *obj, bool value,
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
     board->graphics_trace_enabled = value;
+    jz4740_lcd_set_trace_enabled(board->lcd, value);
 }
 
 static bool bbk9588_get_touch_trace(Object *obj, Error **errp)
@@ -5732,6 +4333,18 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->dmac_irq) {
         qemu_free_irq(board->dmac_irq);
     }
+    if (board->gpio) {
+        object_unref(OBJECT(board->gpio));
+    }
+    if (board->lcd) {
+        object_unref(OBJECT(board->lcd));
+    }
+    if (board->rtc) {
+        object_unref(OBJECT(board->rtc));
+    }
+    if (board->sadc) {
+        object_unref(OBJECT(board->sadc));
+    }
     if (board->tcu) {
         object_unref(OBJECT(board->tcu));
     }
@@ -5794,26 +4407,8 @@ static void bbk9588_instance_init(Object *obj)
     board->msc_last_dma_phys = 0;
     board->msc_last_dma_words = 0;
     board->msc_dma_complete_count = 0;
-    board->rtc_control = BBK9588_RTC_RTCCR_RESET & ~BBK9588_RTC_RTCCR_WRDY;
-    board->rtc_base_seconds = bbk9588_rtc_host_seconds();
-    board->rtc_base_ns = qemu_clock_get_ns(rtc_clock);
-    board->rtc_regulator = 0;
-    board->rtc_alarm_seconds = 0xffffffffu;
-    board->rtc_1hz_latched_seconds = board->rtc_base_seconds;
-    board->rtc_alarm_latched = false;
-    board->rtc_hcr = 0;
-    board->rtc_hwfcr = 0;
-    board->rtc_hrcr = 0;
-    board->rtc_hwcr = 0;
-    board->rtc_hwrsr = BBK9588_RTC_HWRSR_PPR;
-    board->rtc_scratch = BBK9588_RTC_MAGIC;
     board->lcd_status = 0;
     board->lcd_irq_status = 0;
-    board->jz_lcd_ctrl = 0;
-    board->jz_lcd_state = 0;
-    board->jz_lcd_iid = 0;
-    board->jz_lcd_cmd[0] = 0;
-    board->jz_lcd_cmd[1] = 0;
     board->perf_seq = 0;
     board->perf_last_send_ms = 0;
     board->cpu_irq_output_enabled = true;
@@ -5830,10 +4425,6 @@ static void bbk9588_instance_init(Object *obj)
     board->nand_id_code = BBK9588_NAND_ID_CODE;
     board->bootrom_nand_page = BBK9588_BOOTROM_NAND_PAGE;
     board->bootrom_size = BBK9588_BOOTROM_FIRST_STAGE_BYTES;
-    board->lcd_dma_desc_va = 0;
-    board->lcd_dma_desc_valid = false;
-    board->lcd_dma_frame_va = 0;
-    board->lcd_dma_frame_valid = false;
     board->lcd_scanout_not_before_ms = 0;
     board->lcd_frame_stable_not_before_ms = 0;
     board->lcd_frame_chardev_sent_valid = false;
@@ -5888,10 +4479,6 @@ static void bbk9588_init(MachineState *machine)
     board->intc_resample_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                               bbk9588_intc_resample_timer_cb,
                                               board);
-    board->rtc_timer = timer_new_ns(rtc_clock, bbk9588_rtc_timer_cb, board);
-    bbk9588_rtc_schedule(board);
-    board->sadc_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                     bbk9588_sadc_timer_cb, board);
     board->progress_trace_timer = timer_new_ms(
         QEMU_CLOCK_REALTIME, bbk9588_progress_trace_timer_cb, board);
     board->lcd_refresh_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
@@ -5921,38 +4508,15 @@ static void bbk9588_init(MachineState *machine)
     if (frame_chr) {
         qemu_chr_fe_init(&board->frame_chr, frame_chr, &error_abort);
     }
-    board->touch_down = false;
-    board->touch_move_pending = false;
-    board->touch_raw_x = 0x0e74;
-    board->touch_raw_y = 0x0dde;
-    board->sadc_enable = 0;
-    board->sadc_config = BBK9588_SADC_CONFIG_RESET;
-    board->sadc_control = 0;
-    board->sadc_status_event = 0;
-    board->sadc_pending_enable = 0;
-    board->sadc_same_time = 0;
-    board->sadc_wait_time = 0;
-    board->sadc_touch_sample_is_move = false;
-    board->sadc_battery_raw = BBK9588_SADC_DEFAULT_BATTERY_RAW;
-    board->sadc_sadcin_raw = BBK9588_SADC_DEFAULT_SADCIN_RAW;
-    board->sadc_battery_data = 0;
-    board->sadc_sadcin_data = 0;
-    bbk9588_sadc_touch_fifo_clear(board);
-    board->sadc_next_axis = 0;
-    board->sadc_conversion_events_remaining = 0;
-    board->sadc_last_read_offset = 0;
-    board->sadc_last_read_value = 0;
-    board->sadc_last_write_offset = 0;
-    board->sadc_last_write_value = 0;
     board->extgpio_wake_enable_80 = 0;
     board->sysctrl_wake_pending = false;
     board->gpio300_wake_pulse_available = false;
     board->sysctrl_wake_count = 0;
-    board->gpio_last_read_offset = 0;
-    board->gpio_last_read_value = 0;
-    board->gpio_last_flag_offset = 0;
-    board->gpio_last_flag_value = 0;
     bbk9588_create_intc_device(board);
+    bbk9588_create_sadc_device(board);
+    bbk9588_create_gpio_device(board);
+    bbk9588_create_rtc_device(board);
+    bbk9588_create_lcd_device(machine, board);
     bbk9588_create_tcu_device(board);
     bbk9588_create_cpm_device(board);
     bbk9588_create_dmac_device(machine, board);
@@ -6022,12 +4586,12 @@ static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)
     bbk9588_add_u32_property(
         oc, "sadc-battery-raw",
         offsetof(Bbk9588MachineState, sadc_battery_raw),
-        BBK9588_SADC_DEFAULT_BATTERY_RAW,
+        JZ4740_SADC_DEFAULT_BATTERY_RAW,
         "12-bit SADC PBAT sample value latched into ADBDAT when ADENA.PBATEN is written");
     bbk9588_add_u32_property(
         oc, "sadc-sadcin-raw",
         offsetof(Bbk9588MachineState, sadc_sadcin_raw),
-        BBK9588_SADC_DEFAULT_SADCIN_RAW,
+        JZ4740_SADC_DEFAULT_SADCIN_RAW,
         "12-bit SADCIN sample value latched into ADSDAT when ADENA.SADCINEN is written");
     bbk9588_add_u32_property(
         oc, "nand-id-code",

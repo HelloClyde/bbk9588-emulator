@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+- 将 JZ4740 RTC 的 seconds、1 Hz、alarm、hibernate registers、timer、IRQ、reset
+  和 migration 从 `bbk9588.c` 迁移到独立 `hw/rtc/jz4740_rtc.c` QOM device。
+- 将 JZ4740 GPIO 的 4-port register banks、外部 pin level、FLG latch、4 路 IRQ、
+  reset 和 migration 从 `bbk9588.c` 迁移到独立
+  `hw/gpio/jz4740_gpio.c` QOM device；9588 键位、pen、NAND 和 wake 接线保留在
+  machine。
+- 修正 Web smoke 对低配色主菜单和应用启动画面的误判，同时继续要求非黑像素、
+  颜色数、GUI active 和输入队列消费达到有效阈值。
+- 将 JZ4740 SADC register、2-entry touch FIFO、conversion timer、PBAT/SADCIN、
+  IRQ、reset 和 migration 从 `bbk9588.c` 迁移到独立
+  `hw/input/jz4740_sadc.c` QOM device。
+- 将 JZ4740 LCD register、descriptor DMA、SOF/EOF IRQ、reset 和 migration 从
+  `bbk9588.c` 迁移到独立 `hw/display/jz4740_lcd.c` QOM device。
+- 修复独立仓库中雷霆战机 Web smoke 的 NAND 工具导入路径。
+- 雷霆战机 Web smoke 会自动打开游戏音效，并校验 8000 Hz AIC 播放、DMA/output
+  增长、xrun、Game Over 返回菜单以及第二次战斗的重复播放生命周期。
+- 修复 Web smoke 在 C200 主界面已经激活时重复执行触摸校准的问题。
+
 ## [v0.1.2] - 2026-07-12
 
 - 将 JZ4740 AIC 的 S16LE PCM 通过 chardev 和独立 WebSocket 推送到浏览器。

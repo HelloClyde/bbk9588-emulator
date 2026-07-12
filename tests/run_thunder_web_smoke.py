@@ -13,12 +13,10 @@ import sys
 import time
 import zlib
 from pathlib import Path
+from urllib.parse import quote
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from urllib.parse import quote
-
-from emu.tools.inspect_combined_nand_fat import Fat16View, extract_fat_from_nand
 
 from tests.run_frontend_web_smoke import (
     BUILD,
@@ -33,7 +31,10 @@ from tests.run_frontend_web_smoke import (
     tap,
     wait_http,
 )
+from tools.inspect_combined_nand_fat import Fat16View, extract_fat_from_nand
 
+KEY_UP = 4
+KEY_DOWN = 5
 KEY_RIGHT = 7
 KEY_OK = 10
 KEY_LEFT = 6
@@ -65,6 +66,97 @@ def pump_for(ws: WebSocketClient, seconds: float) -> None:
 def framebuffer_stats(status: dict[str, object]) -> tuple[int, int]:
     fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
     return int(fb.get("nonzero_pixels") or 0), int(fb.get("unique_pixel_values") or 0)
+
+
+def audio_metrics(status: dict[str, object]) -> dict[str, object]:
+    qemu = status.get("qemu") if isinstance(status.get("qemu"), dict) else {}
+    performance = qemu.get("performance") if isinstance(qemu.get("performance"), dict) else {}
+    audio = performance.get("audio") if isinstance(performance.get("audio"), dict) else {}
+    return {
+        key: audio.get(key)
+        for key in (
+            "sample_rate_hz",
+            "playing",
+            "muted",
+            "timer_running",
+            "tx_fifo_level",
+            "tx_dma_samples",
+            "output_frames",
+            "underruns",
+            "overruns",
+            "dma_completion_count",
+            "dma_rearm_count",
+            "dma_last_rearm_gap_ns",
+            "dma_max_rearm_gap_ns",
+            "dma_completion_fifo",
+            "dma_rearm_fifo",
+        )
+    }
+
+
+def audio_counter_delta(before: dict[str, object], after: dict[str, object]) -> dict[str, int]:
+    counters = (
+        "tx_dma_samples",
+        "output_frames",
+        "underruns",
+        "overruns",
+        "dma_completion_count",
+        "dma_rearm_count",
+    )
+    return {
+        key: int(after.get(key) or 0) - int(before.get(key) or 0)
+        for key in counters
+    }
+
+
+def wait_for_audio_playback(
+    ws: WebSocketClient,
+    host: str,
+    port: int,
+    *,
+    timeout: float = 10.0,
+) -> tuple[dict[str, object], dict[str, object]]:
+    deadline = time.time() + max(0.0, timeout)
+    status: dict[str, object] = {}
+    metrics: dict[str, object] = {}
+    while time.time() < deadline:
+        status = http_json(host, port, "GET", "/api/status")
+        metrics = audio_metrics(status)
+        if (
+            metrics.get("playing") is True
+            and int(metrics.get("sample_rate_hz") or 0) > 0
+            and int(metrics.get("tx_dma_samples") or 0) > 0
+            and int(metrics.get("output_frames") or 0) > 0
+        ):
+            return status, metrics
+        pump_for(ws, 0.2)
+    return status, metrics
+
+
+def validate_stable_audio_window(
+    before: dict[str, object],
+    after: dict[str, object],
+    failures: list[str],
+) -> dict[str, int]:
+    delta = audio_counter_delta(before, after)
+    if int(after.get("sample_rate_hz") or 0) != 8000:
+        failures.append(
+            f"Thunder audio sample rate is {after.get('sample_rate_hz')!r}, expected 8000 Hz"
+        )
+    if after.get("playing") is not True or after.get("muted") is True:
+        failures.append("Thunder audio is not playing through an unmuted codec route")
+    for key in ("tx_dma_samples", "output_frames", "dma_completion_count", "dma_rearm_count"):
+        if delta[key] <= 0:
+            failures.append(f"Thunder audio counter {key} did not advance")
+    if abs(delta["dma_completion_count"] - delta["dma_rearm_count"]) > 1:
+        failures.append(
+            "Thunder audio DMA completion/rearm counts diverged by more than one block"
+        )
+    if delta["underruns"] != 0:
+        failures.append(f"Thunder stable audio window added {delta['underruns']} underrun samples")
+    if delta["overruns"] != 0:
+        failures.append(f"Thunder stable audio window added {delta['overruns']} overrun samples")
+    return delta
 
 
 def thunder_fullscreen_like(status: dict[str, object]) -> bool:
@@ -139,7 +231,32 @@ def thunder_menu_capture_like(capture: dict[str, object]) -> bool:
     stats = capture.get("image_stats")
     if not isinstance(stats, dict):
         return False
-    return int(stats.get("yellow") or 0) >= 800
+    return (
+        int(stats.get("yellow") or 0) >= 800
+        and int(stats.get("bluebar") or 0) < 1400
+        and int(stats.get("red") or 0) >= 200
+    )
+
+
+def thunder_settings_capture_like(capture: dict[str, object]) -> bool:
+    stats = capture.get("image_stats")
+    if not isinstance(stats, dict):
+        return False
+    return (
+        int(stats.get("bluebar") or 0) >= 1400
+        and int(stats.get("red") or 0) < 100
+    )
+
+
+def thunder_game_over_capture_like(capture: dict[str, object]) -> bool:
+    stats = capture.get("image_stats")
+    if not isinstance(stats, dict):
+        return False
+    return (
+        int(stats.get("white") or 0) >= 900
+        and int(stats.get("yellow") or 0) < 100
+        and int(stats.get("green") or 0) < 30
+    )
 
 
 def game_grid_capture_like(capture: dict[str, object]) -> bool:
@@ -151,6 +268,17 @@ def game_grid_capture_like(capture: dict[str, object]) -> bool:
         and int(stats.get("bluebar") or 0) >= 2500
         and int(stats.get("green") or 0) < 1000
         and int(stats.get("yellow") or 0) < 400
+    )
+
+
+def entertainment_menu_capture_like(capture: dict[str, object]) -> bool:
+    stats = capture.get("image_stats")
+    if not isinstance(stats, dict):
+        return False
+    return (
+        int(stats.get("white") or 0) >= 4500
+        and int(stats.get("bluebar") or 0) >= 2500
+        and int(stats.get("green") or 0) < 1000
     )
 
 
@@ -430,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk-steps", type=int, default=250000)
     ap.add_argument("--frame-push-min-interval", type=float, default=0.04)
     ap.add_argument("--fps-probe-seconds", type=float, default=0.0)
+    ap.add_argument("--audio-lifecycle-probe", action="store_true")
     ap.add_argument("--frontend-profile-out", type=Path)
     ap.add_argument("--event-probe", action="store_true", default=False)
     ap.add_argument("--battle-state-out", type=Path, help="Save a frontend checkpoint after Thunder reaches battle.")
@@ -512,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
                 captures.append(modal_capture)
                 modal_status = http_json(ns.host, port, "GET", "/api/status?detail=full")
                 gui = modal_status.get("guest_gui_state") if isinstance(modal_status.get("guest_gui_state"), dict) else {}
-                if gui.get("modal_804a65c0"):
+                if gui.get("modal_804a65c0") and pet_popup_capture_like(modal_capture):
                     failures.append("qemu initial system modal is visible; system files were not read correctly")
                 interactions.append(
                     {
@@ -560,23 +689,32 @@ def main(argv: list[str] | None = None) -> int:
                 key_press(ws, KEY_DISMISS_PET, poll_status=poll_status)
                 menu_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "00_menu_dismiss_pet", 1.0)
                 captures.append(menu_capture)
-            tap(ws, 168, 286, poll_status=poll_status)
-            entertainment_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "01_entertainment", 1.0)
-            if pet_popup_capture_like(entertainment_capture):
-                key_press(ws, KEY_DISMISS_PET, poll_status=poll_status)
-                entertainment_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "01_entertainment_dismiss_pet", 1.0)
-                tap(ws, 168, 286, poll_status=poll_status)
-                entertainment_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "01_entertainment_retry", 1.0)
+            entertainment_capture, entertainment_opened = tap_until_capture_predicate(
+                ws,
+                ns.host,
+                port,
+                ns.out_dir,
+                ns.prefix,
+                "01_entertainment",
+                168,
+                286,
+                entertainment_menu_capture_like,
+                attempts=4,
+                timeout=2.0,
+            )
             captures.append(entertainment_capture)
+            if not entertainment_opened:
+                failures.append("Entertainment tab did not open after repeated touch input")
 
             grid_capture = entertainment_capture
             grid_opened = False
             for index in range(1, 5):
-                tap(ws, 198, 84, poll_status=poll_status)
+                tap(ws, 120, 72, poll_status=poll_status)
                 grid_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, f"02_game_grid_r{index}", 0.8)
                 captures.append(grid_capture)
                 if game_grid_capture_like(grid_capture):
                     grid_opened = True
+                    break
             if grid_opened:
                 # Keep the default-image path aligned with the known-good saved
                 # checkpoint route. Earlier pages can look grid-like but keep a
@@ -593,55 +731,29 @@ def main(argv: list[str] | None = None) -> int:
             )
             thunder_selected = False
             if not grid_opened:
-                failures.append("Entertainment game grid did not open before Entertainment World selection")
+                failures.append("Entertainment game grid did not open before Thunder selection")
             else:
-                # In the app.py default NAND image Thunder is under:
-                # 娱乐 tab -> game grid -> 娱乐天地 -> 雷霆战机.
-                key_press(ws, KEY_LEFT, poll_status=poll_status)
-                captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "03_select_ent_world_left", 0.8))
-                tap(ws, 120, 72, poll_status=poll_status)
-                captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "04_tap_ent_world", 1.5))
-                tap(ws, 150, 306, poll_status=poll_status)
-                captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "05_bottom_open_ent_world", 1.5))
-                key_press(ws, KEY_RIGHT, poll_status=poll_status)
-                captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "06_ent_world_right", 0.4))
-                key_press(ws, KEY_OK, poll_status=poll_status)
-                captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "07_ent_world_ok", 2.0))
-                key_press(ws, KEY_LEFT, poll_status=poll_status)
-                world_capture = capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "08_ent_world_grid", 0.4)
-                captures.append(world_capture)
-                thunder_world_opened = str(world_capture.get("sha256") or "") != str(grid_capture.get("sha256") or "")
-                interactions.append(
-                    {
-                        "step": "open-entertainment-world-list",
-                        "digest_changed": thunder_world_opened,
-                        "status": summarize_status(http_json(ns.host, port, "GET", "/api/status")),
-                    }
+                # Current release NAND: 娱乐 -> 娱乐天地 -> bottom-row center.
+                select_capture, selected_thunder = tap_until_capture_changes(
+                    ws,
+                    ns.host,
+                    port,
+                    ns.out_dir,
+                    ns.prefix,
+                    "03_select_thunder",
+                    120,
+                    260,
+                    str(grid_capture.get("sha256") or ""),
+                    attempts=2,
+                    timeout=2.0,
                 )
-                if not thunder_world_opened:
-                    failures.append("Entertainment World list did not open before Thunder selection")
-                else:
-                    select_capture, selected_thunder = tap_until_capture_changes(
-                        ws,
-                        ns.host,
-                        port,
-                        ns.out_dir,
-                        ns.prefix,
-                        "09_select_thunder",
-                        135,
-                        260,
-                        str(world_capture.get("sha256") or ""),
-                        attempts=2,
-                        timeout=2.0,
-                    )
-                    captures.append(select_capture)
-                    if not selected_thunder:
-                        failures.append("Thunder icon selection did not change the Entertainment World grid")
-                    thunder_selected = selected_thunder
-                    tap(ws, 135, 260, poll_status=poll_status)
-                    captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "10_open_thunder_touch", 2.0))
+                captures.append(select_capture)
+                if not selected_thunder:
+                    failures.append("Thunder icon selection did not change the game grid")
+                thunder_selected = selected_thunder
+                if thunder_selected:
                     tap(ws, 150, 306, poll_status=poll_status)
-                    captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "11_open_thunder_toolbar", 2.0))
+                    captures.append(capture_after(ws, ns.host, port, ns.out_dir, ns.prefix, "04_open_thunder_toolbar", 2.0))
 
             if thunder_selected:
                 key_press(ws, KEY_OK, poll_status=lambda: http_json(ns.host, port, "GET", "/api/status"))
@@ -652,9 +764,6 @@ def main(argv: list[str] | None = None) -> int:
                 if balance is not None and balance < 2:
                     failures.append(f"SysPet.yzj balance is {balance}, expected at least 2")
 
-                # If the billing dialog is shown, this hits its confirm button.
-                # If the game has already moved to loading, the tap is harmless.
-                tap(ws, 82, 202, poll_status=lambda: http_json(ns.host, port, "GET", "/api/status"))
                 menu_capture = capture_when(
                     ws,
                     ns.host,
@@ -691,19 +800,102 @@ def main(argv: list[str] | None = None) -> int:
                 thunder_menu_ready = thunder_fullscreen_like(menu_status) and thunder_menu_capture_like(menu_capture)
 
                 if thunder_menu_ready:
-                    key_press(ws, KEY_OK, poll_status=lambda: http_json(ns.host, port, "GET", "/api/status"))
-                    start_capture = capture_when(
-                        ws,
-                        ns.host,
-                        port,
-                        ns.out_dir,
-                        ns.prefix,
-                        "06_after_start_ok",
-                        timeout=8.0,
-                        min_wait=0.3,
-                        capture_predicate=lambda capture, old=menu_digest: capture.get("sha256") != old,
-                    )
-                    captures.append(start_capture)
+                    prestarted_capture: dict[str, object] | None = None
+                    if ns.audio_lifecycle_probe:
+                        # The release NAND keeps Thunder's own sound switch off.
+                        # Select Game Settings, choose the left-hand "on" value,
+                        # confirm, and restore focus to Game Start before probing.
+                        pre_settings_digest = menu_digest
+                        key_press(ws, KEY_DOWN, poll_status=poll_status)
+                        key_press(ws, KEY_OK, poll_status=poll_status)
+                        settings_capture = capture_after(
+                            ws, ns.host, port, ns.out_dir, ns.prefix,
+                            "05_audio_settings", 1.0,
+                        )
+                        captures.append(settings_capture)
+                        key_press(ws, KEY_DOWN, poll_status=poll_status)
+                        key_press(ws, KEY_LEFT, poll_status=poll_status)
+                        tap(ws, 150, 154, poll_status=poll_status)
+                        sound_on_capture = capture_after(
+                            ws, ns.host, port, ns.out_dir, ns.prefix,
+                            "05_audio_sound_on", 0.5,
+                        )
+                        captures.append(sound_on_capture)
+                        settings_closed_capture = sound_on_capture
+                        for close_attempt in range(3):
+                            for label, code in (("ok", KEY_OK), ("up", KEY_UP)):
+                                key_press(ws, code, poll_status=poll_status)
+                                settings_closed_capture = capture_after(
+                                    ws, ns.host, port, ns.out_dir, ns.prefix,
+                                    f"05_audio_settings_close_{close_attempt:02d}_{label}",
+                                    0.4,
+                                )
+                                captures.append(settings_closed_capture)
+                                if thunder_menu_capture_like(settings_closed_capture):
+                                    break
+                            if thunder_menu_capture_like(settings_closed_capture):
+                                break
+                        menu_capture = settings_closed_capture
+                        menu_digest = str(menu_capture.get("sha256") or menu_digest)
+                        if thunder_menu_capture_like(settings_closed_capture):
+                            tap(ws, 120, 174, poll_status=poll_status)
+                            prestarted_capture = capture_when(
+                                ws, ns.host, port, ns.out_dir, ns.prefix,
+                                "05_audio_game_start",
+                                timeout=8.0,
+                                min_wait=0.3,
+                                capture_predicate=lambda item, old=menu_digest: (
+                                    item.get("sha256") != old
+                                ),
+                            )
+                            captures.append(prestarted_capture)
+                        interactions.append(
+                            {
+                                "step": "enable-thunder-audio",
+                                "settings_opened": thunder_settings_capture_like(settings_capture),
+                                "sound_selection_changed": (
+                                    sound_on_capture.get("sha256") != settings_capture.get("sha256")
+                                ),
+                                "settings_closed": (
+                                    thunder_menu_capture_like(settings_closed_capture)
+                                    and settings_closed_capture.get("sha256")
+                                    != sound_on_capture.get("sha256")
+                                ),
+                                "game_start_activated": (
+                                    prestarted_capture is not None
+                                    and prestarted_capture.get("sha256") != menu_digest
+                                ),
+                            }
+                        )
+                        if (
+                            not thunder_settings_capture_like(settings_capture)
+                            or settings_capture.get("sha256") == pre_settings_digest
+                        ):
+                            failures.append("Thunder game settings did not open")
+                        if not thunder_menu_capture_like(settings_closed_capture):
+                            failures.append("Thunder game settings did not close")
+                        if (
+                            prestarted_capture is None
+                            or prestarted_capture.get("sha256") == menu_digest
+                        ):
+                            failures.append("Thunder game-start touch did not open plane selection")
+
+                    if prestarted_capture is not None:
+                        start_capture = prestarted_capture
+                    else:
+                        key_press(ws, KEY_OK, poll_status=lambda: http_json(ns.host, port, "GET", "/api/status"))
+                        start_capture = capture_when(
+                            ws,
+                            ns.host,
+                            port,
+                            ns.out_dir,
+                            ns.prefix,
+                            "06_after_start_ok",
+                            timeout=8.0,
+                            min_wait=0.3,
+                            capture_predicate=lambda capture, old=menu_digest: capture.get("sha256") != old,
+                        )
+                        captures.append(start_capture)
                     if start_capture.get("sha256") == menu_digest:
                         tap(ws, 105, 142, poll_status=lambda: http_json(ns.host, port, "GET", "/api/status"))
                         start_capture = capture_when(
@@ -758,7 +950,29 @@ def main(argv: list[str] | None = None) -> int:
                         captures.append(battle_capture)
                         wait_index += 1
                     battle_status = http_json(ns.host, port, "GET", "/api/status")
-                    interactions.append({"step": "enter-battle", "digest_changed": battle_capture.get("sha256") != before_battle_digest, "status": summarize_status(battle_status)})
+                    if ns.audio_lifecycle_probe:
+                        battle_status, playback_audio = wait_for_audio_playback(
+                            ws, ns.host, port, timeout=10.0
+                        )
+                        interactions.append(
+                            {
+                                "step": "wait-for-thunder-audio",
+                                "audio": playback_audio,
+                                "status": summarize_status(battle_status),
+                            }
+                        )
+                        if playback_audio.get("playing") is not True:
+                            failures.append(
+                                "Thunder battle reached the screen but did not start AIC playback"
+                            )
+                    interactions.append(
+                        {
+                            "step": "enter-battle",
+                            "digest_changed": battle_capture.get("sha256") != before_battle_digest,
+                            "audio": audio_metrics(battle_status),
+                            "status": summarize_status(battle_status),
+                        }
+                    )
                     if battle_capture.get("sha256") == before_battle_digest:
                         failures.append("Thunder did not advance from plane selection to a battle-looking screen")
                     elif ns.battle_state_out is not None:
@@ -776,23 +990,37 @@ def main(argv: list[str] | None = None) -> int:
                             }
                         )
 
-                    if ns.fps_probe_seconds > 0 and ws is not None:
+                    probe_seconds = float(ns.fps_probe_seconds)
+                    if ns.audio_lifecycle_probe:
+                        probe_seconds = max(5.0, probe_seconds)
+                    if probe_seconds > 0 and ws is not None:
+                        probe_start_status = http_json(ns.host, port, "GET", "/api/status")
+                        probe_start_audio = audio_metrics(probe_start_status)
                         probe_start_frames = ws.frames
                         probe_start = time.time()
-                        probe_deadline = probe_start + float(ns.fps_probe_seconds)
+                        probe_deadline = probe_start + probe_seconds
                         while time.time() < probe_deadline:
                             ws.recv_one()
                         probe_elapsed = max(0.001, time.time() - probe_start)
                         probe_status = http_json(ns.host, port, "GET", "/api/status")
+                        probe_audio = audio_metrics(probe_status)
+                        probe_audio_delta = audio_counter_delta(probe_start_audio, probe_audio)
                         interactions.append(
                             {
                                 "step": "battle-fps-probe",
                                 "seconds": round(probe_elapsed, 3),
                                 "frames_delta": ws.frames - probe_start_frames,
                                 "frames_per_second": (ws.frames - probe_start_frames) / probe_elapsed,
+                                "audio_before": probe_start_audio,
+                                "audio_after": probe_audio,
+                                "audio_delta": probe_audio_delta,
                                 "status": summarize_status(probe_status),
                             }
                         )
+                        if ns.audio_lifecycle_probe:
+                            validate_stable_audio_window(
+                                probe_start_audio, probe_audio, failures
+                            )
 
                     before_input_digest = str(battle_capture.get("sha256") or before_battle_digest)
                     for name, code in (("left", KEY_LEFT), ("right", KEY_RIGHT), ("ok", KEY_OK)):
@@ -805,6 +1033,107 @@ def main(argv: list[str] | None = None) -> int:
                             "status": capture.get("status"),
                         })
                         before_input_digest = str(capture.get("sha256") or before_input_digest)
+
+                    if ns.audio_lifecycle_probe:
+                        return_capture = capture
+                        game_over_seen = thunder_game_over_capture_like(return_capture)
+                        for attempt in range(10):
+                            if thunder_menu_capture_like(return_capture):
+                                break
+                            return_capture = capture_after(
+                                ws, ns.host, port, ns.out_dir, ns.prefix,
+                                f"09_wait_game_return_{attempt:02d}", 2.0,
+                            )
+                            captures.append(return_capture)
+                            game_over_seen = (
+                                game_over_seen
+                                or thunder_game_over_capture_like(return_capture)
+                            )
+                        if game_over_seen and not thunder_menu_capture_like(return_capture):
+                            for label, code in (("cancel", KEY_CANCEL), ("ok", KEY_OK)):
+                                key_press(ws, code, poll_status=poll_status)
+                                return_capture = capture_after(
+                                    ws, ns.host, port, ns.out_dir, ns.prefix,
+                                    f"09_game_over_{label}", 2.0,
+                                )
+                                captures.append(return_capture)
+                                if thunder_menu_capture_like(return_capture):
+                                    break
+                        returned_to_menu = thunder_menu_capture_like(return_capture)
+                        return_status = http_json(ns.host, port, "GET", "/api/status")
+                        interactions.append(
+                            {
+                                "step": "audio-first-battle-return",
+                                "returned_to_menu": returned_to_menu,
+                                "game_over_seen": game_over_seen,
+                                "audio": audio_metrics(return_status),
+                                "status": summarize_status(return_status),
+                            }
+                        )
+                        if not returned_to_menu:
+                            failures.append("Thunder first battle did not return to its game menu")
+                        else:
+                            tap(ws, 120, 174, poll_status=poll_status)
+                            key_press(ws, KEY_OK, poll_status=poll_status)
+                            second_plane_capture = capture_when(
+                                ws,
+                                ns.host,
+                                port,
+                                ns.out_dir,
+                                ns.prefix,
+                                "10_audio_second_plane",
+                                timeout=8.0,
+                                min_wait=0.3,
+                                capture_predicate=lambda item, old=return_capture.get("sha256"): (
+                                    item.get("sha256") != old
+                                ),
+                            )
+                            captures.append(second_plane_capture)
+                            key_press(ws, KEY_OK, poll_status=poll_status)
+                            second_battle_capture = capture_when(
+                                ws,
+                                ns.host,
+                                port,
+                                ns.out_dir,
+                                ns.prefix,
+                                "11_audio_second_battle",
+                                timeout=12.0,
+                                min_wait=0.3,
+                                capture_predicate=lambda item, old=second_plane_capture.get("sha256"): (
+                                    item.get("sha256") != old
+                                ),
+                            )
+                            captures.append(second_battle_capture)
+                            second_start_status, second_start_audio = wait_for_audio_playback(
+                                ws, ns.host, port, timeout=10.0
+                            )
+                            pump_for(ws, 5.0)
+                            second_stable_status = http_json(
+                                ns.host, port, "GET", "/api/status"
+                            )
+                            second_stable_audio = audio_metrics(second_stable_status)
+                            second_delta = validate_stable_audio_window(
+                                second_start_audio, second_stable_audio, failures
+                            )
+                            interactions.append(
+                                {
+                                    "step": "audio-second-battle",
+                                    "screen_changed": (
+                                        second_battle_capture.get("sha256")
+                                        != second_plane_capture.get("sha256")
+                                    ),
+                                    "before": second_start_audio,
+                                    "after": second_stable_audio,
+                                    "delta": second_delta,
+                                    "start_status": summarize_status(second_start_status),
+                                    "stable_status": summarize_status(second_stable_status),
+                                }
+                            )
+                            if (
+                                second_battle_capture.get("sha256")
+                                == second_plane_capture.get("sha256")
+                            ):
+                                failures.append("Thunder second battle did not start")
 
         if ws is not None:
             ws.send_json({"op": "stop"})

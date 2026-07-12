@@ -28,6 +28,10 @@ DEFAULT_NAND = ROOT / "runtime" / "bbk9588_nand.bin"
 WS_RAW_FRAME_MAGIC = b"BBKRAW1\0"
 WS_RAW_FRAME_HEADER_SIZE = 20
 WS_RAW_FRAME_FORMAT_RGB565 = 1
+MENU_MIN_NONZERO_PIXELS = 25000
+MENU_MIN_UNIQUE_PIXEL_VALUES = 2000
+RENDERED_MIN_NONZERO_PIXELS = 15000
+RENDERED_MIN_UNIQUE_PIXEL_VALUES = 500
 
 
 def ws_raw_frame_seq(payload: bytes) -> int | None:
@@ -443,8 +447,9 @@ def looks_like_menu(status: dict[str, object]) -> bool:
     fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
     return (
         int(status.get("frontend_input_calibration_stage") or 0) >= 12
-        and int(fb.get("nonzero_pixels") or 0) >= 25000
-        and int(fb.get("unique_pixel_values") or 0) >= 2500
+        and int(fb.get("nonzero_pixels") or 0) >= MENU_MIN_NONZERO_PIXELS
+        and int(fb.get("unique_pixel_values") or 0)
+        >= MENU_MIN_UNIQUE_PIXEL_VALUES
     )
 
 
@@ -452,7 +457,20 @@ def looks_like_menu_family(status: dict[str, object]) -> bool:
     fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
     nonzero = int(fb.get("nonzero_pixels") or 0)
     unique = int(fb.get("unique_pixel_values") or 0)
-    return int(status.get("frontend_input_calibration_stage") or 0) >= 12 and nonzero >= 25000 and unique >= 2500
+    return (
+        int(status.get("frontend_input_calibration_stage") or 0) >= 12
+        and nonzero >= MENU_MIN_NONZERO_PIXELS
+        and unique >= MENU_MIN_UNIQUE_PIXEL_VALUES
+    )
+
+
+def looks_like_rendered_screen(status: dict[str, object]) -> bool:
+    fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
+    return (
+        int(fb.get("nonzero_pixels") or 0) >= RENDERED_MIN_NONZERO_PIXELS
+        and int(fb.get("unique_pixel_values") or 0)
+        >= RENDERED_MIN_UNIQUE_PIXEL_VALUES
+    )
 
 
 def status_pc_value(status: dict[str, object]) -> int | None:
@@ -819,6 +837,18 @@ def main(argv: list[str] | None = None) -> int:
                     "legacy_python_hooks": screen_status.get("legacy_python_hooks"),
                 }
             )
+            if not looks_like_menu_family(screen_status):
+                framebuffer = (
+                    screen_status.get("framebuffer")
+                    if isinstance(screen_status.get("framebuffer"), dict)
+                    else {}
+                )
+                failures.append(
+                    "qemu main menu resources did not render completely: "
+                    f"stage={screen_status.get('frontend_input_calibration_stage')} "
+                    f"nonzero={framebuffer.get('nonzero_pixels')} "
+                    f"unique={framebuffer.get('unique_pixel_values')}"
+                )
             key_status = http_json(ns.host, port, "POST", "/api/command", {"op": "key", "code": 7, "down": True})
             interactions.append(
                 {
@@ -876,10 +906,9 @@ def main(argv: list[str] | None = None) -> int:
                     "storage_service_replies": storage_service_replies,
                 }
             )
-            if not looks_like_menu_family(post_touch_status):
+            if not looks_like_rendered_screen(post_touch_status):
                 failures.append(
-                    "qemu main menu resources did not render completely: "
-                    f"stage={post_touch_status.get('frontend_input_calibration_stage')} "
+                    "qemu screen did not remain rendered after touch: "
                     f"nonzero={post_touch_framebuffer.get('nonzero_pixels')} "
                     f"unique={post_touch_framebuffer.get('unique_pixel_values')}"
                 )

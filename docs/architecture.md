@@ -48,6 +48,14 @@ QEMU C machine / SoC 模型中。
 `qemu/overlay/` 是对 QEMU 11.0.0 的覆盖源码。release workflow 会下载官方
 QEMU 源码，复制 overlay，编译 `mipsel-softmmu`，再收集 Windows runtime DLL。
 
+当前独立 QOM 设备包括 AIC、LCD controller、SADC、GPIO、RTC、INTC、CPM、DMAC 和
+TCU。LCD device 负责 `0xb3050000` register block、descriptor DMA 和 IRQ；SADC
+device 负责 `0xb0070000` register block、触摸 FIFO、conversion timer 和 IRQ；GPIO
+device 负责 `0xb0010000` 的 4 个 port、pin level、flag 和 4 路 IRQ；RTC device 负责
+`0xb0003000` 的 seconds、alarm、hibernate、timer 和 IRQ。BBK 9588 的 panel scanout、
+frame chardev、固定 guest mirror 兼容路径以及按键、pen、NAND/wake 板级接线仍由
+machine 连接。
+
 设备模型优先级：
 
 1. 按真实 SoC/MMIO 行为补设备寄存器。

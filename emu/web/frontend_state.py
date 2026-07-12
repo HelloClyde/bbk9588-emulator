@@ -1834,6 +1834,25 @@ class FrontendState:
 
         if self.frontend_input_calibration_stage < point_count * 2:
             if not pc_unknown and not in_touch_boot and pc != 0:
+                try:
+                    gui = backend.guest_gui_state_snapshot()
+                except Exception:
+                    return
+                active = int(str(gui.get("active_object_80474048") or "0x0"), 16)
+                if active == 0x80959670 or bool(gui.get("active_object_ready")):
+                    self.frontend_input_calibration_stage = 12
+                    self.frontend_input_calibration_last_stage_step += 1
+                    self.qemu_frontend_input_calibration_last_action_at = now
+                    self.qemu_frontend_input_calibration_log.append(
+                        {
+                            "event": "qemu-frontend-input-calibration-complete",
+                            "pc": f"0x{pc:08x}",
+                            "ra": f"0x{ra:08x}",
+                            "active": gui.get("active_object_80474048"),
+                            "reason": "main-menu-already-active",
+                        }
+                    )
+                    del self.qemu_frontend_input_calibration_log[:-16]
                 return
             point_index = self.frontend_input_calibration_stage // 2
             down = self.frontend_input_calibration_stage % 2 == 0

@@ -6,9 +6,13 @@ mips_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_virt.c'))
 mips_ss.add(when: 'CONFIG_MALTA', if_true: files('malta.c'))
 mips_ss.add(when: 'CONFIG_BBK9588', if_true: files(
   'bbk9588.c',
+  '../display/jz4740_lcd.c',
   '../dma/jz4740_dmac.c',
+  '../gpio/jz4740_gpio.c',
+  '../input/jz4740_sadc.c',
   '../intc/jz4740_intc.c',
   '../misc/jz4740_cpm.c',
+  '../rtc/jz4740_rtc.c',
   '../timer/jz4740_tcu.c',
 ))
 mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))

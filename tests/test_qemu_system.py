@@ -747,7 +747,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         start = source.index("static void bbk9588_touch_trace_update")
-        end = source.index("static void bbk9588_sadc_touch_fifo_clear", start)
+        end = source.index("static void bbk9588_sadc_trace", start)
         touch_trace = source[start:end]
 
         self.assertIn("bool touch_trace_enabled;", source)
@@ -1207,308 +1207,243 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("bbk9588.sysctrl", board)
 
     def test_bbk9588_lcd_source_follows_jz4740_register_semantics(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "display" / "jz4740_lcd.c").read_text(
+            encoding="utf-8"
+        )
+        header = (
+            root / "include" / "hw" / "display" / "jz4740_lcd.h"
         ).read_text(encoding="utf-8")
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_ENA       0x00000008u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_OFUM      0x00000800u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_IFUM0     0x00000400u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_IFUM1     0x00000200u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_RW_MASK   0x3fff3fffu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CFG_RW_MASK    0x80ffffbfu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_VSYNC_RW_MASK  0x000007ffu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_TIMING_RW_MASK 0x07ff07ffu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_REV_RW_MASK    0x07ff0000u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_IRQ         JZ4740_INTC_IRQ_LCD", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_EOF      0x00000020u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_SOF      0x00000010u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_OUF      0x00000008u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_IFU0     0x00000004u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_IFU1     0x00000002u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_DA_ALIGN_MASK  0x0000000fu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CMD_PAL        0x10000000u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CMD_LEN_MASK   0x00ffffffu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CMD_RW_MASK", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CTRL_OFF       0x30u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_STATE_OFF      0x34u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_IID_OFF        0x38u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_DA0_OFF        0x40u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_SA0_OFF        0x44u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_CMD1_OFF       0x5cu", source)
-        self.assertIn("#define BBK9588_JZ_LCD_DESC_BYTES     16u", source)
-        self.assertIn("#define BBK9588_JZ_LCD_DESC_SOURCE_OFF 0x04u", source)
-        self.assertIn("{ \"bbk9588.display0\", 0xb3050000, 0x1000, BBK9588_MMIO_GRAPHICS }", source)
-        self.assertIn("static bool bbk9588_is_jz_lcd_window", source)
-        self.assertIn("static bool bbk9588_jz_lcd_irq_pending", source)
-        self.assertIn("static void bbk9588_jz_lcd_latch_iid", source)
-        self.assertIn("!bbk9588_jz_lcd_irq_pending(board)", source)
-        self.assertIn("((state & BBK9588_JZ_LCD_STATE_OUF) &&\n            (ctrl & BBK9588_JZ_LCD_CTRL_OFUM))", source)
-        self.assertIn("((state & BBK9588_JZ_LCD_STATE_IFU0) &&\n            (ctrl & BBK9588_JZ_LCD_CTRL_IFUM0))", source)
-        self.assertIn("((state & BBK9588_JZ_LCD_STATE_IFU1) &&\n            (ctrl & BBK9588_JZ_LCD_CTRL_IFUM1))", source)
-        self.assertIn("jz4740_intc_set_irq(board->intc, BBK9588_JZ_LCD_IRQ,", source)
-        self.assertIn("case BBK9588_JZ_LCD_STATE_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_CFG_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_VSYNC_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_HSYNC_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_PS_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_REV_OFF:", source)
-        self.assertIn("s->regs[index] = value & BBK9588_JZ_LCD_CFG_RW_MASK;", source)
-        self.assertIn("s->regs[index] = value & BBK9588_JZ_LCD_VSYNC_RW_MASK;", source)
-        self.assertIn("s->regs[index] = value & BBK9588_JZ_LCD_TIMING_RW_MASK;", source)
-        self.assertIn("s->regs[index] = value & BBK9588_JZ_LCD_REV_RW_MASK;", source)
-        self.assertIn("case BBK9588_JZ_LCD_DA0_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_DA1_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_SA0_OFF:", source)
-        self.assertIn("case BBK9588_JZ_LCD_CMD1_OFF:", source)
-        self.assertIn("board->jz_lcd_cmd[channel ? 1 : 0] = command;", source)
-        fetch_start = source.index("static bool bbk9588_jz_lcd_fetch_descriptor")
-        fetch_end = source.index("static void bbk9588_jz_lcd_finish_channel", fetch_start)
-        fetch_source = source[fetch_start:fetch_end]
-        self.assertIn("BBK9588_JZ_LCD_CMD_RW_MASK", fetch_source)
-        self.assertIn("bbk9588_jz_lcd_latch_iid(board, BBK9588_JZ_LCD_STATE_SOF,", fetch_source)
-        self.assertNotIn("board->jz_lcd_iid = fid;", fetch_source)
-        self.assertIn("static void bbk9588_jz_lcd_finish_channel", source)
-        self.assertIn("bbk9588_jz_lcd_latch_iid(\n            board, BBK9588_JZ_LCD_STATE_EOF,", source)
-        self.assertIn("cmd & ~BBK9588_JZ_LCD_CMD_LEN_MASK", source)
-        self.assertIn("static void bbk9588_jz_lcd_signal_frame_done", source)
-        self.assertIn("bbk9588_jz_lcd_signal_frame_done(board);", source)
-        self.assertIn("bbk9588_jz_lcd_fetch_descriptor(s, 0)", source)
-        self.assertIn("board->jz_lcd_mmio = s;", source)
-        self.assertIn("bbk9588_jz_lcd_read(s, offset & ~3)", source)
-        self.assertIn("s->regs[index] = value & BBK9588_JZ_LCD_CTRL_RW_MASK;", source)
-        self.assertIn("s->regs[index] = value & ~BBK9588_JZ_LCD_DA_ALIGN_MASK;", source)
-        self.assertIn("bbk9588_jz_lcd_write(s, aligned_offset, old_reg, reg);", source)
-        self.assertIn("offset == BBK9588_JZ_LCD_DA1_OFF", source)
-        self.assertIn("bbk9588_lcd_candidate_desc_va(value, &desc_va)", source)
-        self.assertIn("bbk9588_guest_ram_va_valid(candidate,\n                                       BBK9588_JZ_LCD_DESC_BYTES)", source)
-        self.assertIn("BBK9588_JZ_LCD_DESC_SOURCE_OFF", source)
-        self.assertIn("board->lcd_status = 0;", source)
-        self.assertNotIn("graphics_status", source)
-        self.assertNotIn('oc, "graphics-status"', source)
-        self.assertNotIn('oc, "lcd-status"', source)
-        self.assertNotIn("return s->regs[index] | 0x00000800;", source)
-        self.assertNotIn("board->lcd_irq_status |\n                   BBK9588_LCD_STATUS_READY", source)
+        self.assertIn('#define TYPE_JZ4740_LCD "jz4740-lcd"', header)
+        self.assertIn("#define LCD_CTRL_ENA               0x00000008u", source)
+        self.assertIn("#define LCD_CTRL_OFUM              0x00000800u", source)
+        self.assertIn("#define LCD_CTRL_IFUM0             0x00000400u", source)
+        self.assertIn("#define LCD_CTRL_IFUM1             0x00000200u", source)
+        self.assertIn("#define LCD_CTRL_RW_MASK           0x3fff3fffu", source)
+        self.assertIn("#define LCD_CFG_RW_MASK            0x80ffffbfu", source)
+        self.assertIn("#define LCD_VSYNC_RW_MASK          0x000007ffu", source)
+        self.assertIn("#define LCD_TIMING_RW_MASK         0x07ff07ffu", source)
+        self.assertIn("#define LCD_REV_RW_MASK            0x07ff0000u", source)
+        self.assertIn("#define LCD_STATE_EOF              0x00000020u", source)
+        self.assertIn("#define LCD_STATE_SOF              0x00000010u", source)
+        self.assertIn("#define LCD_CMD_PAL                0x10000000u", source)
+        self.assertIn("#define LCD_CMD_LEN_MASK           0x00ffffffu", source)
+        self.assertIn("static bool jz4740_lcd_irq_pending", source)
+        self.assertIn("static void jz4740_lcd_latch_iid", source)
+        self.assertIn("static bool jz4740_lcd_fetch_descriptor", source)
+        self.assertIn("static void jz4740_lcd_finish_channel", source)
+        self.assertIn("command &= LCD_CMD_RW_MASK;", source)
+        self.assertIn("command & ~LCD_CMD_LEN_MASK", source)
+        self.assertIn("jz4740_lcd_latch_iid(s, LCD_STATE_SOF", source)
+        self.assertIn("jz4740_lcd_latch_iid(s, LCD_STATE_EOF", source)
+        self.assertIn("address_space_read(&address_space_memory", source)
+        self.assertIn("VMSTATE_UINT32_ARRAY(regs, JZ4740LCDState", source)
+        self.assertIn("rc->phases.hold = jz4740_lcd_reset_hold;", source)
+        self.assertIn("sysbus_init_irq(sbd, &s->irq);", source)
+
+        self.assertIn("TYPE_JZ4740_LCD", board)
+        self.assertIn(
+            "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3050000u));",
+            board,
+        )
+        self.assertIn("JZ4740_INTC_IRQ_LCD", board)
+        self.assertIn("jz4740_lcd_signal_frame_done(board->lcd);", board)
+        self.assertIn("jz4740_lcd_get_frame_source(board->lcd, &fb_va)", board)
+        self.assertIn("jz4740_lcd_observe_alias_write(board->lcd", board)
+        self.assertNotIn("bbk9588.display0", board)
+        self.assertNotIn("uint32_t jz_lcd_ctrl;", board)
+        self.assertNotIn("static bool bbk9588_jz_lcd_irq_pending", board)
+        self.assertNotIn("static void bbk9588_jz_lcd_write", board)
+        self.assertIn("board->lcd_status = 0;", board)
+        self.assertNotIn("graphics_status", board)
+        self.assertNotIn('oc, "graphics-status"', board)
+        self.assertNotIn('oc, "lcd-status"', board)
 
     def test_bbk9588_sadc_source_follows_jz4740_register_semantics(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "input" / "jz4740_sadc.c").read_text(
+            encoding="utf-8"
+        )
+        header = (
+            root / "include" / "hw" / "input" / "jz4740_sadc.h"
         ).read_text(encoding="utf-8")
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("#define BBK9588_SADC_CONFIG_RESET  0x0002002cu", source)
-        self.assertIn("#define BBK9588_SADC_DEFAULT_BATTERY_RAW 0x0e68u", source)
-        self.assertIn("#define BBK9588_SADC_DATA_MASK     0x0fffu", source)
-        self.assertIn("#define BBK9588_SADC_ADENA_OFF     0x00u", source)
-        self.assertIn("#define BBK9588_SADC_ADTCH_OFF     0x18u", source)
-        self.assertIn("#define BBK9588_SADC_ADSDAT_OFF    0x20u", source)
-        self.assertIn("#define BBK9588_SADC_CONFIG_XYZ_MASK 0x00006000u", source)
-        self.assertIn("#define BBK9588_SADC_CONFIG_XYZ_SHIFT 13u", source)
-        self.assertIn("#define BBK9588_SADC_CONFIG_XYZ_XY 0u", source)
-        self.assertIn("#define BBK9588_SADC_CONFIG_XYZ_ZS 1u", source)
-        self.assertIn("#define BBK9588_SADC_CONFIG_XYZ_Z12 2u", source)
-        self.assertIn("#define BBK9588_SADC_FIFO_DEPTH    2u", source)
-        self.assertIn("#define BBK9588_SADC_STATE_DTCH     0x04u", source)
-        self.assertIn("#define BBK9588_SADC_STATE_PENU     0x08u", source)
-        self.assertIn("#define BBK9588_SADC_STATE_PEND     0x10u", source)
-        self.assertIn("#define BBK9588_SADC_TOUCH_TYPE0    0x00008000u", source)
-        self.assertIn("#define BBK9588_SADC_TOUCH_TYPE1    0x80000000u", source)
-        self.assertIn("#define BBK9588_SADC_TOUCH_ZS_RAW   0x0800u", source)
-        self.assertIn("QEMUTimer *sadc_timer;", source)
-        self.assertIn("uint8_t sadc_pending_enable;", source)
-        self.assertIn("static uint32_t bbk9588_sadc_pack_touch_pair", source)
-        self.assertIn("if (type0) {\n        value |= BBK9588_SADC_TOUCH_TYPE0;", source)
-        self.assertIn("if (type1) {\n        value |= BBK9588_SADC_TOUCH_TYPE1;", source)
-        self.assertIn("static unsigned bbk9588_sadc_touch_xyz_mode", source)
-        self.assertIn("return (board->sadc_status_event & ~board->sadc_control &", source)
-        self.assertIn("static uint32_t bbk9588_sadc_touch_fifo_pop", source)
-        self.assertIn("if (board->sadc_touch_fifo_count == 0) {\n        return 0;", source)
-        self.assertIn("static void bbk9588_sadc_complete_cpu_samples", source)
-        self.assertIn("static uint32_t bbk9588_sadc_touch_delay_ms", source)
-        self.assertIn("static void bbk9588_sadc_schedule_conversion", source)
-        self.assertIn("static void bbk9588_sadc_timer_cb", source)
-        self.assertIn("board->sadc_pending_enable |= requested;", source)
-        self.assertIn("uint8_t previous_pending = board->sadc_pending_enable;", source)
-        self.assertIn("uint8_t new_cpu_channels = requested & cpu_channels & ~previous_pending;", source)
-        self.assertIn("if (previous_pending && !new_cpu_channels) {", source)
-        self.assertIn("delay_ms = new_cpu_channels ? 1u :", source)
+        self.assertIn('#define TYPE_JZ4740_SADC "jz4740-sadc"', header)
+        self.assertIn("#define JZ4740_SADC_DEFAULT_BATTERY_RAW 0x0e68u", header)
+        self.assertIn("#define SADC_CONFIG_RESET           0x0002002cu", source)
+        self.assertIn("#define SADC_DATA_MASK              0x0fffu", source)
+        self.assertIn("#define SADC_ADENA                  0x00u", source)
+        self.assertIn("#define SADC_ADTCH                  0x18u", source)
+        self.assertIn("#define SADC_ADSDAT                 0x20u", source)
+        self.assertIn("#define SADC_CONFIG_XYZ_MASK        0x00006000u", source)
+        self.assertIn("#define SADC_CONFIG_XYZ_ZS          1u", source)
+        self.assertIn("#define SADC_CONFIG_XYZ_Z12         2u", source)
+        self.assertIn("#define SADC_FIFO_DEPTH             2u", source)
+        self.assertIn("#define SADC_STATE_DTCH             0x04u", source)
+        self.assertIn("#define SADC_STATE_PENU             0x08u", source)
+        self.assertIn("#define SADC_STATE_PEND             0x10u", source)
+        self.assertIn("#define SADC_TOUCH_TYPE0            0x00008000u", source)
+        self.assertIn("#define SADC_TOUCH_TYPE1            0x80000000u", source)
+        self.assertIn("#define SADC_TOUCH_ZS_RAW           0x0800u", source)
+
+        self.assertIn("QEMUTimer *timer;", source)
+        self.assertIn("static uint32_t sadc_pack_touch_pair", source)
+        self.assertIn("static uint32_t sadc_touch_fifo_pop", source)
+        self.assertIn("static void sadc_complete_cpu_samples", source)
+        self.assertIn("static uint32_t sadc_touch_delay_ms", source)
+        self.assertIn("static void sadc_schedule_conversion", source)
+        self.assertIn("static void sadc_timer_cb", source)
+        self.assertIn("s->pending_enable |= requested;", source)
         self.assertIn("uint64_t scaled = (uint64_t)ticks * 128u;", source)
         self.assertIn("(scaled + 11999u) / 12000u", source)
-        self.assertIn("timer_mod(board->sadc_timer,\n              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + delay_ms);", source)
-        self.assertIn("board->sadc_pending_enable = 0;", source)
-        self.assertIn("timer_new_ms(QEMU_CLOCK_REALTIME,\n                                     bbk9588_sadc_timer_cb, board)", source)
-        self.assertIn("case BBK9588_SADC_CONFIG_XYZ_ZS:", source)
-        self.assertIn("case BBK9588_SADC_CONFIG_XYZ_Z12:", source)
-        self.assertIn("case BBK9588_SADC_CONFIG_XYZ_XY:", source)
-        self.assertIn("bbk9588_sadc_pack_touch_pair(board->touch_raw_x,\n                                         board->touch_raw_y,\n                                         false, false)", source)
-        self.assertIn("bbk9588_sadc_pack_touch_pair(BBK9588_SADC_TOUCH_ZS_RAW, 0,\n                                         false, false)", source)
-        self.assertIn("bbk9588_sadc_pack_touch_pair(BBK9588_SADC_TOUCH_Z1_RAW,\n                                         BBK9588_SADC_TOUCH_Z2_RAW,\n                                         true, true)", source)
-        self.assertIn("case BBK9588_SADC_ADENA_OFF: /* ADENA */", source)
-        self.assertIn("case BBK9588_SADC_ADCFG_OFF: /* ADCFG */", source)
-        self.assertIn("case BBK9588_SADC_ADCTRL_OFF: /* ADCTRL */", source)
-        self.assertIn("case BBK9588_SADC_ADSTATE_OFF: /* ADSTATE */", source)
-        self.assertIn("case BBK9588_SADC_ADTCH_OFF: /* ADTCH */", source)
-        self.assertIn("case BBK9588_SADC_ADBDAT_OFF: /* ADBDAT */", source)
-        self.assertIn("case BBK9588_SADC_ADSDAT_OFF: /* ADSDAT */", source)
-        self.assertIn("if (board->sadc_touch_fifo_count > 0) {\n            value = bbk9588_sadc_touch_fifo_pop(board);", source)
-        self.assertIn("bbk9588_sadc_schedule_conversion(board, requested);", source)
-        self.assertIn("timer_del(board->sadc_timer);", source)
-        self.assertIn("board->sadc_enable &= ~BBK9588_SADC_ADENA_PBATEN;", source)
-        self.assertIn("board->sadc_battery_data = 0;", source)
-        self.assertIn('oc, "sadc-battery-raw"', source)
-        self.assertIn("bbk9588_sadc_queue_touch_sample(board);", source)
-        self.assertIn("board->sadc_config = BBK9588_SADC_CONFIG_RESET;", source)
-        self.assertIn("board->sadc_pending_enable = 0;", source)
-        self.assertIn("board->sadc_battery_raw = BBK9588_SADC_DEFAULT_BATTERY_RAW;", source)
-        self.assertNotIn("return BBK9588_SADC_TOUCH_TYPE1 |", source)
-        self.assertNotIn("value = BBK9588_SADC_BATTERY_RAW;", source)
+        self.assertIn("timer_new_ms(QEMU_CLOCK_REALTIME, sadc_timer_cb, s)", source)
+        self.assertIn("case SADC_CONFIG_XYZ_ZS:", source)
+        self.assertIn("case SADC_CONFIG_XYZ_Z12:", source)
+        self.assertIn("case SADC_CONFIG_XYZ_XY:", source)
+        self.assertIn("case SADC_ADENA:", source)
+        self.assertIn("case SADC_ADCFG:", source)
+        self.assertIn("case SADC_ADCTRL:", source)
+        self.assertIn("case SADC_ADSTATE:", source)
+        self.assertIn("case SADC_ADTCH:", source)
+        self.assertIn("case SADC_ADBDAT:", source)
+        self.assertIn("case SADC_ADSDAT:", source)
+        self.assertIn("qemu_set_irq(s->irq, level);", source)
+        self.assertIn("VMSTATE_UINT32_ARRAY(touch_fifo, JZ4740SADCState", source)
+        self.assertIn("rc->phases.hold = sadc_reset_hold;", source)
+        self.assertIn('DEFINE_PROP_UINT32("battery-raw"', source)
+        self.assertIn("void jz4740_sadc_set_touch", source)
+        self.assertIn("void jz4740_sadc_get_diagnostics", source)
+
+        self.assertIn("TYPE_JZ4740_SADC", board)
+        self.assertIn(
+            "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0070000u));",
+            board,
+        )
+        self.assertIn("JZ4740_INTC_IRQ_SADC", board)
+        self.assertIn("jz4740_sadc_set_touch(board->sadc, raw_x, raw_y, down);", board)
+        self.assertIn("jz4740_sadc_get_diagnostics(board->sadc, &sadc_diag);", board)
+        self.assertNotIn("QEMUTimer *sadc_timer;", board)
+        self.assertNotIn("uint8_t sadc_status_event;", board)
+        self.assertNotIn("static uint32_t bbk9588_sadc_read", board)
+        self.assertNotIn('"bbk9588.misc7"', board)
 
     def test_bbk9588_gpio_source_follows_jz4740_port_register_semantics(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
-        gpio_start = source.index("static uint32_t bbk9588_gpio_idle_level")
-        gpio_end = source.index("static uint32_t bbk9588_sadc_read", gpio_start)
-        gpio = source[gpio_start:gpio_end]
-        read_start = source.index("static uint64_t bbk9588_mmio_read")
-        write_start = source.index("static void bbk9588_mmio_write", read_start)
-        mmio_read = source[read_start:write_start]
-        write_end = source.index("static const MemoryRegionOps", write_start)
-        mmio_write = source[write_start:write_end]
-        map_start = source.index("static void bbk9588_map_mmio_window")
-        map_end = source.index("static void bbk9588_cpu_reset", map_start)
-        map_window = source[map_start:map_end]
-        key_start = source.index("static bool bbk9588_key_gpio_bits")
-        key_end = source.index("static void bbk9588_key_apply_host_input", key_start)
-        key_gpio = source[key_start:key_end]
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "qemu/overlay/hw/gpio/jz4740_gpio.c").read_text(
+            encoding="utf-8"
+        )
+        header = (root / "qemu/overlay/include/hw/gpio/jz4740_gpio.h").read_text(
+            encoding="utf-8"
+        )
+        board = (root / "qemu/overlay/hw/mips/bbk9588.c").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("#define BBK9588_GPIO_PORTS          4u", source)
-        self.assertIn("#define BBK9588_GPIO_PORT_STRIDE    0x100u", source)
-        self.assertIn("#define BBK9588_GPIO_PIN_OFF        0x00u", source)
-        self.assertIn("#define BBK9588_GPIO_DAT_OFF        0x10u", source)
-        self.assertIn("#define BBK9588_GPIO_DATS_OFF       0x14u", source)
-        self.assertIn("#define BBK9588_GPIO_FLGC_OFF       BBK9588_GPIO_DATS_OFF", source)
-        self.assertIn("#define BBK9588_GPIO_DATC_OFF       0x18u", source)
-        self.assertIn("#define BBK9588_GPIO_IM_OFF         0x20u", source)
-        self.assertIn("#define BBK9588_GPIO_IM_RESET       0xffffffffu", source)
-        self.assertIn("#define BBK9588_GPIO_FLG_OFF        0x80u", source)
-        self.assertIn("#define BBK9588_GPIO_PORT_B_OFF     0x100u", source)
-        self.assertIn("#define BBK9588_GPIO_IRQ_PORT_B     JZ4740_INTC_IRQ_GPIO1", source)
-        self.assertIn("#define BBK9588_NAND_READY_IRQ      BBK9588_GPIO_IRQ_PORT_C", source)
+        self.assertIn('#define TYPE_JZ4740_GPIO "jz4740-gpio"', header)
+        self.assertIn("#define JZ4740_GPIO_NUM_PORTS 4u", header)
+        self.assertIn("#define GPIO_PORT_STRIDE           0x0100u", source)
+        self.assertIn("#define GPIO_PIN                   0x00u", source)
+        self.assertIn("#define GPIO_DAT                   0x10u", source)
+        self.assertIn("#define GPIO_DATS                  0x14u", source)
+        self.assertIn("#define GPIO_FLGC                  GPIO_DATS", source)
+        self.assertIn("#define GPIO_DATC                  0x18u", source)
+        self.assertIn("#define GPIO_IM                    0x20u", source)
+        self.assertIn("#define GPIO_FLG                   0x80u", source)
+        self.assertIn("#define GPIO_IM_RESET              0xffffffffu", source)
 
-        self.assertIn("static bool bbk9588_gpio_decode_offset", gpio)
-        self.assertIn("static void bbk9588_gpio_apply_write", gpio)
-        self.assertIn("case BBK9588_GPIO_DATS_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_DATC_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_IMS_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_IMC_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_FUNS_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_FUNC_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_DIRS_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_DIRC_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_TRGS_OFF:", gpio)
-        self.assertIn("case BBK9588_GPIO_TRGC_OFF:", gpio)
-        self.assertIn("bbk9588_gpio_clear_flag(s->board, offset, value);", gpio)
-        self.assertIn("BBK9588_GPIO_PORT_B_OFF + BBK9588_GPIO_FLGC_OFF", gpio)
-        self.assertIn("BBK9588_GPIO_IRQ_PORT_B", gpio)
+        self.assertIn("case GPIO_DATS:", source)
+        self.assertIn("case GPIO_DATC:", source)
+        self.assertIn("case GPIO_IMS:", source)
+        self.assertIn("case GPIO_IMC:", source)
+        self.assertIn("case GPIO_FUNS:", source)
+        self.assertIn("case GPIO_FUNC:", source)
+        self.assertIn("case GPIO_DIRS:", source)
+        self.assertIn("case GPIO_DIRC:", source)
+        self.assertIn("case GPIO_TRGS:", source)
+        self.assertIn("case GPIO_TRGC:", source)
+        self.assertIn("s->flag[port] &= ~lane_value;", source)
+        self.assertIn("gpio_update_irq(s, port);", source)
+        self.assertIn("qdev_init_gpio_in_named(DEVICE(obj), gpio_pin_input", source)
+        self.assertIn("VMSTATE_UINT32_ARRAY(regs, JZ4740GPIOState", source)
+        self.assertIn("rc->phases.hold = gpio_reset_hold;", source)
 
-        self.assertIn("BBK9588_GPIO_PIN_OFF", mmio_read)
-        self.assertIn("BBK9588_GPIO_FLG_OFF", mmio_read)
-        self.assertIn("bbk9588_gpio_apply_write(s, aligned_offset, lane_value);", mmio_write)
-        self.assertIn("BBK9588_GPIO_IM_RESET", map_window)
-        self.assertIn("port < BBK9588_GPIO_PORTS", map_window)
-
-        self.assertIn("*offset = BBK9588_GPIO_PORT_B_OFF;", key_gpio)
-        self.assertIn("case BBK9588_GPIO_PORT_C_OFF:", key_gpio)
-        self.assertIn("main_irq = BBK9588_GPIO_IRQ_PORT_D;", key_gpio)
-        self.assertNotIn("case 0x100:", key_gpio)
-        self.assertNotIn("main_irq = 27;", key_gpio)
+        self.assertIn('#include "hw/gpio/jz4740_gpio.h"', board)
+        self.assertIn("TYPE_JZ4740_GPIO", board)
+        self.assertIn(
+            "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0010000u));",
+            board,
+        )
+        self.assertIn("JZ4740_INTC_IRQ_GPIO0", board)
+        self.assertIn("JZ4740_INTC_IRQ_GPIO3", board)
+        self.assertIn('qdev_prop_set_uint32(dev, "input-reset-b", 0x78040000u);', board)
+        self.assertIn("jz4740_gpio_set_input_level(board->gpio, port, mask,", board)
+        self.assertIn("jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C", board)
+        self.assertIn("jz4740_gpio_set_input_sample_callback(", board)
+        self.assertNotIn("BBK9588_MMIO_GPIO", board)
+        self.assertNotIn("uint32_t key_gpio_down_100;", board)
+        self.assertNotIn("static void bbk9588_gpio_apply_write", board)
 
     def test_bbk9588_rtc_source_follows_jz4740_register_semantics(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "qemu/overlay/hw/rtc/jz4740_rtc.c").read_text(
+            encoding="utf-8"
+        )
+        header = (root / "qemu/overlay/include/hw/rtc/jz4740_rtc.h").read_text(
+            encoding="utf-8"
+        )
+        board = (root / "qemu/overlay/hw/mips/bbk9588.c").read_text(
+            encoding="utf-8"
+        )
 
+        self.assertIn('#define TYPE_JZ4740_RTC "jz4740-rtc"', header)
         self.assertIn('#include "system/rtc.h"', source)
-        self.assertIn('#include "qemu/cutils.h"', source)
-        self.assertIn("#define BBK9588_RTC_RTCCR_RESET    0x00000081u", source)
-        self.assertIn("#define BBK9588_RTC_RTCCR_WRDY     0x00000080u", source)
-        self.assertIn("#define BBK9588_RTC_RTCCR_1HZ      0x00000040u", source)
-        self.assertIn("#define BBK9588_RTC_RTCCR_1HZIE    0x00000020u", source)
-        self.assertIn("#define BBK9588_RTC_IRQ            JZ4740_INTC_IRQ_RTC", source)
-        self.assertIn("#define BBK9588_RTC_HCR_PD         0x00000001u", source)
-        self.assertIn("#define BBK9588_RTC_HWFCR_MASK     0x0000ffe0u", source)
-        self.assertIn("#define BBK9588_RTC_HRCR_MASK      0x00000fe0u", source)
-        self.assertIn("#define BBK9588_RTC_HWRSR_PPR      0x00000010u", source)
-        self.assertIn("#define BBK9588_RTC_HWRSR_HR       0x00000020u", source)
-        self.assertIn("#define BBK9588_RTC_HWRSR_PIN      0x00000002u", source)
-        self.assertIn("#define BBK9588_RTC_HWRSR_ALM      0x00000001u", source)
-        self.assertIn("BBK9588_MMIO_RTC", source)
-        self.assertIn('{ "bbk9588.rtc",      0xb0003000, 0x1000, BBK9588_MMIO_RTC }', source)
-        self.assertIn("static uint32_t bbk9588_rtc_read", source)
-        self.assertIn("static uint32_t bbk9588_rtc_host_seconds", source)
-        self.assertIn("static uint32_t bbk9588_rtc_latch_flags", source)
-        self.assertIn("static bool bbk9588_rtc_irq_pending", source)
-        self.assertIn("static void bbk9588_rtc_schedule", source)
-        self.assertIn("static void bbk9588_rtc_timer_cb", source)
-        self.assertIn("static void bbk9588_rtc_enter_hibernate", source)
-        self.assertIn("static void bbk9588_rtc_write_while_hibernating", source)
-        self.assertIn("QEMUTimer *rtc_timer;", source)
-        self.assertIn("uint32_t rtc_1hz_latched_seconds;", source)
-        self.assertIn("bool rtc_alarm_latched;", source)
-        self.assertIn("case 0x00: /* RTCCR */", source)
-        self.assertIn("case 0x04: /* RTCSR */", source)
-        self.assertIn("case 0x20: /* HCR */", source)
-        self.assertIn("case 0x30: /* HWRSR */", source)
-        self.assertIn("case 0x34: /* HSPR */", source)
-        self.assertIn("jz4740_intc_set_irq(board->intc, BBK9588_RTC_IRQ,", source)
-        self.assertIn("board->rtc_hwrsr |= BBK9588_RTC_HWRSR_ALM;", source)
-        self.assertIn("board->rtc_hcr &= ~BBK9588_RTC_HCR_PD;", source)
-        self.assertIn("board->rtc_hwrsr &= ~(BBK9588_RTC_HWRSR_ALM |", source)
-        self.assertIn("if (board->rtc_hcr & BBK9588_RTC_HCR_PD)", source)
-        self.assertIn("bbk9588_mmio_extract32(bbk9588_rtc_read(board, offset & ~3)", source)
-        self.assertIn("bbk9588_rtc_write(board, aligned_offset, reg);", source)
+        self.assertIn("#define RTC_RTCCR_RESET            0x00000081u", source)
+        self.assertIn("#define RTC_RTCCR_WRDY             0x00000080u", source)
+        self.assertIn("#define RTC_RTCCR_1HZ              0x00000040u", source)
+        self.assertIn("#define RTC_RTCCR_1HZIE            0x00000020u", source)
+        self.assertIn("#define RTC_HCR_PD                 0x00000001u", source)
+        self.assertIn("#define RTC_HWRSR_PPR              0x00000010u", source)
+        self.assertIn("static uint32_t rtc_host_seconds", source)
+        self.assertIn("uint32_t jz4740_rtc_seconds", source)
+        self.assertIn("static uint32_t rtc_latch_flags", source)
+        self.assertIn("static bool rtc_irq_pending", source)
+        self.assertIn("static void rtc_schedule", source)
+        self.assertIn("static void rtc_timer_cb", source)
+        self.assertIn("static void rtc_enter_hibernate", source)
+        self.assertIn("static void rtc_write_while_hibernating", source)
+        self.assertIn("case RTC_RTCCR:", source)
+        self.assertIn("case RTC_RTCSR:", source)
+        self.assertIn("case RTC_HCR:", source)
+        self.assertIn("case RTC_HWRSR:", source)
+        self.assertIn("case RTC_HSPR:", source)
+        self.assertIn("s->hwrsr |= RTC_HWRSR_ALM;", source)
+        self.assertIn("s->hcr &= ~RTC_HCR_PD;", source)
         self.assertIn("qemu_get_timedate(&tm, 0);", source)
         self.assertIn("seconds = mktimegm(&tm);", source)
-        self.assertIn("board->rtc_base_seconds = bbk9588_rtc_host_seconds();", source)
-        self.assertIn("board->rtc_base_ns = qemu_clock_get_ns(rtc_clock);", source)
-        self.assertIn("seconds != board->rtc_1hz_latched_seconds", source)
-        self.assertIn("board->rtc_1hz_latched_seconds = seconds;", source)
-        self.assertIn("!board->rtc_alarm_latched", source)
-        self.assertIn("board->rtc_alarm_latched = true;", source)
-        self.assertIn("board->rtc_alarm_latched = false;", source)
-        self.assertIn("board->rtc_1hz_latched_seconds = board->rtc_base_seconds;", source)
-        self.assertIn("timer_new_ns(rtc_clock, bbk9588_rtc_timer_cb, board)", source)
-        self.assertIn("bbk9588_rtc_schedule(board);", source)
-        self.assertIn("timer_mod(board->rtc_timer, next_ns);", source)
-        self.assertIn("board->rtc_hwrsr = BBK9588_RTC_HWRSR_PPR;", source)
-        rtc_source = source[
-            source.index("static uint32_t bbk9588_rtc_seconds"):
-            source.index("static uint32_t bbk9588_jz_lcd_read")
-        ]
-        self.assertNotIn("BBK9588_RTC_DEFAULT_SECONDS", source)
-        self.assertNotIn("qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)", rtc_source)
-        self.assertNotIn("seconds != board->rtc_base_seconds", rtc_source)
-        self.assertNotIn('"ready-status"', source)
+        self.assertIn("timer_new_ns(rtc_clock, rtc_timer_cb, s)", source)
+        self.assertIn("timer_mod(s->timer, next_ns);", source)
+        self.assertIn("VMSTATE_INT64(base_ns, JZ4740RTCState)", source)
+        self.assertIn("rc->phases.hold = rtc_reset_hold;", source)
+        self.assertNotIn("qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)", source)
+
+        self.assertIn('#include "hw/rtc/jz4740_rtc.h"', board)
+        self.assertIn("TYPE_JZ4740_RTC", board)
+        self.assertIn(
+            "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0003000u));",
+            board,
+        )
+        self.assertIn("JZ4740_INTC_IRQ_RTC", board)
+        self.assertNotIn("BBK9588_MMIO_RTC", board)
+        self.assertNotIn("QEMUTimer *rtc_timer;", board)
+        self.assertNotIn("static uint32_t bbk9588_rtc_read", board)
+        self.assertNotIn('"ready-status"', board)
 
     def test_jz4740_dmac_source_follows_channel_semantics(self) -> None:
         root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
@@ -3743,56 +3678,60 @@ class QemuSystemCommandTests(unittest.TestCase):
 
     def test_bbk9588_pen_up_preserves_unread_touch_sample(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        source = (root / "qemu/overlay/hw/mips/bbk9588.c").read_text(encoding="utf-8")
-        touch_set_state = source.split("static void bbk9588_touch_set_state(", 2)[2].split(
-            "static uint32_t bbk9588_gpio_idle_level", 1
+        source = (root / "qemu/overlay/hw/input/jz4740_sadc.c").read_text(
+            encoding="utf-8"
+        )
+        touch_set_state = source.split("void jz4740_sadc_set_touch(", 1)[1].split(
+            "bool jz4740_sadc_touch_down", 1
         )[0]
 
-        self.assertNotIn("bbk9588_sadc_touch_fifo_clear(board);", touch_set_state)
-        self.assertIn("board->sadc_status_event & ~BBK9588_SADC_STATE_PEND", touch_set_state)
-        self.assertNotIn(
-            "BBK9588_SADC_STATE_PEND | BBK9588_SADC_STATE_DTCH",
-            touch_set_state,
-        )
-        self.assertIn("board->sadc_conversion_events_remaining = 5;", touch_set_state)
+        self.assertNotIn("sadc_touch_fifo_clear(s);", touch_set_state)
+        self.assertIn("s->status_event & ~SADC_STATE_PEND", touch_set_state)
+        self.assertNotIn("SADC_STATE_PEND | SADC_STATE_DTCH", touch_set_state)
+        self.assertIn("s->conversion_events_remaining = 5;", touch_set_state)
         self.assertIn("bool touch_move_pending;", source)
-        self.assertIn("bool was_down = board->touch_down;", touch_set_state)
+        self.assertIn("was_down = s->touch_down;", touch_set_state)
         self.assertIn("} else if (position_changed) {", touch_set_state)
-        self.assertIn("board->touch_move_pending = true;", touch_set_state)
-        self.assertIn("bool irq_needs_sync = was_down != down;", touch_set_state)
-        self.assertNotIn("irq_needs_sync = true;", touch_set_state)
+        self.assertIn("s->touch_move_pending = true;", touch_set_state)
+        self.assertIn("if (was_down != down) {", touch_set_state)
         initial_down = touch_set_state.split("if (!was_down) {", 1)[1].split(
             "} else if (position_changed) {", 1
         )[0]
         move = touch_set_state.split("} else if (position_changed) {", 1)[1].split(
             "    } else if (was_down) {", 1
         )[0]
-        self.assertIn("board->sadc_conversion_events_remaining = 5;", initial_down)
-        self.assertIn("BBK9588_SADC_STATE_PEND", initial_down)
-        self.assertNotIn("board->sadc_conversion_events_remaining = 5;", move)
-        self.assertNotIn("BBK9588_SADC_STATE_PEND", move)
-        self.assertIn("bbk9588_sadc_queue_next_touch_sample(board);", move)
+        self.assertIn("s->conversion_events_remaining = 5;", initial_down)
+        self.assertIn("SADC_STATE_PEND", initial_down)
+        self.assertNotIn("s->conversion_events_remaining = 5;", move)
+        self.assertNotIn("SADC_STATE_PEND", move)
+        self.assertIn("sadc_queue_next_touch_sample(s);", move)
 
         queue_next = source.split(
-            "static bool bbk9588_sadc_queue_next_touch_sample(", 1
-        )[1].split("static void bbk9588_sadc_sync_irq", 1)[0]
-        self.assertIn("board->sadc_status_event & BBK9588_SADC_STATE_DTCH", queue_next)
-        self.assertIn("board->sadc_touch_fifo_count != 0", queue_next)
-        self.assertIn("board->sadc_pending_enable & BBK9588_SADC_ADENA_TCHEN", queue_next)
-        self.assertIn("bbk9588_sadc_touch_delay_ms(board, true)", queue_next)
-        self.assertIn("bbk9588_sadc_touch_delay_ms(board, false)", queue_next)
+            "static bool sadc_queue_next_touch_sample(", 1
+        )[1].split("static void sadc_complete_cpu_samples", 1)[0]
+        self.assertIn("s->status_event & SADC_STATE_DTCH", queue_next)
+        self.assertIn("s->touch_fifo_count != 0", queue_next)
+        self.assertIn("s->pending_enable & SADC_ADENA_TCHEN", queue_next)
+        self.assertIn("sadc_touch_delay_ms(s, true)", queue_next)
+        self.assertIn("sadc_touch_delay_ms(s, false)", queue_next)
 
-        adtch_read = source.split(
-            "case BBK9588_SADC_ADTCH_OFF: /* ADTCH */", 1
-        )[1].split("case BBK9588_SADC_ADBDAT_OFF", 1)[0]
-        self.assertIn("board->sadc_touch_fifo_count > 0", adtch_read)
-        self.assertNotIn("sadc_status_event & BBK9588_SADC_STATE_DTCH", adtch_read)
+        read_source = source.split("static uint64_t sadc_read(", 1)[1].split(
+            "static void sadc_write(", 1
+        )[0]
+        adtch_read = read_source.split("case SADC_ADTCH:", 1)[1].split(
+            "case SADC_ADBDAT:", 1
+        )[0]
+        self.assertIn("sadc_touch_fifo_pop(s)", adtch_read)
+        self.assertNotIn("status_event & SADC_STATE_DTCH", adtch_read)
 
-        adtch_write = source.split(
-            "} else if (offset == BBK9588_SADC_ADTCH_OFF) { /* ADTCH */", 1
-        )[1].split("} else if (offset == BBK9588_SADC_ADBDAT_OFF)", 1)[0]
-        self.assertIn("bbk9588_sadc_touch_fifo_clear(board);", adtch_write)
-        self.assertNotIn("sadc_status_event", adtch_write)
+        write_source = source.split("static void sadc_write(", 1)[1].split(
+            "static const MemoryRegionOps", 1
+        )[0]
+        adtch_write = write_source.split("case SADC_ADTCH:", 1)[1].split(
+            "case SADC_ADBDAT:", 1
+        )[0]
+        self.assertIn("sadc_touch_fifo_clear(s);", adtch_write)
+        self.assertNotIn("status_event", adtch_write)
 
     def test_frontend_coalesces_touch_moves_to_animation_frames(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -5580,6 +5519,34 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(len(backend.touches), len(FRONTEND_INPUT_CALIBRATION_TARGETS) * 2)
         self.assertEqual(state.qemu_frontend_input_calibration_log[-1]["event"], "qemu-frontend-input-calibration-status-deferred")
         self.assertIn("TimeoutError", str(state.qemu_frontend_input_calibration_log[-1].get("error")))
+
+    def test_frontend_input_calibration_accepts_an_already_active_gui(self) -> None:
+        class ActiveGuiBackend(_FakeFrontendQemuBackend):
+            def snapshot(self) -> dict[str, object]:
+                return {"pc": "0x8005bdec", "running": True}
+
+            def guest_gui_state_snapshot(self) -> dict[str, object]:
+                return {
+                    "active_object_ready": True,
+                    "active_object_80474048": "0x809632a4",
+                }
+
+        state = FrontendState.__new__(FrontendState)
+        state.args = argparse.Namespace(frontend_input_calibration=True, boot_mode="nand")
+        state.frontend_input_calibration_stage = 0
+        state.frontend_input_calibration_last_stage_step = -1
+        state.qemu_frontend_input_calibration_last_action_at = 0.0
+        state.qemu_frontend_input_calibration_log = []
+        backend = ActiveGuiBackend()
+
+        state._apply_frontend_input_calibration_locked(backend)  # type: ignore[arg-type]
+
+        self.assertEqual(state.frontend_input_calibration_stage, 12)
+        self.assertEqual(backend.touches, [])
+        self.assertEqual(
+            state.qemu_frontend_input_calibration_log[-1]["reason"],
+            "main-menu-already-active",
+        )
 
     def test_frontend_input_calibration_waits_for_pc_before_unknown_pc_fallback(self) -> None:
         class UnknownPcBackend(_FakeFrontendQemuBackend):
