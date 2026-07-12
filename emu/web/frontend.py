@@ -34,7 +34,7 @@ HTML = r"""<!doctype html>
     * { box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; }
     body { margin: 0; background: #15171a; }
-    .app-header { height: 56px; display: flex; align-items: center; padding: 0 18px; border-bottom: 1px solid #343941; background: #191b1f; }
+    .app-header { height: 56px; display: flex; align-items: center; gap: 10px; padding: 0 18px; border-bottom: 1px solid #343941; background: #191b1f; }
     .workspace { height: calc(100vh - 56px); min-height: 0; display: grid; grid-template-columns: minmax(280px, 340px) minmax(390px, 1fr) minmax(280px, 340px); grid-template-areas: "controls stage status"; overflow: hidden; }
     .control-sidebar { grid-area: controls; padding: 16px; border-right: 1px solid #343941; background: #1b1e22; overflow: auto; }
     .emulator-stage { grid-area: stage; min-width: 0; padding: 16px 20px 22px; display: flex; flex-direction: column; align-items: center; gap: 12px; overflow: auto; }
@@ -112,6 +112,9 @@ HTML = r"""<!doctype html>
     .file-actions button.delete { background: #693333; }
     .file-empty { padding: 20px 4px; color: #8f99a7; font-size: 12px; text-align: center; }
     .file-manager-status { min-height: 18px; margin-top: 8px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
+    .mobile-drawer-button, .drawer-header, .drawer-backdrop { display: none; }
+    .drawer-header { min-height: 38px; align-items: center; justify-content: space-between; margin-bottom: 12px; color: #cbd3dd; font-size: 13px; font-weight: 600; }
+    .drawer-close { width: 32px; height: 32px; padding: 0; background: #343941; font-size: 22px; line-height: 1; }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45; color: #c9d1d9; }
     .muted { color: #9aa4b2; font-size: 12px; }
     @media (max-width: 1120px) {
@@ -119,12 +122,26 @@ HTML = r"""<!doctype html>
       .status-sidebar { border-left: 0; border-top: 1px solid #343941; }
     }
     @media (max-width: 760px) {
-      .app-header { height: 50px; }
-      .workspace { height: calc(100vh - 50px); grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(260px, 1fr) minmax(160px, .55fr) minmax(220px, .8fr); grid-template-areas: "stage" "controls" "status"; overflow-y: auto; }
-      .emulator-stage { padding: 12px; }
-      .control-sidebar, .status-sidebar { border: 0; border-top: 1px solid #343941; }
-      #screen { max-height: none; }
-      .binding-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .app-header { height: 50px; justify-content: space-between; padding: 0 10px; }
+      .app-header h1 { flex: 1; text-align: center; font-size: 16px; }
+      .mobile-drawer-button { width: 36px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; padding: 0; background: #343941; font-size: 20px; }
+      .workspace { height: calc(100dvh - 50px); display: block; overflow: hidden; }
+      .emulator-stage { width: 100%; height: 100%; padding: 8px 10px 12px; gap: 8px; overflow: hidden; }
+      .screen-toolbar { flex: 0 0 auto; }
+      .screen-wrap { flex: 1 1 auto; min-height: 0; padding: 6px; }
+      #screen { max-height: 100%; }
+      .device-controls { flex: 0 0 auto; gap: 0; }
+      .keymap-panel { display: none; }
+      .control-sidebar, .status-sidebar {
+        width: min(86vw, 340px); height: calc(100dvh - 50px); position: fixed; top: 50px; bottom: 0; z-index: 30;
+        padding: 12px; border: 0; box-shadow: 0 0 24px rgba(0, 0, 0, .45); transition: transform 180ms ease;
+      }
+      .control-sidebar { left: 0; transform: translateX(-105%); }
+      .status-sidebar { right: 0; transform: translateX(105%); }
+      .control-sidebar.drawer-open, .status-sidebar.drawer-open { transform: translateX(0); }
+      .drawer-header { display: flex; }
+      .drawer-backdrop { position: fixed; inset: 50px 0 0; z-index: 25; width: 100%; height: auto; padding: 0; border: 0; border-radius: 0; background: rgba(0, 0, 0, .55); }
+      .drawer-backdrop:not([hidden]) { display: block; }
     }
     @media (max-width: 380px) {
       .device-keypad { grid-template-columns: repeat(5, 48px); gap: 6px; }
@@ -133,10 +150,13 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header class="app-header">
+    <button id="openControlsDrawer" class="mobile-drawer-button" title="镜像与运行" aria-label="打开镜像与运行抽屉" aria-controls="controlsDrawer" aria-expanded="false">☰</button>
     <h1>BBK 9588 硬件仿真器</h1>
+    <button id="openStatusDrawer" class="mobile-drawer-button" title="状态与文件" aria-label="打开状态与文件抽屉" aria-controls="statusDrawer" aria-expanded="false">☷</button>
   </header>
   <div class="workspace">
-    <aside class="control-sidebar" aria-label="镜像与运行控制">
+    <aside id="controlsDrawer" class="control-sidebar" aria-label="镜像与运行控制">
+      <div class="drawer-header"><span>镜像与运行</span><button class="drawer-close" data-close-drawer title="关闭" aria-label="关闭镜像与运行抽屉">×</button></div>
       <section class="panel">
         <h2>NAND 镜像</h2>
         <div class="row">
@@ -190,7 +210,8 @@ HTML = r"""<!doctype html>
         </section>
       </div>
     </main>
-    <aside class="status-sidebar" aria-label="状态与文件">
+    <aside id="statusDrawer" class="status-sidebar" aria-label="状态与文件">
+      <div class="drawer-header"><span>状态与文件</span><button class="drawer-close" data-close-drawer title="关闭" aria-label="关闭状态与文件抽屉">×</button></div>
       <div class="sidebar-tabs" role="tablist" aria-label="右侧视图">
         <button id="statusTabButton" class="sidebar-tab active" role="tab" aria-selected="true" aria-controls="statusTab">状态</button>
         <button id="filesTabButton" class="sidebar-tab" role="tab" aria-selected="false" aria-controls="filesTab">文件</button>
@@ -213,6 +234,7 @@ HTML = r"""<!doctype html>
       </section>
     </aside>
   </div>
+  <button id="drawerBackdrop" class="drawer-backdrop" title="关闭抽屉" aria-label="关闭抽屉" hidden></button>
 <script>
 const screen = document.getElementById('screen');
 const screenCtx = screen.getContext('2d', { alpha: false });
@@ -228,6 +250,11 @@ const screenWrapEl = document.getElementById('screenWrap');
 const orientationLabelEl = document.getElementById('orientationLabel');
 const resetKeyBindingsEl = document.getElementById('resetKeyBindings');
 const gamepadStatusEl = document.getElementById('gamepadStatus');
+const controlsDrawerEl = document.getElementById('controlsDrawer');
+const statusDrawerEl = document.getElementById('statusDrawer');
+const openControlsDrawerEl = document.getElementById('openControlsDrawer');
+const openStatusDrawerEl = document.getElementById('openStatusDrawer');
+const drawerBackdropEl = document.getElementById('drawerBackdrop');
 const statusTabButtonEl = document.getElementById('statusTabButton');
 const filesTabButtonEl = document.getElementById('filesTabButton');
 const statusTabEl = document.getElementById('statusTab');
@@ -259,8 +286,10 @@ let rgb565Lut = null;
 let rawImageData = null;
 let bindingCaptureCode = null;
 let currentSidebarTab = 'status';
+let activeDrawer = null;
 let currentNandDirectory = '/';
 let nandFilesBusy = false;
+const mobileLayoutQuery = window.matchMedia('(max-width: 760px)');
 const minTouchHoldMs = 180;
 const minTouchMoveIntervalMs = 1000 / 30;
 const touchMoveBackpressureMs = 1000 / 30;
@@ -520,6 +549,31 @@ async function restoreNandImage() {
   } catch (err) {
     imageStatusEl.textContent = String(err.message || err);
   }
+}
+function syncDrawerState() {
+  const mobile = mobileLayoutQuery.matches;
+  const controlsOpen = mobile && activeDrawer === 'controls';
+  const statusOpen = mobile && activeDrawer === 'status';
+  controlsDrawerEl.classList.toggle('drawer-open', controlsOpen);
+  statusDrawerEl.classList.toggle('drawer-open', statusOpen);
+  openControlsDrawerEl.setAttribute('aria-expanded', String(controlsOpen));
+  openStatusDrawerEl.setAttribute('aria-expanded', String(statusOpen));
+  drawerBackdropEl.hidden = !(controlsOpen || statusOpen);
+  controlsDrawerEl.inert = mobile && !controlsOpen;
+  statusDrawerEl.inert = mobile && !statusOpen;
+  if (mobile && !controlsOpen) controlsDrawerEl.setAttribute('aria-hidden', 'true');
+  else controlsDrawerEl.removeAttribute('aria-hidden');
+  if (mobile && !statusOpen) statusDrawerEl.setAttribute('aria-hidden', 'true');
+  else statusDrawerEl.removeAttribute('aria-hidden');
+}
+function openDrawer(name) {
+  if (!mobileLayoutQuery.matches) return;
+  activeDrawer = name === 'status' ? 'status' : 'controls';
+  syncDrawerState();
+}
+function closeDrawers() {
+  activeDrawer = null;
+  syncDrawerState();
 }
 function setSidebarTab(tab) {
   currentSidebarTab = tab === 'files' ? 'files' : 'status';
@@ -1042,6 +1096,22 @@ frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
 document.getElementById('restoreNandImage').onclick = restoreNandImage;
+openControlsDrawerEl.onclick = () => openDrawer('controls');
+openStatusDrawerEl.onclick = () => openDrawer('status');
+drawerBackdropEl.onclick = closeDrawers;
+document.querySelectorAll('[data-close-drawer]').forEach(button => {
+  button.addEventListener('click', closeDrawers);
+});
+const handleMobileLayoutChange = () => {
+  if (!mobileLayoutQuery.matches) activeDrawer = null;
+  syncDrawerState();
+};
+if (typeof mobileLayoutQuery.addEventListener === 'function') {
+  mobileLayoutQuery.addEventListener('change', handleMobileLayoutChange);
+} else {
+  mobileLayoutQuery.addListener(handleMobileLayoutChange);
+}
+syncDrawerState();
 statusTabButtonEl.onclick = () => setSidebarTab('status');
 filesTabButtonEl.onclick = () => setSidebarTab('files');
 document.getElementById('fileUp').onclick = () => {
@@ -1285,6 +1355,11 @@ function isEditableTarget(target) {
   return target.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName);
 }
 window.addEventListener('keydown', ev => {
+  if (ev.code === 'Escape' && activeDrawer !== null) {
+    ev.preventDefault();
+    closeDrawers();
+    return;
+  }
   if (bindingCaptureCode !== null) {
     ev.preventDefault();
     ev.stopPropagation();
