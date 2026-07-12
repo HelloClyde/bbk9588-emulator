@@ -278,6 +278,13 @@ let audioContext = null;
 let audioGain = null;
 let audioNextTime = 0;
 let audioEnabled = true;
+let audioPacketsReceived = 0;
+let audioPacketsScheduled = 0;
+let audioPacketsRejected = 0;
+let audioLastError = '';
+let audioClockValue = 0;
+let audioClockObservedAt = 0;
+let audioClockStalled = false;
 const scheduledAudioSources = new Set();
 let pointerActive = false;
 let activePointerId = null;
@@ -547,7 +554,9 @@ function formatAudioMode(audio) {
 }
 function formatWebAudio(transport) {
   const state = !audioEnabled ? 'muted' : audioContext?.state || 'locked';
-  return `${state} / ${transport?.ws_connections ?? 0} clients`;
+  const packets = `${audioPacketsScheduled}/${audioPacketsReceived}`;
+  const error = audioLastError ? ` ${audioLastError}` : '';
+  return `${state} ${packets} / ${transport?.ws_connections ?? 0}${error}`;
 }
 async function restoreNandImage() {
   if (!window.confirm('恢复基础镜像会删除这个镜像的全部持久化写入。继续？')) return;
@@ -1081,8 +1090,10 @@ function connectWs() {
 
 function updateAudioButton() {
   toggleAudioEl.textContent = audioEnabled ? '🔊' : '🔇';
-  toggleAudioEl.title = audioEnabled ? '关闭声音' : '开启声音';
+  const running = audioContext?.state === 'running' && !audioClockStalled;
+  toggleAudioEl.title = !audioEnabled ? '开启声音' : running ? '关闭声音' : '启动声音';
   toggleAudioEl.setAttribute('aria-label', toggleAudioEl.title);
+  toggleAudioEl.classList.toggle('warn', audioEnabled && !running);
   if (audioGain && audioContext) {
     audioGain.gain.setValueAtTime(audioEnabled ? 1 : 0, audioContext.currentTime);
   }
@@ -1095,10 +1106,18 @@ function ensureAudioContext() {
     toggleAudioEl.title = '浏览器不支持音频';
     return null;
   }
-  audioContext = new AudioContextClass({latencyHint:'interactive'});
+  try {
+    audioContext = new AudioContextClass({latencyHint:'interactive'});
+  } catch (_) {
+    audioContext = new AudioContextClass();
+  }
   audioGain = audioContext.createGain();
   audioGain.gain.value = audioEnabled ? 1 : 0;
   audioGain.connect(audioContext.destination);
+  audioClockValue = audioContext.currentTime;
+  audioClockObservedAt = performance.now();
+  audioClockStalled = false;
+  audioContext.onstatechange = updateAudioButton;
   return audioContext;
 }
 function stopScheduledAudio() {
@@ -1108,12 +1127,54 @@ function stopScheduledAudio() {
   scheduledAudioSources.clear();
   audioNextTime = 0;
 }
+function discardAudioContext() {
+  stopScheduledAudio();
+  const previous = audioContext;
+  audioContext = null;
+  audioGain = null;
+  audioClockStalled = false;
+  try { previous?.close(); } catch (_) {}
+}
+function primeAudioContext(context) {
+  const source = context.createBufferSource();
+  source.buffer = context.createBuffer(1, 1, context.sampleRate || 44100);
+  source.connect(audioGain || context.destination);
+  source.start(0);
+}
+function observeAudioClock(context) {
+  if (context.state !== 'running') return false;
+  const now = performance.now();
+  const current = context.currentTime;
+  if (current > audioClockValue + 0.005) {
+    audioClockValue = current;
+    audioClockObservedAt = now;
+    audioClockStalled = false;
+  } else if (now - audioClockObservedAt > 1200) {
+    audioClockStalled = true;
+  }
+  return audioClockStalled;
+}
 function unlockAudio() {
   if (!audioEnabled) return;
+  if (audioContext?.state === 'interrupted' || audioClockStalled) discardAudioContext();
   const context = ensureAudioContext();
   if (!context) return;
-  if (context.state !== 'running') {
-    context.resume().then(() => { audioNextTime = 0; }).catch(() => {});
+  try { primeAudioContext(context); } catch (err) { audioLastError = err?.name || 'prime'; }
+  if (context.state !== 'running' && context.state !== 'closed') {
+    context.resume().then(() => {
+      audioNextTime = 0;
+      audioClockValue = context.currentTime;
+      audioClockObservedAt = performance.now();
+      audioClockStalled = false;
+      audioLastError = context.state === 'running' ? '' : context.state;
+      updateAudioButton();
+    }).catch(err => {
+      audioLastError = err?.name || 'resume';
+      updateAudioButton();
+    });
+  } else if (context.state === 'running') {
+    audioLastError = '';
+    updateAudioButton();
   }
 }
 function parseAudioPacket(buffer) {
@@ -1138,7 +1199,15 @@ function scheduleAudioPacket(buffer) {
   const context = ensureAudioContext();
   if (!context || context.state !== 'running' || !audioGain) return;
   const packet = parseAudioPacket(buffer);
-  if (!packet) return;
+  if (!packet) {
+    audioPacketsRejected += 1;
+    return;
+  }
+  if (observeAudioClock(context)) {
+    audioLastError = 'clock stalled';
+    updateAudioButton();
+    return;
+  }
   const frames = packet.payloadBytes / (packet.channels * 2);
   const audioBuffer = context.createBuffer(packet.channels, frames, packet.sampleRate);
   const pcm = new DataView(buffer, audioPacketHeaderBytes, packet.payloadBytes);
@@ -1158,13 +1227,24 @@ function scheduleAudioPacket(buffer) {
   source.onended = () => scheduledAudioSources.delete(source);
   source.start(audioNextTime);
   audioNextTime += audioBuffer.duration;
+  audioPacketsScheduled += 1;
+  audioLastError = '';
 }
 function connectAudioWs() {
   if (audioWs && (audioWs.readyState === WebSocket.OPEN || audioWs.readyState === WebSocket.CONNECTING)) return;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   audioWs = new WebSocket(`${protocol}//${location.host}/audio`);
   audioWs.binaryType = 'arraybuffer';
-  audioWs.onmessage = ev => scheduleAudioPacket(ev.data);
+  audioWs.onmessage = ev => {
+    audioPacketsReceived += 1;
+    try {
+      scheduleAudioPacket(ev.data);
+    } catch (err) {
+      audioPacketsRejected += 1;
+      audioLastError = err?.name || 'decode';
+      updateAudioButton();
+    }
+  };
   audioWs.onclose = () => {
     audioWs = null;
     stopScheduledAudio();
@@ -1261,8 +1341,16 @@ fileImportInputEl.onchange = () => {
 rotateLeftEl.onclick = () => requestRotation(-1);
 rotateRightEl.onclick = () => requestRotation(1);
 toggleAudioEl.onclick = () => {
-  audioEnabled = !audioEnabled;
-  if (audioEnabled) unlockAudio(); else stopScheduledAudio();
+  const running = audioContext?.state === 'running' && !audioClockStalled;
+  if (!audioEnabled) {
+    audioEnabled = true;
+    unlockAudio();
+  } else if (!running) {
+    unlockAudio();
+  } else {
+    audioEnabled = false;
+    stopScheduledAudio();
+  }
   updateAudioButton();
 };
 toggleFullscreenEl.onclick = toggleFullscreen;
@@ -1664,6 +1752,8 @@ document.addEventListener('visibilitychange', () => {
     releaseGamepadInputs('gamepad-hidden');
     stopScheduledAudio();
     audioContext?.suspend().catch(() => {});
+  } else if (audioEnabled && audioContext) {
+    audioContext.resume().catch(() => {});
   }
 });
 window.addEventListener('gamepadconnected', ev => {
