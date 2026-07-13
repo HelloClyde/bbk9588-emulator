@@ -212,8 +212,9 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] 共享 FTL parser 已覆盖最后一页 bad-block marker；raw NAND device 新增按 physical
   block 注入 program/erase failure 的属性，失败返回 ready+FAIL `0x41`、不修改内存或
   backing，后续成功命令恢复 ready `0x40`。qtest 已覆盖状态、读回及进程退出后的文件。
-- [ ] 补 guest FTL 面对 bad block、program/erase failure、掉电中断和 OOB 各提交边界
-  的系统恢复测试，并与真机 trace 对齐。
+- [ ] 非阻塞研究项：补 guest FTL 面对物理 bad block、program/erase failure 和 OOB
+  各提交边界的恢复测试，并与真机 trace 对齐。虚拟 NAND 默认无坏块且不注入失败，
+  该矩阵不再阻塞单一活动 NAND。
 - [ ] 复现 C200 FTL 的 sequence、valid-page、回收和掉电提交顺序，使运行后的 raw
   NAND 能由 loader/U-Boot 原样冷启动；完成后删除 host canonical checkpoint 和
   persistent 会话 work copy。
@@ -262,7 +263,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   删除。写操作先停止 QEMU 并提交 work copy，再原子修改 checkpoint 和重启 QEMU；
   该离线工具不进入 guest 运行路径，也不改变 QEMU C 不解析 FAT 的边界。
   普通 reset 不进入恢复路径，基础镜像本身永不删除或修改。
-- [ ] FTL 掉电恢复矩阵通过后，把 Web persistent 模式改为直接打开唯一活动 raw NAND；
+- [ ] 现在把 Web persistent 模式改为直接打开唯一活动 raw NAND；已有正常 remap raw
+  冷启动和单 block torn-tail 回退作为迁移基线。虚拟 NAND 默认无坏块、无故障注入，
   page program/erase 实时写入该文件，正常停止、QEMU 崩溃、Web 强退和下次冷启动都不再
   创建、提交或删除 persistent work copy。
 - [ ] 删除 `ensure_runtime_nand_checkpoint()`、`commit_runtime_nand_checkpoint()` 及
@@ -278,7 +280,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] 删除 MSC OOB FTL 翻译后，固件仍能扫描 OOB、读取资源并执行 raw NAND 写入。
 - [x] RS clean、1~4-error correction、5-error uncorrectable、status/IRQ 和 BootROM
   backup 行为已有手册参数下的已知向量、纯 C、qtest 与运行时交叉回归。
-- [ ] bad-block marker、program/erase failure 和掉电中断行为与真机 trace 一致。
+- [ ] 非阻塞研究项：bad-block marker、program/erase failure 和细粒度掉电中断行为与
+  真机 trace 一致。
 
 ### 3. INTC/TCU/CPU WAIT：基本完成
 
@@ -641,13 +644,13 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 22. [x] checkpoint 压实在保留 canonical FTL tag 的同时，为变化 data page 重新生成
     `4+9*n` RS parity；还原固件 cold-scan/环形 sequence 规则，修正 C200 16-bit logical
     tag 的高半字，并加入旧 checkpoint 原子迁移、严格审计和 tail 掉电注入工具。
-23. [ ] 复现 FTL sequence/valid-page/回收/提交顺序，完成不依赖 host checkpoint 的
-    完整掉电恢复矩阵。正常 10-block remap raw 重启和单-block pre-commit 回退已通过；
-    raw NAND program/erase FAIL 注入和状态/落盘 qtest 已通过；仍需多-block 提交边界、
-    垃圾回收、sequence wrap 及 guest 在 bad-block/program/erase failure 下的恢复。
-24. [ ] 将 Web persistent NAND 收敛为唯一活动 raw NAND：删除 canonical checkpoint、
+23. [ ] 将 Web persistent NAND 收敛为唯一活动 raw NAND：删除 canonical checkpoint、
     persistent work copy 和正常停止压实流程；异常退出后直接复用同一文件，文件管理和
-    显式恢复也围绕该文件工作。disposable 测试副本继续隔离。
+    显式恢复也围绕该文件工作。先覆盖正常保存后强杀 QEMU/Web、直接冷启动和严格审计；
+    disposable 测试副本继续隔离。
+24. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
+    正常 10-block remap raw 重启、单-block pre-commit 回退及 raw NAND FAIL qtest 已通过；
+    仍缺多-block 提交边界、垃圾回收、sequence wrap 和物理故障下的 guest 恢复。
 25. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
 
 ## 关键验收清单
@@ -669,8 +672,9 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 - [ ] FTL 掉电恢复：单 logical remap 的“旧块保留、新尾标签 torn”已验证回退并由
   固件清理；仍需覆盖多 logical transaction、垃圾回收及 program/erase 各提交阶段。
 - [ ] 单一活动 NAND：persistent Web/QEMU 不再创建 work copy/checkpoint；应用写入后
-  强杀 QEMU 或 Web，再次启动同一 raw NAND 仍能进入系统，并按固件提交边界保留或回滚
-  文件，活动镜像通过严格 FTL/ECC 审计。
+  确认保存并回到空闲状态，再强杀 QEMU 或 Web；再次启动同一 raw NAND 仍能进入系统、
+  保留文件并通过严格 FTL/ECC 审计。若在写命令中途退出，最低要求是镜像仍可启动，
+  最近一次文件修改允许按固件提交边界保留或回滚。
 - [x] 性能：默认 OOB scan 可在可用时间内进入主菜单，前端可观察 FPS/IPS/延迟。
 - [x] 显示：有自动 raw-frame 稳定回归，并且不依赖固定 guest mirror/alias 地址。
 - [x] 输入：触摸、按键和 release 通过 SADC/GPIO/INTC，不卡在 guest global hook。
@@ -690,9 +694,10 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 - BootROM/first-stage 与 U-Boot 常规 NAND driver 使用不同 OOB ECC 起点，分别是
   `6+9*n` 和 `4+9*n`。镜像迁移不能再无差别覆盖全盘同一 OOB range；标准 9588 镜像
   以 page `0x200` 为布局边界，其他 boot layout 必须显式提供边界。
-- C200 raw NAND trace 已证明运行期 FTL 由固件持有，因此 MSC OOB map 已删除。仍不能
-  据此宣称私有 FTL 完整：sequence/valid-page 提交、坏块、垃圾回收和掉电恢复必须继续
-  用反汇编、真机 dump/trace 与无 checkpoint 冷启动回归确认。
+- C200 raw NAND trace 已证明运行期 FTL 由固件持有，因此 MSC OOB map 已删除。单一活动
+  NAND 可先按默认无坏块的虚拟介质落地；不能据此宣称私有 FTL 完整，sequence/valid-page
+  提交、坏块、垃圾回收和细粒度掉电恢复仍应继续用反汇编、真机 dump/trace 与无
+  checkpoint 冷启动回归确认，但不阻塞普通模拟器持久化。
 - 音频 codec、功放使能、mute 和引脚复用属于板级信息；JZ4740 手册只能确定 AIC/DMAC
   契约，最终接线和初始化序列仍需结合固件反汇编与运行 trace。
 - LCD 噪点要同时检查 descriptor、cache flush、DMA、资源加载和 frame push，不能只
