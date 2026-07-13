@@ -160,7 +160,9 @@ bin/bbk9588-qemu-system-mipsel.exe
 
 overlay 还包含少量 `target/mips` 侧 instrumentation/helper，用于当前 machine model
 和诊断；filesystem/resource probe 写入诊断 RAM 前受 `storage-trace=on` 门控，
-默认启动不会因此改写 guest 内存。周期性 progress 采样使用
+默认启动不会因此改写 guest 内存。独立、无 guest MMIO 的 `hw/misc/bbk9588_diag.c`
+持有 input event ring 以及 storage/MSC/NAND-target/DMAC trace sequence，并把调用方
+显式提供的 PC/INTC/DMAC 快照写入诊断 RAM；默认 trace 关闭。周期性 progress 采样使用
 `progress-trace-period-ms` 显式诊断 property，不再以旧的资源泵命名。
 Python/GDB 侧遗留的 resource hook、filesystem scan、file-open probe 和 GUI
 dispatcher 诊断服务在 `bbk9588` machine 上统一返回 disabled；默认路径不再通过

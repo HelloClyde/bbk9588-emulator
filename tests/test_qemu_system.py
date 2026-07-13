@@ -889,20 +889,19 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("self.backing_sector_cache", source)
 
     def test_bbk9588_event_queue_source_is_diagnostic_mirror_only(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("static void bbk9588_event_queue_mirror_header", source)
-        self.assertIn("static void bbk9588_event_queue_mirror_slot", source)
-        self.assertIn("static void bbk9588_event_queue_mirror_all", source)
-        self.assertNotIn("bbk9588_event_queue_pop_to_record", source)
+        self.assertIn("static void diag_mirror_input", source)
+        self.assertIn("bbk9588_diag_queue_input", source)
+        self.assertNotIn("event_queue_pop_to_record", source)
         self.assertNotIn("record + 0x04 + word * 4", source)
+        self.assertNotIn("EVENT_QUEUE_SLOTS", board)
 
     def test_bbk9588_fs_probe_helper_is_storage_trace_gated(self) -> None:
         source = (
@@ -1732,6 +1731,34 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("CharFrontend input_chr;", board)
         self.assertNotIn("static void bbk9588_input_handle_line", board)
         self.assertNotIn("static void bbk9588_input_read", board)
+
+    def test_bbk9588_diag_owns_trace_and_input_ring_state(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
+        header = (
+            root / "include" / "hw" / "misc" / "bbk9588_diag.h"
+        ).read_text(encoding="utf-8")
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        meson = (root / "hw" / "mips" / "meson.build").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('#define TYPE_BBK9588_DIAG "bbk9588-diag"', header)
+        self.assertIn("struct Bbk9588DiagState", source)
+        self.assertIn("bbk9588_diag_queue_input", source)
+        self.assertIn("bbk9588_diag_storage_record", source)
+        self.assertIn("bbk9588_diag_dmac_record", source)
+        self.assertIn("qdev_new(TYPE_BBK9588_DIAG)", board)
+        self.assertIn("bbk9588_diag_dmac_record", board)
+        self.assertIn("../misc/bbk9588_diag.c", meson)
+        self.assertNotIn("bbk9588_active_board", board)
+        self.assertNotIn("uint32_t input_event_words", board)
+        self.assertNotIn("uint32_t dmac_trace_seq", board)
+        self.assertNotIn("bbk9588_storage_trace_record", board)
 
     def test_qemu_bbk9588_panel_ready_frame_done_and_w1c(self) -> None:
         qemu = find_qemu()

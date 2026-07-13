@@ -77,7 +77,10 @@ device 负责 `0xb0010000` 的 4 个 port、pin level、flag 和 4 路 IRQ；RTC
 `0xb0003000` 的 seconds、alarm、hibernate、timer 和 IRQ。独立 BBK panel device 负责
 `0xb0043000` 的 board register、ready/frame-done 和 W1C。独立、无 guest MMIO 的
 BBK host bridge 负责 panel RGB565 scanout、frame/audio/perf chardev、QEMU console
-和刷新 timer；按键、pen、NAND ready/busy 和 wake 板级接线仍由 machine 连接。
+和刷新 timer。无 guest MMIO 的 `bbk9588-diag` 持有 input event ring 以及
+storage/MSC/NAND-target/DMAC trace 的 sequence 和 guest RAM recorder；machine 通过
+显式参数提交 PC、INTC 和 DMAC 快照，不再依赖全局活动 board 指针。按键、pen、NAND
+ready/busy 和 wake 板级接线仍由 machine 连接。
 `0xb3060000` 已不再是通用 shadow window，而是独立 JZ4740 CIM idle device；9588
 未连接摄像头 sensor，因此它只提供 register mask、FIFO empty、disable-done 和 IRQ17，
 不合成 image stream 或 CIM descriptor DMA。

@@ -18,6 +18,7 @@ mips_ss.add(when: 'CONFIG_BBK9588', if_true: files(
   '../intc/jz4740_intc.c',
   '../mem/jz4740_ecc.c',
   '../mem/jz4740_emc.c',
+  '../misc/bbk9588_diag.c',
   '../misc/jz4740_cim.c',
   '../misc/jz4740_cpm.c',
   '../rtc/jz4740_rtc.c',

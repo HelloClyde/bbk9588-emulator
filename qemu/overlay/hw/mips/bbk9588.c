@@ -38,6 +38,7 @@
 #include "hw/intc/jz4740_intc.h"
 #include "hw/mem/jz4740_ecc.h"
 #include "hw/mem/jz4740_emc.h"
+#include "hw/misc/bbk9588_diag.h"
 #include "hw/misc/jz4740_cim.h"
 #include "hw/misc/jz4740_cpm.h"
 #include "hw/rtc/jz4740_rtc.h"
@@ -71,52 +72,16 @@
 #define BBK9588_GUI_EVENT_OBJ_OFF  0xf0u
 #define BBK9588_AIC_DATA_PHYS      0x10020034u
 #define BBK9588_DIAG_VA            0x89f00000u
-#define BBK9588_EVENT_SCRATCH_VA   (BBK9588_DIAG_VA + 0x0000u)
-#define BBK9588_EVENT_SCRATCH_MAGIC 0x45564b42u
-#define BBK9588_EVENT_QUEUE_VA     (BBK9588_DIAG_VA + 0x0040u)
-#define BBK9588_EVENT_QUEUE_MAGIC  0x514b4242u
-#define BBK9588_EVENT_QUEUE_SLOTS  8u
-#define BBK9588_EVENT_QUEUE_WORDS  5u
-#define BBK9588_EVENT_QUEUE_HEADER_WORDS 4u
-#define BBK9588_EVENT_CODE_INPUT   3u
-#define BBK9588_EVENT_KIND_KEY     1u
-#define BBK9588_EVENT_KIND_TOUCH   2u
 #define BBK9588_TOUCH_TRACE_VA     (BBK9588_DIAG_VA + 0x0100u)
 #define BBK9588_TOUCH_TRACE_MAGIC  0x54434b42u
 #define BBK9588_NAND_READ_SOURCE_RUNTIME 1u
 #define BBK9588_NAND_READ_REQUEST_BLANK 8u
 #define BBK9588_NAND_READ_FINAL_BLANK 16u
-#define BBK9588_STORAGE_TRACE_VA   (BBK9588_DIAG_VA + 0x2000u)
-#define BBK9588_STORAGE_TRACE_MAGIC 0x53544b42u
-#define BBK9588_STORAGE_TRACE_SLOTS 4096u
-#define BBK9588_STORAGE_TRACE_WORDS 4u
-#define BBK9588_STORAGE_TRACE_HEADER_WORDS 4u
-#define BBK9588_STORAGE_TRACE_NAND_READ 0x80000000u
-#define BBK9588_STORAGE_TRACE_NAND_PROGRAM 0x20000000u
-#define BBK9588_STORAGE_TRACE_NAND_ERASE 0x10000000u
-#define BBK9588_STORAGE_TRACE_DMAC_TRANSFER 0x08000000u
-#define BBK9588_STORAGE_TRACE_NAND_DETAIL 0x04000000u
-#define BBK9588_MSC_TRACE_VA       (BBK9588_DIAG_VA + 0x1000u)
-#define BBK9588_MSC_TRACE_MAGIC    0x4d534b42u
-#define BBK9588_MSC_TRACE_SLOTS    113u
-#define BBK9588_MSC_TRACE_WORDS    9u
-#define BBK9588_MSC_TRACE_HEADER_WORDS 4u
-#define BBK9588_MSC_TRACE_READ     1u
-#define BBK9588_MSC_TRACE_WRITE    2u
-#define BBK9588_MSC_TRACE_CMD      3u
-#define BBK9588_CLUSTER_TRACE_DETAIL_VA (BBK9588_DIAG_VA + 0x0420u)
 #define BBK9588_PROGRESS_TRACE_VA  (BBK9588_DIAG_VA + 0x0500u)
 #define BBK9588_PROGRESS_TRACE_MAGIC 0x50544b42u
 #define BBK9588_PROGRESS_TRACE_SLOTS 8u
 #define BBK9588_PROGRESS_TRACE_WORDS 12u
 #define BBK9588_PROGRESS_TRACE_HEADER_WORDS 4u
-#define BBK9588_DMAC_TRACE_VA      (BBK9588_DIAG_VA + 0x0300u)
-#define BBK9588_DMAC_TRACE_MAGIC   0x444d4b42u
-#define BBK9588_DMAC_TRACE_WORDS   16u
-#define BBK9588_NAND_TARGET_TRACE_VA (BBK9588_DIAG_VA + 0x0600u)
-#define BBK9588_NAND_TARGET_TRACE_MAGIC 0x4e544b42u
-#define BBK9588_NAND_TARGET_TRACE_SLOTS 8u
-#define BBK9588_NAND_TARGET_TRACE_WORDS 6u
 #define BBK9588_NAND_TARGET_BLOCK 0x2540u
 #define BBK9588_NAND_TARGET_PAGE 0x256au
 #define BBK9588_NAND_TARGET_EVENT_ERASE 1u
@@ -132,13 +97,6 @@
 
 typedef struct Bbk9588MachineState Bbk9588MachineState;
 
-static void bbk9588_storage_trace_record(uint32_t logical,
-                                         uint32_t absolute,
-                                         uint32_t first_word);
-static void bbk9588_nand_target_trace_record(uint32_t event,
-                                             uint32_t a,
-                                             uint32_t b,
-                                             uint32_t c);
 static void bbk9588_dmac_trace_sample(void *opaque, uint32_t event,
                                       unsigned channel, hwaddr offset,
                                       uint32_t value);
@@ -165,6 +123,7 @@ struct Bbk9588MachineState {
     uint32_t intc_last_cp0_status;
     uint32_t intc_last_cp0_cause;
     JZ4740AICState *aic;
+    Bbk9588DiagState *diag;
     Bbk9588HostBridgeState *host_bridge;
     Bbk9588HostInputState *host_input;
     JZ4740LCDState *lcd;
@@ -190,21 +149,8 @@ struct Bbk9588MachineState {
     bool graphics_trace_enabled;
     bool touch_trace_enabled;
     uint32_t graphics_trace_count;
-    uint32_t storage_trace_seq;
-    uint32_t msc_trace_seq;
-    uint32_t nand_target_trace_seq;
     bool progress_trace_enabled;
     uint32_t progress_trace_seq;
-    uint32_t dmac_trace_seq;
-    uint32_t dmac_last_event;
-    uint32_t dmac_last_channel;
-    uint32_t dmac_last_offset;
-    uint32_t dmac_last_value;
-    uint32_t input_event_read_idx;
-    uint32_t input_event_write_idx;
-    uint32_t input_event_count;
-    uint32_t input_event_words[BBK9588_EVENT_QUEUE_SLOTS]
-                              [BBK9588_EVENT_QUEUE_WORDS];
     uint32_t nand_ready_raise_count;
     char *input_chardev;
     char *frame_chardev;
@@ -219,8 +165,6 @@ struct Bbk9588MachineState {
 
 #define TYPE_BBK9588_MACHINE MACHINE_TYPE_NAME("bbk9588")
 OBJECT_DECLARE_SIMPLE_TYPE(Bbk9588MachineState, BBK9588_MACHINE)
-
-static Bbk9588MachineState *bbk9588_active_board;
 
 static void bbk9588_touch_set_state(Bbk9588MachineState *board,
                                      uint16_t raw_x, uint16_t raw_y,
@@ -248,6 +192,12 @@ static uint32_t bbk9588_phys_read_le32(hwaddr addr)
 
     bbk9588_phys_read(addr, buf, sizeof(buf));
     return buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+}
+
+static uint32_t bbk9588_cpu_pc(Bbk9588MachineState *board)
+{
+    return board && board->cpu ?
+           board->cpu->env.active_tc.PC & 0xffffffffu : 0;
 }
 
 static void bbk9588_wake_cpu(Bbk9588MachineState *board)
@@ -444,95 +394,13 @@ static void bbk9588_progress_trace_sample(Bbk9588MachineState *board,
     bbk9588_phys_write_le32(entry + 0x2c, status);
 }
 
-static void bbk9588_event_queue_mirror_header(Bbk9588MachineState *board)
-{
-    uint32_t queue = BBK9588_EVENT_QUEUE_VA;
-    uint32_t total_size = (BBK9588_EVENT_QUEUE_HEADER_WORDS +
-                           BBK9588_EVENT_QUEUE_SLOTS *
-                           BBK9588_EVENT_QUEUE_WORDS) * 4;
-
-    if (!bbk9588_guest_ram_va_valid(queue, total_size)) {
-        return;
-    }
-
-    bbk9588_phys_write_le32(queue + 0x00, BBK9588_EVENT_QUEUE_MAGIC);
-    bbk9588_phys_write_le32(queue + 0x04, board->input_event_read_idx);
-    bbk9588_phys_write_le32(queue + 0x08, board->input_event_write_idx);
-    bbk9588_phys_write_le32(queue + 0x0c, board->input_event_count);
-}
-
-static void bbk9588_event_queue_mirror_slot(Bbk9588MachineState *board,
-                                            uint32_t slot)
-{
-    uint32_t queue = BBK9588_EVENT_QUEUE_VA;
-    uint32_t total_size = (BBK9588_EVENT_QUEUE_HEADER_WORDS +
-                           BBK9588_EVENT_QUEUE_SLOTS *
-                           BBK9588_EVENT_QUEUE_WORDS) * 4;
-    uint32_t base;
-
-    if (slot >= BBK9588_EVENT_QUEUE_SLOTS ||
-        !bbk9588_guest_ram_va_valid(queue, total_size)) {
-        return;
-    }
-
-    base = queue + BBK9588_EVENT_QUEUE_HEADER_WORDS * 4 +
-           slot * BBK9588_EVENT_QUEUE_WORDS * 4;
-    for (uint32_t word = 0; word < BBK9588_EVENT_QUEUE_WORDS; word++) {
-        bbk9588_phys_write_le32(base + word * 4,
-                                board->input_event_words[slot][word]);
-    }
-}
-
-static void bbk9588_event_queue_mirror_all(Bbk9588MachineState *board)
-{
-    bbk9588_event_queue_mirror_header(board);
-    for (uint32_t slot = 0; slot < BBK9588_EVENT_QUEUE_SLOTS; slot++) {
-        bbk9588_event_queue_mirror_slot(board, slot);
-    }
-}
-
 static void bbk9588_queue_input_event(Bbk9588MachineState *board,
                                       uint32_t kind, uint32_t arg0,
                                       uint32_t arg1, uint32_t arg2)
 {
-    uint32_t read_idx;
-    uint32_t write_idx;
-    uint32_t count;
-
-    if (!board) {
-        return;
+    if (board) {
+        bbk9588_diag_queue_input(board->diag, kind, arg0, arg1, arg2);
     }
-
-    read_idx = board->input_event_read_idx;
-    write_idx = board->input_event_write_idx;
-    count = board->input_event_count;
-    if (read_idx >= BBK9588_EVENT_QUEUE_SLOTS ||
-        write_idx >= BBK9588_EVENT_QUEUE_SLOTS ||
-        count > BBK9588_EVENT_QUEUE_SLOTS) {
-        read_idx = 0;
-        write_idx = 0;
-        count = 0;
-    }
-
-    if (count == BBK9588_EVENT_QUEUE_SLOTS) {
-        read_idx = (read_idx + 1) % BBK9588_EVENT_QUEUE_SLOTS;
-        count--;
-    }
-
-    board->input_event_words[write_idx][0] = BBK9588_EVENT_CODE_INPUT;
-    board->input_event_words[write_idx][1] = kind;
-    board->input_event_words[write_idx][2] = arg0;
-    board->input_event_words[write_idx][3] = arg1;
-    board->input_event_words[write_idx][4] = arg2;
-    write_idx = (write_idx + 1) % BBK9588_EVENT_QUEUE_SLOTS;
-    count++;
-    board->input_event_read_idx = read_idx;
-    board->input_event_write_idx = write_idx;
-    board->input_event_count = count;
-    bbk9588_event_queue_mirror_all(board);
-
-    bbk9588_phys_write_le32(BBK9588_EVENT_SCRATCH_VA + 0x18,
-                            BBK9588_EVENT_SCRATCH_MAGIC);
 }
 
 static void bbk9588_touch_apply_host_input(void *opaque, uint16_t raw_x,
@@ -598,7 +466,7 @@ static void bbk9588_key_apply_host_input(void *opaque, uint32_t key_code,
     Bbk9588MachineState *board = opaque;
 
     if (bbk9588_key_gpio_set_state(board, key_code & 0xff, down)) {
-        bbk9588_queue_input_event(board, BBK9588_EVENT_KIND_KEY,
+        bbk9588_queue_input_event(board, BBK9588_DIAG_EVENT_KIND_KEY,
                                   key_code & 0xff, down ? 1 : 0, 0);
     }
 }
@@ -634,52 +502,57 @@ static void bbk9588_nand_event(void *opaque,
         bbk9588_nand_raise_ready(board);
         break;
     case BBK9588_NAND_EVENT_READ_TRACE:
-        bbk9588_storage_trace_record(
-            BBK9588_STORAGE_TRACE_NAND_READ | event->page,
+        bbk9588_diag_storage_record(
+            board->diag, BBK9588_DIAG_STORAGE_NAND_READ | event->page,
             ((event->flags & 0xffu) << 24) |
             (event->page & 0x00ffffffu),
             event->value);
         break;
     case BBK9588_NAND_EVENT_READ_DETAIL:
-        bbk9588_storage_trace_record(
-            BBK9588_STORAGE_TRACE_NAND_READ |
-            BBK9588_STORAGE_TRACE_NAND_DETAIL |
+        bbk9588_diag_storage_record(
+            board->diag, BBK9588_DIAG_STORAGE_NAND_READ |
+            BBK9588_DIAG_STORAGE_NAND_DETAIL |
             (event->page & 0x03ffffffu),
             event->column, pc);
         break;
     case BBK9588_NAND_EVENT_PROGRAM:
         if (event->failed && board->storage_trace_enabled) {
-            bbk9588_storage_trace_record(
-                BBK9588_STORAGE_TRACE_NAND_PROGRAM | event->page,
+            bbk9588_diag_storage_record(
+                board->diag,
+                BBK9588_DIAG_STORAGE_NAND_PROGRAM | event->page,
                 event->column, 0xffffffffu);
         }
         if (board->storage_trace_enabled &&
             !event->failed && event->column < BBK9588_NAND_PAGE_SIZE) {
-            bbk9588_storage_trace_record(
-                BBK9588_STORAGE_TRACE_NAND_PROGRAM | event->page,
+            bbk9588_diag_storage_record(
+                board->diag,
+                BBK9588_DIAG_STORAGE_NAND_PROGRAM | event->page,
                 event->column, event->value);
         }
         if (!event->failed &&
             event->page == BBK9588_NAND_TARGET_PAGE &&
             event->column < BBK9588_NAND_PAGE_SIZE) {
-            bbk9588_nand_target_trace_record(
+            bbk9588_diag_nand_target_record(
+                board->diag,
                 BBK9588_NAND_TARGET_EVENT_PROGRAM, event->page,
-                event->column, event->value);
+                event->column, event->value, pc);
         }
         bbk9588_nand_raise_ready(board);
         break;
     case BBK9588_NAND_EVENT_ERASE:
         if (board->storage_trace_enabled) {
-            bbk9588_storage_trace_record(
-                BBK9588_STORAGE_TRACE_NAND_ERASE | event->flags,
+            bbk9588_diag_storage_record(
+                board->diag,
+                BBK9588_DIAG_STORAGE_NAND_ERASE | event->flags,
                 event->count,
                 event->failed ? 0u : event->value);
         }
         if (!event->failed &&
             event->flags == BBK9588_NAND_TARGET_BLOCK) {
-            bbk9588_nand_target_trace_record(
+            bbk9588_diag_nand_target_record(
+                board->diag,
                 BBK9588_NAND_TARGET_EVENT_ERASE, event->flags,
-                event->page, event->count);
+                event->page, event->count, pc);
         }
         bbk9588_nand_raise_ready(board);
         break;
@@ -1055,116 +928,6 @@ static uint32_t bbk9588_ldl_le(const uint8_t *p)
     return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
 }
 
-static void bbk9588_storage_trace_record(uint32_t logical,
-                                         uint32_t absolute,
-                                         uint32_t first_word)
-{
-    Bbk9588MachineState *board = bbk9588_active_board;
-    uint32_t seq;
-    uint32_t slot;
-    uint32_t base;
-
-    if (!board || !board->storage_trace_enabled) {
-        return;
-    }
-
-    seq = ++board->storage_trace_seq;
-    slot = (seq - 1) % BBK9588_STORAGE_TRACE_SLOTS;
-    base = BBK9588_STORAGE_TRACE_VA +
-           BBK9588_STORAGE_TRACE_HEADER_WORDS * 4u +
-           slot * BBK9588_STORAGE_TRACE_WORDS * 4u;
-    bbk9588_phys_write_le32(BBK9588_STORAGE_TRACE_VA,
-                            BBK9588_STORAGE_TRACE_MAGIC);
-    bbk9588_phys_write_le32(BBK9588_STORAGE_TRACE_VA + 4, seq);
-    bbk9588_phys_write_le32(BBK9588_STORAGE_TRACE_VA + 8, slot);
-    bbk9588_phys_write_le32(BBK9588_STORAGE_TRACE_VA + 12,
-                            BBK9588_STORAGE_TRACE_SLOTS);
-    bbk9588_phys_write_le32(base + 0, seq);
-    bbk9588_phys_write_le32(base + 4, logical);
-    bbk9588_phys_write_le32(base + 8, absolute);
-    bbk9588_phys_write_le32(base + 12, first_word);
-}
-
-static void bbk9588_msc_trace_record(uint32_t event,
-                                     uint32_t lba,
-                                     uint32_t dma_phys,
-                                     uint32_t bytes,
-                                     uint32_t cmd,
-                                     uint32_t arg,
-                                     uint32_t first_word)
-{
-    Bbk9588MachineState *board = bbk9588_active_board;
-    uint32_t seq;
-    uint32_t slot;
-    uint32_t base;
-    uint32_t pc = 0;
-
-    if (!board || !board->storage_trace_enabled) {
-        return;
-    }
-    if (board->cpu) {
-        pc = board->cpu->env.active_tc.PC & 0xffffffffu;
-    }
-
-    seq = ++board->msc_trace_seq;
-    slot = (seq - 1) % BBK9588_MSC_TRACE_SLOTS;
-    base = BBK9588_MSC_TRACE_VA +
-           BBK9588_MSC_TRACE_HEADER_WORDS * 4u +
-           slot * BBK9588_MSC_TRACE_WORDS * 4u;
-    bbk9588_phys_write_le32(BBK9588_MSC_TRACE_VA,
-                            BBK9588_MSC_TRACE_MAGIC);
-    bbk9588_phys_write_le32(BBK9588_MSC_TRACE_VA + 4, seq);
-    bbk9588_phys_write_le32(BBK9588_MSC_TRACE_VA + 8, slot);
-    bbk9588_phys_write_le32(BBK9588_MSC_TRACE_VA + 12,
-                            BBK9588_MSC_TRACE_SLOTS);
-    bbk9588_phys_write_le32(base + 0, seq);
-    bbk9588_phys_write_le32(base + 4, event);
-    bbk9588_phys_write_le32(base + 8, lba);
-    bbk9588_phys_write_le32(base + 12, dma_phys);
-    bbk9588_phys_write_le32(base + 16, bytes);
-    bbk9588_phys_write_le32(base + 20, cmd);
-    bbk9588_phys_write_le32(base + 24, arg);
-    bbk9588_phys_write_le32(base + 28, first_word);
-    bbk9588_phys_write_le32(base + 32, pc);
-}
-
-static void bbk9588_nand_target_trace_record(uint32_t event,
-                                             uint32_t a,
-                                             uint32_t b,
-                                             uint32_t c)
-{
-    Bbk9588MachineState *board = bbk9588_active_board;
-    uint32_t seq;
-    uint32_t slot;
-    uint32_t base;
-    uint32_t pc = 0;
-
-    if (!board || !board->storage_trace_enabled) {
-        return;
-    }
-    if (board->cpu) {
-        pc = board->cpu->env.active_tc.PC & 0xffffffffu;
-    }
-
-    seq = ++board->nand_target_trace_seq;
-    slot = (seq - 1) % BBK9588_NAND_TARGET_TRACE_SLOTS;
-    base = BBK9588_NAND_TARGET_TRACE_VA +
-           BBK9588_STORAGE_TRACE_HEADER_WORDS * 4u +
-           slot * BBK9588_NAND_TARGET_TRACE_WORDS * 4u;
-    bbk9588_phys_write_le32(BBK9588_NAND_TARGET_TRACE_VA,
-                            BBK9588_NAND_TARGET_TRACE_MAGIC);
-    bbk9588_phys_write_le32(BBK9588_NAND_TARGET_TRACE_VA + 4, seq);
-    bbk9588_phys_write_le32(BBK9588_NAND_TARGET_TRACE_VA + 8, slot);
-    bbk9588_phys_write_le32(BBK9588_NAND_TARGET_TRACE_VA + 12,
-                            BBK9588_NAND_TARGET_TRACE_SLOTS);
-    bbk9588_phys_write_le32(base + 0, seq);
-    bbk9588_phys_write_le32(base + 4, event);
-    bbk9588_phys_write_le32(base + 8, a);
-    bbk9588_phys_write_le32(base + 12, b);
-    bbk9588_phys_write_le32(base + 16, c);
-    bbk9588_phys_write_le32(base + 20, pc);
-}
-
 static void bbk9588_msc_kick_dmac(void *opaque)
 {
     Bbk9588MachineState *board = opaque;
@@ -1177,9 +940,11 @@ static void bbk9588_msc_kick_dmac(void *opaque)
 static void bbk9588_msc_command(void *opaque, uint32_t command,
                                 uint32_t argument)
 {
-    (void)opaque;
-    bbk9588_msc_trace_record(BBK9588_MSC_TRACE_CMD, argument >> 9,
-                             0, 0, command, argument, 0);
+    Bbk9588MachineState *board = opaque;
+
+    bbk9588_diag_msc_record(
+        board->diag, BBK9588_DIAG_MSC_COMMAND, argument >> 9,
+        0, 0, command, argument, 0, bbk9588_cpu_pc(board));
 }
 
 static bool bbk9588_msc_dma_transfer(Bbk9588MachineState *board,
@@ -1195,8 +960,8 @@ static bool bbk9588_msc_dma_transfer(Bbk9588MachineState *board,
                               &transfer)) {
         return false;
     }
-    bbk9588_storage_trace_record(
-        BBK9588_STORAGE_TRACE_DMAC_TRANSFER |
+    bbk9588_diag_storage_record(
+        board->diag, BBK9588_DIAG_STORAGE_DMAC_TRANSFER |
         (transfer.read ? 1u : 2u),
         transfer.words, transfer.dma_phys);
     if (transfer.bytes == 0) {
@@ -1210,11 +975,12 @@ static bool bbk9588_msc_dma_transfer(Bbk9588MachineState *board,
     buf = g_malloc0(transfer.sectors * 512u);
     if (transfer.read) {
         /* No removable MSC medium is attached by default. */
-        bbk9588_msc_trace_record(BBK9588_MSC_TRACE_READ,
-                                 transfer.lba, transfer.dma_phys,
-                                 transfer.bytes, transfer.command,
-                                 transfer.argument,
-                                 ok ? bbk9588_ldl_le(buf) : 0xffffffffu);
+        bbk9588_diag_msc_record(
+            board->diag, BBK9588_DIAG_MSC_READ,
+            transfer.lba, transfer.dma_phys, transfer.bytes,
+            transfer.command, transfer.argument,
+            ok ? bbk9588_ldl_le(buf) : 0xffffffffu,
+            bbk9588_cpu_pc(board));
         if (ok) {
             cpu_physical_memory_write(
                 transfer.dma_phys, buf,
@@ -1224,11 +990,11 @@ static bool bbk9588_msc_dma_transfer(Bbk9588MachineState *board,
         cpu_physical_memory_read(
             transfer.dma_phys, buf,
             MIN(transfer.bytes, transfer.sectors * 512u));
-        bbk9588_msc_trace_record(BBK9588_MSC_TRACE_WRITE,
-                                 transfer.lba, transfer.dma_phys,
-                                 transfer.bytes, transfer.command,
-                                 transfer.argument,
-                                 bbk9588_ldl_le(buf));
+        bbk9588_diag_msc_record(
+            board->diag, BBK9588_DIAG_MSC_WRITE,
+            transfer.lba, transfer.dma_phys, transfer.bytes,
+            transfer.command, transfer.argument, bbk9588_ldl_le(buf),
+            bbk9588_cpu_pc(board));
     }
     jz4740_msc_finish_dma(board->msc, ok);
     g_free(buf);
@@ -1240,49 +1006,23 @@ static void bbk9588_dmac_trace_sample(void *opaque, uint32_t event,
                                       uint32_t value)
 {
     Bbk9588MachineState *board = opaque;
-    uint32_t base = BBK9588_DMAC_TRACE_VA;
-    uint32_t pc = 0;
+    uint32_t channel_regs[7];
 
-    if (!board || !board->storage_trace_enabled ||
-        !bbk9588_guest_ram_va_valid(base, BBK9588_DMAC_TRACE_WORDS * 4)) {
+    if (!board || !board->storage_trace_enabled) {
         return;
     }
 
-    if (board->cpu) {
-        pc = board->cpu->env.active_tc.PC & 0xffffffffu;
-    }
-
-    board->dmac_trace_seq++;
-    board->dmac_last_event = event;
-    board->dmac_last_channel = channel;
-    board->dmac_last_offset = offset;
-    board->dmac_last_value = value;
-
-    bbk9588_phys_write_le32(base + 0x00, BBK9588_DMAC_TRACE_MAGIC);
-    bbk9588_phys_write_le32(base + 0x04, board->dmac_trace_seq);
-    bbk9588_phys_write_le32(base + 0x08, event);
-    bbk9588_phys_write_le32(base + 0x0c, channel);
-    bbk9588_phys_write_le32(base + 0x10, offset);
-    bbk9588_phys_write_le32(base + 0x14, value);
-    bbk9588_phys_write_le32(base + 0x18, pc);
-    bbk9588_phys_write_le32(base + 0x1c,
-                            jz4740_intc_pending(board->intc));
-    bbk9588_phys_write_le32(base + 0x20,
-                            jz4740_intc_mask(board->intc));
-    bbk9588_phys_write_le32(base + 0x24,
-                            jz4740_dmac_get_reg(board->dmac, 0x304));
-    bbk9588_phys_write_le32(base + 0x28,
-                            jz4740_dmac_get_reg(board->dmac, 0x50));
-    bbk9588_phys_write_le32(base + 0x2c,
-                            jz4740_dmac_get_reg(board->dmac, 0x54));
-    bbk9588_phys_write_le32(base + 0x30,
-                            jz4740_dmac_get_reg(board->dmac, 0x48));
-    bbk9588_phys_write_le32(base + 0x34,
-                            jz4740_dmac_get_reg(board->dmac, 0x70));
-    bbk9588_phys_write_le32(base + 0x38,
-                            jz4740_dmac_get_reg(board->dmac, 0x74));
-    bbk9588_phys_write_le32(base + 0x3c,
-                            jz4740_dmac_get_reg(board->dmac, 0x68));
+    channel_regs[0] = jz4740_dmac_get_reg(board->dmac, 0x304);
+    channel_regs[1] = jz4740_dmac_get_reg(board->dmac, 0x50);
+    channel_regs[2] = jz4740_dmac_get_reg(board->dmac, 0x54);
+    channel_regs[3] = jz4740_dmac_get_reg(board->dmac, 0x48);
+    channel_regs[4] = jz4740_dmac_get_reg(board->dmac, 0x70);
+    channel_regs[5] = jz4740_dmac_get_reg(board->dmac, 0x74);
+    channel_regs[6] = jz4740_dmac_get_reg(board->dmac, 0x68);
+    bbk9588_diag_dmac_record(
+        board->diag, event, channel, offset, value, bbk9588_cpu_pc(board),
+        jz4740_intc_pending(board->intc), jz4740_intc_mask(board->intc),
+        channel_regs);
 }
 
 static bool bbk9588_dmac_bulk_transfer(void *opaque, unsigned channel,
@@ -1725,6 +1465,16 @@ static uint64_t bbk9588_guest_insn_count(void *opaque)
            qatomic_read(&board->cpu->env.bbk9588_guest_insn_count) : 0;
 }
 
+static void bbk9588_create_diag_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_BBK9588_DIAG);
+
+    qdev_realize(dev, NULL, &error_fatal);
+    board->diag = BBK9588_DIAG(dev);
+    bbk9588_diag_set_storage_enabled(board->diag,
+                                     board->storage_trace_enabled);
+}
+
 static void bbk9588_create_host_bridge(Bbk9588MachineState *board)
 {
     DeviceState *dev = qdev_new(TYPE_BBK9588_HOST_BRIDGE);
@@ -1968,14 +1718,7 @@ static void bbk9588_cpu_reset(void *opaque)
     qatomic_set(&env->bbk9588_guest_insn_count, 0);
     bbk9588_host_bridge_reset_metrics(board->host_bridge);
 
-    board->input_event_read_idx = 0;
-    board->input_event_write_idx = 0;
-    board->input_event_count = 0;
-    memset(board->input_event_words, 0, sizeof(board->input_event_words));
-    bbk9588_event_queue_mirror_all(board);
-    if (bbk9588_guest_ram_va_valid(BBK9588_EVENT_SCRATCH_VA, 0x1c)) {
-        bbk9588_phys_write_le32(BBK9588_EVENT_SCRATCH_VA + 0x18, 0);
-    }
+    bbk9588_diag_reset_input(board->diag);
 }
 
 static void bbk9588_load_firmware(MachineState *machine)
@@ -2082,6 +1825,7 @@ static void bbk9588_set_storage_trace(Object *obj, bool value,
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
     board->storage_trace_enabled = value;
+    bbk9588_diag_set_storage_enabled(board->diag, value);
     bbk9588_nand_set_trace_enabled(board->nand_dev, value);
 }
 
@@ -2232,6 +1976,9 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->aic) {
         object_unref(OBJECT(board->aic));
     }
+    if (board->diag) {
+        object_unref(OBJECT(board->diag));
+    }
     if (board->host_bridge) {
         object_unref(OBJECT(board->host_bridge));
     }
@@ -2312,8 +2059,6 @@ static void bbk9588_instance_init(Object *obj)
     board->graphics_trace_enabled = false;
     board->touch_trace_enabled = false;
     board->graphics_trace_count = 0;
-    board->storage_trace_seq = 0;
-    board->msc_trace_seq = 0;
     board->progress_trace_enabled = false;
     board->progress_trace_seq = 0;
     board->bootrom_nand_enabled = false;
@@ -2336,8 +2081,6 @@ static void bbk9588_init(MachineState *machine)
         error_report("bbk9588: RAM must be at least 32 MiB");
         exit(1);
     }
-    bbk9588_active_board = board;
-
     memory_region_add_subregion(system_memory, 0, machine->ram);
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
@@ -2360,10 +2103,6 @@ static void bbk9588_init(MachineState *machine)
     cpu_mips_irq_init_cpu(cpu);
     cpu_mips_clock_init(cpu);
     board->cpu = cpu;
-    board->input_event_read_idx = 0;
-    board->input_event_write_idx = 0;
-    board->input_event_count = 0;
-    memset(board->input_event_words, 0, sizeof(board->input_event_words));
     qemu_register_reset(bbk9588_cpu_reset, board);
     board->cpu_irq = cpu->env.irq[2];
     board->intc_resample_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
@@ -2372,6 +2111,7 @@ static void bbk9588_init(MachineState *machine)
     board->progress_trace_timer = timer_new_ms(
         QEMU_CLOCK_REALTIME, bbk9588_progress_trace_timer_cb, board);
 
+    bbk9588_create_diag_device(board);
     bbk9588_create_host_input(board);
     bbk9588_create_host_bridge(board);
     board->extgpio_wake_enable_80 = 0;
