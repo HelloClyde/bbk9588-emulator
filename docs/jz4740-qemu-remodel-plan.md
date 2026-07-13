@@ -215,7 +215,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [ ] 补 guest FTL 面对 bad block、program/erase failure、掉电中断和 OOB 各提交边界
   的系统恢复测试，并与真机 trace 对齐。
 - [ ] 复现 C200 FTL 的 sequence、valid-page、回收和掉电提交顺序，使运行后的 raw
-  NAND 能由 loader/U-Boot 原样冷启动；完成后删除 host canonical checkpoint。
+  NAND 能由 loader/U-Boot 原样冷启动；完成后删除 host canonical checkpoint 和
+  persistent 会话 work copy。
 - [x] 从 U-Boot `0x80903d1c` 和 C200 `0x8017db6c` 还原 cold-scan：bad marker、
   `u16` last-valid-page、first/last 6-byte commit 比较、`bbt8`、低 16-bit logical id
   及 16-bit 环形 sequence 候选替换均已进入共享只读 parser 和单元测试。
@@ -251,7 +252,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   parity，同时保留 canonical FTL metadata；已有回归断言 page data、metadata 和 ECC
   一致，避免真实 ECC 启用后出现“新 data + 旧 parity”。
 - [x] Web 状态展示 persistent/disposable、checkpoint、work image 和提交错误；已有
-  checkpoint commit、异常保留 work copy、跨冷启动恢复应用状态回归。
+  checkpoint commit、提交失败保留 work copy、跨冷启动恢复应用状态回归。QEMU
+  异常退出时当前仍会丢弃会话 work copy，因此不能作为最终掉电恢复方案。
 - [x] 增加显式“恢复基础镜像”操作；Web 左侧“↺ 恢复”按钮二次确认后调用
   `restore-nand-image`，只删除所选基础镜像派生的 checkpoint 和受控 work copy。
 - [x] 基础镜像固定为 `runtime/bbk9588_nand.bin`，持久 checkpoint 位于
@@ -260,6 +262,14 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   删除。写操作先停止 QEMU 并提交 work copy，再原子修改 checkpoint 和重启 QEMU；
   该离线工具不进入 guest 运行路径，也不改变 QEMU C 不解析 FAT 的边界。
   普通 reset 不进入恢复路径，基础镜像本身永不删除或修改。
+- [ ] FTL 掉电恢复矩阵通过后，把 Web persistent 模式改为直接打开唯一活动 raw NAND；
+  page program/erase 实时写入该文件，正常停止、QEMU 崩溃、Web 强退和下次冷启动都不再
+  创建、提交或删除 persistent work copy。
+- [ ] 删除 `ensure_runtime_nand_checkpoint()`、`commit_runtime_nand_checkpoint()` 及
+  persistent checkpoint 状态；`build/qemu_nand_runs/` 只保留测试/probe 的 disposable
+  副本。Release/用户导入的镜像只作为恢复来源，显式“恢复基础镜像”才替换活动 NAND。
+- [ ] NAND 文件管理器在 QEMU 停止后直接操作同一活动 NAND，并完成导入、导出、改名、
+  删除后原地冷启动回归；不得再通过 canonical checkpoint 隐式重排 FTL physical block。
 
 验收：
 
@@ -635,7 +645,10 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
     完整掉电恢复矩阵。正常 10-block remap raw 重启和单-block pre-commit 回退已通过；
     raw NAND program/erase FAIL 注入和状态/落盘 qtest 已通过；仍需多-block 提交边界、
     垃圾回收、sequence wrap 及 guest 在 bad-block/program/erase failure 下的恢复。
-24. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
+24. [ ] 将 Web persistent NAND 收敛为唯一活动 raw NAND：删除 canonical checkpoint、
+    persistent work copy 和正常停止压实流程；异常退出后直接复用同一文件，文件管理和
+    显式恢复也围绕该文件工作。disposable 测试副本继续隔离。
+25. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
 
 ## 关键验收清单
 
@@ -655,6 +668,9 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
   boot/data 双 OOB parity 布局均有自动或私有运行回归。
 - [ ] FTL 掉电恢复：单 logical remap 的“旧块保留、新尾标签 torn”已验证回退并由
   固件清理；仍需覆盖多 logical transaction、垃圾回收及 program/erase 各提交阶段。
+- [ ] 单一活动 NAND：persistent Web/QEMU 不再创建 work copy/checkpoint；应用写入后
+  强杀 QEMU 或 Web，再次启动同一 raw NAND 仍能进入系统，并按固件提交边界保留或回滚
+  文件，活动镜像通过严格 FTL/ECC 审计。
 - [x] 性能：默认 OOB scan 可在可用时间内进入主菜单，前端可观察 FPS/IPS/延迟。
 - [x] 显示：有自动 raw-frame 稳定回归，并且不依赖固定 guest mirror/alias 地址。
 - [x] 输入：触摸、按键和 release 通过 SADC/GPIO/INTC，不卡在 guest global hook。
