@@ -21,6 +21,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .ftl import normalize_c200_logical_tail_pages
+
 DEFAULT_QEMU_EXECUTABLE = "qemu-system-mipsel"
 DEFAULT_QEMU_MACHINE = "bbk9588"
 DEFAULT_BBK9588_COMPAT_MACHINE_OPTIONS: tuple[str, ...] = ()
@@ -76,6 +78,97 @@ TOUCH_CALIBRATION_REFERENCE_POINTS = (
     (230, 310, 0x0172, 0x00F0),
     (10, 310, 0x0E60, 0x00F0),
 )
+
+
+def _assign_windows_kill_on_close_job(
+    proc: subprocess.Popen[str],
+) -> tuple[object | None, str | None]:
+    if os.name != "nt" or not hasattr(proc, "_handle"):
+        return None, None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        return None, f"CreateJobObjectW failed: {ctypes.get_last_error()}"
+    limits = ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000
+    if not kernel32.SetInformationJobObject(
+        handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        return None, f"SetInformationJobObject failed: {error}"
+    if not kernel32.AssignProcessToJobObject(
+        handle, wintypes.HANDLE(proc._handle)
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        return None, f"AssignProcessToJobObject failed: {error}"
+    return handle, None
+
+
+def _close_windows_job(handle: object | None) -> None:
+    if handle is None or os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(handle)
+
+
 DEFAULT_QEMU_FIRMWARE_PATCHES = (
     "c200-lcd-ready",
     "c200-intc-no-pending",
@@ -487,7 +580,6 @@ class QemuSystemConfig:
     boot_load_addr: int = DEFAULT_C200_PHYS
     boot_pc: int = DEFAULT_C200_BASE
     nand_image: Path | None = None
-    persist_nand_writes: bool = False
     extra_payloads: tuple[QemuPayload, ...] = ()
     plugins: tuple[Path, ...] = ()
     extra_args: tuple[str, ...] = ()
@@ -604,12 +696,8 @@ class QemuProcessBackend:
         self._last_snapshot: dict[str, object] = {}
         self._reader_threads: list[threading.Thread] = []
         self._frame_reader_thread: threading.Thread | None = None
-        self._runtime_nand_image: Path | None = None
-        self._runtime_nand_source: Path | None = None
-        self._runtime_nand_checkpoint: Path | None = None
-        self._runtime_nand_persistent = False
-        self._runtime_nand_commit_count = 0
-        self._runtime_nand_last_commit_error: str | None = None
+        self._process_job_handle: object | None = None
+        self.last_process_job_error: str | None = None
 
     def _bbk_machine_bool_option_enabled(self, name: str) -> bool:
         needle = name.lower()
@@ -721,21 +809,6 @@ class QemuProcessBackend:
                         "server=on,wait=off,nodelay=on"
                     ),
                 )
-            if launch_config.machine.lower() == "bbk9588" and launch_config.nand_image is not None:
-                runtime_nand = prepare_runtime_nand_image(
-                    launch_config.nand_image,
-                    persistent=launch_config.persist_nand_writes,
-                )
-                self._runtime_nand_image = runtime_nand
-                self._runtime_nand_source = launch_config.nand_image
-                self._runtime_nand_persistent = launch_config.persist_nand_writes
-                self._runtime_nand_checkpoint = (
-                    persistent_runtime_nand_checkpoint_path(
-                        launch_config.nand_image
-                    )
-                    if launch_config.persist_nand_writes else None
-                )
-                launch_config = replace(launch_config, nand_image=runtime_nand)
             raw_command = build_qemu_command(launch_config)
             resolved = find_qemu(raw_command[0])
             if resolved is None:
@@ -806,6 +879,9 @@ class QemuProcessBackend:
             self.qemu_heap_next = 0x80960000
             self.finished_at = None
             self.started_at = time.time()
+            _close_windows_job(self._process_job_handle)
+            self._process_job_handle = None
+            self.last_process_job_error = None
             self.proc = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
@@ -816,6 +892,10 @@ class QemuProcessBackend:
                 env=qemu_subprocess_env(self.command[0]),
                 creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
             )
+            (
+                self._process_job_handle,
+                self.last_process_job_error,
+            ) = _assign_windows_kill_on_close_job(self.proc)
             self._reader_threads = [
                 threading.Thread(target=self._reader, args=("stdout", self.proc.stdout), daemon=True),
                 threading.Thread(target=self._reader, args=("stderr", self.proc.stderr), daemon=True),
@@ -1156,7 +1236,8 @@ class QemuProcessBackend:
                 except OSError:
                     pass
                 self.bbk_frame_sock = None
-            self._cleanup_runtime_nand_locked(commit=quit_sent)
+            _close_windows_job(self._process_job_handle)
+            self._process_job_handle = None
 
     def set_storage_trace(self, enabled: bool) -> dict[str, object]:
         """Enable or disable the bbk9588 storage trace at runtime."""
@@ -1209,7 +1290,8 @@ class QemuProcessBackend:
                     except OSError:
                         pass
                     self.bbk_frame_sock = None
-                self._cleanup_runtime_nand_locked(commit=False)
+                _close_windows_job(self._process_job_handle)
+                self._process_job_handle = None
             elif proc is not None and self.hmp_sock is not None and time.time() - self.register_sample_at >= 0.5:
                 try:
                     status = _hmp_command(self.hmp_sock, "info status")
@@ -1223,46 +1305,6 @@ class QemuProcessBackend:
                         self.last_error = None
                 except Exception as exc:
                     self.last_error = f"HMP {type(exc).__name__}: {exc}"
-
-    def _cleanup_runtime_nand_locked(self, *, commit: bool = False) -> None:
-        runtime_nand = self._runtime_nand_image
-        source_nand = self._runtime_nand_source
-        checkpoint = self._runtime_nand_checkpoint
-        persistent = self._runtime_nand_persistent
-        self._runtime_nand_image = None
-        self._runtime_nand_source = None
-        self._runtime_nand_checkpoint = None
-        self._runtime_nand_persistent = False
-        if runtime_nand is None:
-            return
-        if (
-            persistent and commit and self.latest_frame_chardev is not None and
-            source_nand is not None and checkpoint is not None
-        ):
-            try:
-                commit_runtime_nand_checkpoint(
-                    source_nand, runtime_nand, checkpoint
-                )
-                self._runtime_nand_commit_count += 1
-                self._runtime_nand_last_commit_error = None
-            except Exception as exc:
-                self._runtime_nand_last_commit_error = (
-                    f"{type(exc).__name__}: {exc}"
-                )
-                self.last_error = (
-                    "commit NAND " + self._runtime_nand_last_commit_error
-                )
-                self._runtime_nand_image = runtime_nand
-                self._runtime_nand_source = source_nand
-                self._runtime_nand_checkpoint = checkpoint
-                self._runtime_nand_persistent = True
-                return
-        try:
-            runtime_nand.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            self.last_error = f"cleanup NAND {type(exc).__name__}: {exc}"
 
     def running(self) -> bool:
         self.refresh()
@@ -4516,7 +4558,7 @@ class QemuProcessBackend:
                 out["nand_last_column_int"] = int(words[66])
                 out["nand_last_block_int"] = int(words[67])
                 out["nand_busy_reads_int"] = int(words[68])
-                out["nand_bch_busy_reads_int"] = int(words[69])
+                out["emc_nfints_int"] = int(words[69])
                 out["nand_addr_count_int"] = int(words[70])
                 out["gpio_flag_200_int"] = int(words[71])
                 out["sysctrl_wake_pending_bool"] = bool(words[75])
@@ -6095,7 +6137,7 @@ class QemuProcessBackend:
                     trigger_thread.join(timeout=1.0)
 
     def guest_display_surface_snapshot(self) -> dict[str, object]:
-        """Read LCD mirror and active GUI surface descriptors used by C200 drawing."""
+        """Read active GUI surface descriptors used by C200 drawing."""
 
         out: dict[str, object] = {}
         with self._lock:
@@ -6105,30 +6147,8 @@ class QemuProcessBackend:
                 return {"error": "QEMU GDB stub is not connected"}
             try:
                 self._pause_for_gdb_locked()
-                mirror_enabled = self._read_u32_paused_locked(0x80474040) or 0
-                out["mirror_enabled_80474040"] = f"0x{mirror_enabled:08x}"
-                config_va = 0x804A6B88
-                if self._is_guest_ram_va(config_va, 0xE0):
-                    config = self._read_virtual_memory_paused_locked(config_va, 0xE0)
-                    width = struct.unpack_from("<H", config, 0x00)[0]
-                    height = struct.unpack_from("<H", config, 0x04)[0]
-                    fb = struct.unpack_from("<I", config, 0xD8)[0]
-                    reverse = config[0xDC]
-                    out["lcd_mirror_config"] = {
-                        "addr": f"0x{config_va:08x}",
-                        "width": width,
-                        "height": height,
-                        "fb": f"0x{fb:08x}",
-                        "reverse": bool(reverse),
-                        "words_00_1c": [
-                            f"0x{struct.unpack_from('<I', config, off)[0]:08x}"
-                            for off in range(0, 0x20, 4)
-                        ],
-                        "tail_d0_dc": [
-                            f"0x{struct.unpack_from('<I', config, off)[0]:08x}"
-                            for off in range(0xD0, 0xE0, 4)
-                        ],
-                    }
+                if self.config.machine.lower() == "bbk9588":
+                    out["lcd_scanout_source"] = "jz4740-lcd-descriptor"
                 active = self._read_u32_paused_locked(0x80474048) or 0
                 out["active_object_80474048"] = f"0x{active:08x}"
                 if self._is_guest_ram_va(active, 0xD0):
@@ -6263,7 +6283,7 @@ class QemuProcessBackend:
                     self.last_gdb_error = f"{type(exc).__name__}: {exc}"
 
     def enable_lcd_mirror(self) -> dict[str, object]:
-        """Enable the firmware LCD mirror flag used by the C200 GUI renderer."""
+        """Retain the legacy API while descriptor scanout needs no host action."""
 
         row: dict[str, object] = {"event": "qemu-enable-lcd-mirror", "enabled": False}
         if self.config.machine.lower() == "bbk9588":
@@ -6271,8 +6291,8 @@ class QemuProcessBackend:
                 {
                     "enabled": True,
                     "skipped": True,
-                    "reason": "qemu-c-machine-lcd-mirror",
-                    "source": "qemu-c-machine",
+                    "reason": "jz4740-lcd-descriptor-scanout",
+                    "source": "jz4740-lcd",
                 }
             )
             return row
@@ -7310,25 +7330,20 @@ class QemuProcessBackend:
                 "finished_at": self.finished_at,
                 "elapsed_seconds": None if elapsed is None else round(max(0.0, elapsed), 3),
                 "running": self.proc is not None and self.proc.poll() is None,
+                "process_id": None if self.proc is None else self.proc.pid,
                 "returncode": self.returncode,
                 "stdout_tail": list(self.stdout_tail[-80:]),
                 "stderr_tail": list(self.stderr_tail[-80:]),
                 "last_error": self.last_error,
-                "nand_runtime_image": (
-                    None if self._runtime_nand_image is None
-                    else str(self._runtime_nand_image)
+                "nand_image": (
+                    None if self.config.nand_image is None
+                    else str(self.config.nand_image.resolve())
                 ),
-                "nand_source_image": (
-                    None if self._runtime_nand_source is None
-                    else str(self._runtime_nand_source)
+                "nand_write_mode": (
+                    "direct" if self.config.nand_image is not None else "none"
                 ),
-                "nand_checkpoint_image": (
-                    None if self._runtime_nand_checkpoint is None
-                    else str(self._runtime_nand_checkpoint)
-                ),
-                "nand_writes_persistent": self._runtime_nand_persistent,
-                "nand_commit_count": self._runtime_nand_commit_count,
-                "nand_last_commit_error": self._runtime_nand_last_commit_error,
+                "kill_with_parent": self._process_job_handle is not None,
+                "process_job_error": self.last_process_job_error,
                 "hmp_port": self.hmp_port,
                 "gdb_port": self.gdb_port,
                 "gdb_connected": self.gdb_sock is not None,
@@ -7458,9 +7473,8 @@ def find_workspace_file(name: str) -> Path:
 
 
 def find_default_qemu_nand_image() -> Path | None:
-    for candidate in DEFAULT_QEMU_NAND_IMAGE_CANDIDATES:
-        if candidate.is_file():
-            return candidate
+    if DEFAULT_QEMU_NAND_IMAGE.is_file():
+        return DEFAULT_QEMU_NAND_IMAGE
     return None
 
 
@@ -7484,170 +7498,32 @@ def qemu_safe_payload_path(path: Path) -> Path:
     return target.resolve()
 
 
-def persistent_runtime_nand_checkpoint_path(path: Path) -> Path:
-    original = path.resolve()
-    suffix = original.suffix or ".bin"
+def migrate_legacy_nand_checkpoint(path: Path) -> Path | None:
+    """Replace an active NAND with the old checkpoint once, then remove it."""
+
+    active = path.resolve()
+    suffix = active.suffix or ".bin"
     digest = hashlib.sha1(
-        os.path.normcase(str(original)).encode("utf-8")
+        os.path.normcase(str(active)).encode("utf-8")
     ).hexdigest()[:16]
-    return (
+    checkpoint = (
         Path("runtime") / "qemu_nand_persistent" / f"nand_{digest}{suffix}"
     ).resolve()
+    if not checkpoint.is_file():
+        return None
 
-
-def restore_runtime_nand_checkpoint(
-    source_path: Path,
-    *,
-    retained_work_path: Path | None = None,
-) -> tuple[Path, bool]:
-    """Delete only persistent state derived from the selected base image."""
-
-    checkpoint = persistent_runtime_nand_checkpoint_path(source_path)
-    work: Path | None = None
-    if retained_work_path is not None:
-        work = retained_work_path.resolve()
-        runs_dir = (Path("build") / "qemu_nand_runs").resolve()
-        if work.parent != runs_dir:
-            raise ValueError(f"refusing to remove NAND work image outside {runs_dir}: {work}")
-    existed = checkpoint.is_file()
-    checkpoint.unlink(missing_ok=True)
-    if work is not None:
-        work.unlink(missing_ok=True)
-    return checkpoint, existed
-
-
-def _nand_block_map(path: Path) -> tuple[int, dict[int, tuple[int, int]]]:
-    page_size = 2048
-    stride = page_size + 64
-    pages_per_block = 64
-    block_size = stride * pages_per_block
-    size = path.stat().st_size
-    if size == 0 or size % block_size:
-        raise ValueError(f"unsupported persistent NAND geometry: {path} size={size}")
-    block_count = size // block_size
-    mapping: dict[int, tuple[int, int]] = {}
-    with path.open("rb") as stream:
-        for physical in range(block_count):
-            stream.seek(physical * block_size + page_size + 58)
-            tail = stream.read(6)
-            if len(tail) != 6:
-                raise IOError(f"short NAND OOB read from {path}")
-            sequence = int.from_bytes(tail[:2], "little")
-            logical = int.from_bytes(tail[2:], "little") & 0xFFFF
-            if sequence == 0xFFFF or logical >= block_count:
-                continue
-            current = mapping.get(logical)
-            if current is None or sequence >= current[0]:
-                mapping[logical] = (sequence, physical)
-    return block_count, mapping
-
-
-def commit_runtime_nand_checkpoint(
-    source_path: Path,
-    runtime_path: Path,
-    checkpoint_path: Path | None = None,
-) -> Path:
-    """Commit the runtime FTL logical view into a bootable canonical image."""
-
-    source = qemu_safe_payload_path(source_path)
-    runtime = runtime_path.resolve()
-    checkpoint = (
-        persistent_runtime_nand_checkpoint_path(source_path)
-        if checkpoint_path is None else checkpoint_path.resolve()
-    )
-    source_blocks, source_map = _nand_block_map(source)
-    runtime_blocks, runtime_map = _nand_block_map(runtime)
-    if runtime_blocks != source_blocks:
-        raise ValueError(
-            f"runtime NAND block count {runtime_blocks} != source {source_blocks}"
-        )
-
-    page_size = 2048
-    stride = page_size + 64
-    pages_per_block = 64
-    block_size = stride * pages_per_block
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    temporary = checkpoint.with_name(
-        f".{checkpoint.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    temporary = active.with_name(
+        f".{active.name}.{os.getpid()}.{time.time_ns()}.migrate.tmp"
     )
     try:
-        shutil.copy2(source, temporary)
-        with (
-            source.open("rb") as source_stream,
-            runtime.open("rb") as runtime_stream,
-            temporary.open("r+b") as output_stream,
-        ):
-            for logical, (_source_seq, canonical) in source_map.items():
-                runtime_row = runtime_map.get(logical)
-                if runtime_row is None:
-                    continue
-                _runtime_seq, physical = runtime_row
-                source_stream.seek(canonical * block_size)
-                output_block = bytearray(source_stream.read(block_size))
-                runtime_stream.seek(physical * block_size)
-                runtime_block = runtime_stream.read(block_size)
-                if len(output_block) != block_size or len(runtime_block) != block_size:
-                    raise IOError("short NAND block read while committing checkpoint")
-                for page in range(pages_per_block):
-                    offset = page * stride
-                    output_block[offset : offset + page_size] = (
-                        runtime_block[offset : offset + page_size]
-                    )
-                output_stream.seek(canonical * block_size)
-                output_stream.write(output_block)
-            output_stream.flush()
-            os.fsync(output_stream.fileno())
-        os.replace(temporary, checkpoint)
+        shutil.copy2(checkpoint, temporary)
+        normalize_c200_logical_tail_pages(temporary)
+        os.replace(temporary, active)
+        checkpoint.unlink()
     finally:
         temporary.unlink(missing_ok=True)
     return checkpoint
-
-
-def ensure_runtime_nand_checkpoint(path: Path) -> Path:
-    """Create the stable checkpoint for a base NAND image if needed."""
-
-    original = path.resolve()
-    source = qemu_safe_payload_path(original)
-    checkpoint = persistent_runtime_nand_checkpoint_path(original)
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint.exists():
-        return checkpoint
-    temporary = checkpoint.with_name(
-        f".{checkpoint.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    )
-    try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, checkpoint)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return checkpoint
-
-
-def prepare_runtime_nand_image(path: Path, *, persistent: bool = False) -> Path:
-    """Return an isolated writable NAND work image for QEMU."""
-
-    original = path.resolve()
-    source = qemu_safe_payload_path(original)
-    runs_dir = Path("build") / "qemu_nand_runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    if persistent:
-        checkpoint = ensure_runtime_nand_checkpoint(original)
-        copy_source = checkpoint
-    else:
-        copy_source = source
-
-    target = runs_dir / (
-        f"{source.stem}_{os.getpid()}_{time.time_ns()}{source.suffix}"
-    )
-    temporary = target.with_name(
-        f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    )
-    try:
-        shutil.copy2(copy_source, temporary)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return target.resolve()
 
 def qemu_patched_payload_path(path: Path, *, base: int, patch_names: tuple[str, ...]) -> Path:
     source = qemu_safe_payload_path(path)
@@ -7734,7 +7610,6 @@ def build_bbk_qemu_config(
     payload: Path | None = None,
     payload_addr: int = DEFAULT_C200_PHYS,
     nand_image: Path | None = None,
-    persist_nand_writes: bool = False,
     load_addr: int | None = None,
     pc: int | None = None,
     machine: str = DEFAULT_QEMU_MACHINE,
@@ -7806,7 +7681,6 @@ def build_bbk_qemu_config(
     else:
         raise ValueError(f"unsupported QEMU boot_mode {boot_mode!r}")
     if machine.lower() == "bbk9588":
-        nand_image = nand_image or find_default_qemu_nand_image()
         bbk_machine_options = default_bbk9588_machine_options(bbk_machine_options)
     return QemuSystemConfig(
         executable=executable,
@@ -7824,8 +7698,7 @@ def build_bbk_qemu_config(
         boot_payload=boot_payload,
         boot_load_addr=boot_load_addr,
         boot_pc=boot_pc,
-        nand_image=None if nand_image is None else qemu_safe_payload_path(nand_image),
-        persist_nand_writes=bool(persist_nand_writes),
+        nand_image=None if nand_image is None else nand_image.resolve(),
         extra_payloads=extra_payloads,
         plugins=tuple(Path(plugin) for plugin in plugins),
         extra_args=extra_args,
@@ -7882,7 +7755,10 @@ def build_qemu_command(config: QemuSystemConfig) -> list[str]:
         command.extend(["-chardev", config.bbk_frame])
     if config.machine.lower() == "bbk9588" and config.nand_image is not None:
         nand_path = str(config.nand_image.resolve()).replace("\\", "/")
-        command.extend(["-drive", f"if=mtd,index=0,format=raw,file={nand_path}"])
+        command.extend([
+            "-drive",
+            f"if=mtd,index=0,format=raw,cache=writethrough,file={nand_path}",
+        ])
     for plugin in config.plugins:
         plugin_path = str(plugin.resolve()).replace("\\", "/")
         command.extend(["-plugin", f"file={plugin_path}"])
@@ -8246,10 +8122,6 @@ def run_qemu(config: QemuSystemConfig, *, hmp_sample_offsets: tuple[float, ...] 
     """Run QEMU for a bounded interval and collect process output."""
 
     hmp_port: int | None = None
-    runtime_nand: Path | None = None
-    if config.machine.lower() == "bbk9588" and config.nand_image is not None:
-        runtime_nand = prepare_runtime_nand_image(config.nand_image)
-        config = replace(config, nand_image=runtime_nand)
     if hmp_sample_offsets:
         hmp_port = _find_free_tcp_port()
         config = replace(config, monitor=f"tcp:127.0.0.1:{hmp_port},server,nowait", serial="none")
@@ -8297,11 +8169,6 @@ def run_qemu(config: QemuSystemConfig, *, hmp_sample_offsets: tuple[float, ...] 
         if hmp_sock is not None:
             try:
                 hmp_sock.close()
-            except OSError:
-                pass
-        if runtime_nand is not None:
-            try:
-                runtime_nand.unlink()
             except OSError:
                 pass
     elapsed = time.perf_counter() - started

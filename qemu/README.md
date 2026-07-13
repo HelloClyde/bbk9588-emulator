@@ -83,26 +83,38 @@ bin/bbk9588-qemu-system-mipsel.exe
   模型，`LCDCMDx.LEN` 完成消耗、下一 descriptor 装载，`LCDSTATE`
   SOF/EOF/disable 状态到 INTC bit 30 的连线，以及 RGB565 frame chardev
   输出。`0xb0043000` 仍保留为当前 C200 路径使用的 BBK status 窗口；
-  默认启动不再注入 graphics-done/LCD-ready magic，也不再暴露对应的
-  machine ready override。
-- input chardev。
-- raw NAND data/OOB 访问和 MSC DMA 控制器行为；C200 自己扫描 raw NAND OOB、
-  建立 FTL map 并执行 page program/block erase。MSC 已与 NAND backing 解耦，默认
-  表示未挂载独立 removable medium，不再按 OOB tag 把 MSC LBA 翻译到 NAND page。
+  该窗口已迁移到独立 `hw/display/bbk9588_panel.c`，提供 board register、
+  ready/frame-done、W1C、reset 和 migration。RGB565 scanout、frame/audio/perf
+  chardev、QEMU console 和刷新 timer 位于无 guest MMIO 的独立
+  `hw/display/bbk9588_host_bridge.c`。默认启动不再注入
+  graphics-done/LCD-ready magic，也不再暴露对应的 machine ready override。
+- 独立、无 guest MMIO 的 `hw/input/bbk9588_host_input.c` 持有 input chardev、
+  行缓冲和 `T/K` host 协议 parser；machine 只把 typed key/touch callback 接到
+  GPIO/SADC 板级连线。
+- raw NAND data/OOB 访问和独立 MSC DMA 控制器行为；C200 自己扫描 raw NAND OOB、
+  建立 FTL map 并执行 page program/block erase。`hw/sd/jz4740_msc.c` 负责
+  `0xb0021000` register、response FIFO、command/DMA pending、`IREG` 写一清零、
+  `IMASK`/IRQ14、reset 和 migration；machine 只保留 DMAC RAM 搬运和 storage trace。
+  MSC 已与 NAND backing 解耦，默认表示未挂载独立 removable medium，不再按 OOB tag
+  把 MSC LBA 翻译到 NAND page。
   NAND backing 的 page stride 只按 2048B data +
   64B OOB raw geometry 或 legacy 2048B page-only 兼容格式识别，raw NAND
   program/erase 不再带构造镜像 FAT 页范围保护。旧的 QEMU C FAT16
   boot-sector 扫描和 FAT/cluster bridge 已移除；FAT/资源逻辑由
   U-Boot/C200 经 modeled raw NAND 路径执行。后续若需要模拟 SD/MMC，必须给 MSC
   接独立 block backend，不能复用 NAND OOB FTL。
-- Web 默认不直接修改基础 NAND。每次运行从 `runtime/qemu_nand_persistent/` 中与基础
-  镜像路径绑定的 canonical checkpoint 创建隔离 work copy；正常停止且已有有效画面
-  时，将 work copy 的最新 OOB logical block view 压实回 checkpoint。这样既保留应用
-  写入，也保持 loader/U-Boot 所需的 canonical boot layout。启动未完成、异常退出或
-  checkpoint 提交失败时不会覆盖上一个可启动 checkpoint；提交失败的 work copy 会
-  保留用于恢复。一次性测试和 probe 默认仍使用并删除 disposable copy。
-  Web 左侧“↺ 恢复”是唯一删除所选镜像 checkpoint 的默认操作，执行前要求确认；
-  普通 reset/Web 重启只提交或复用 checkpoint，不会恢复基础镜像。
+  测试可用 `-global bbk9588-nand.fail-program-block=N` 或
+  `-global bbk9588-nand.fail-erase-block=N` 让指定 physical block 的操作返回
+  ready+FAIL `0x41` 且保持 backing 不变；默认值禁用故障注入。
+- Web/QEMU 直接读写调用方传入的唯一活动 raw NAND，drive 使用 writethrough；正常停止、
+  QEMU 崩溃或 Web 重启都不触发 host FTL 压实，也不创建或删除 work copy/checkpoint。
+  测试自行创建临时 NAND fixture，direct-boot probe 默认不挂载 NAND。构造 OOB logical
+  tag 只写低 16 位，高 16 位保持 `0xffff`，与 C200 page program 一致。旧版本 checkpoint
+  仅在升级后的首次启动原子迁移到活动 NAND，迁移后删除。Windows 前端通过
+  kill-on-close Job Object 保证 Web 被强杀时同步结束 QEMU，避免孤儿进程继续写活动镜像。
+- Web 文件管理在 QEMU 停止时直接修改活动 NAND，并对变化 data page 重新生成数据区
+  OOB `4+9*n` RS parity。恢复/更换镜像通过启动器显式导入 `.bin` 或单镜像 ZIP，不保留
+  隐藏基础副本。
 - DMAC 基础 channel 模型：`0xb3020000` 按 JZ4740
   `DSA/DTA/DTC/DRT/DCS/DCM/DDA/DMAC/DIRQP/DDR` 组织 channel
   register，MSC 读写通过 channel enable + global `DMAE` 完成并置
@@ -112,15 +124,20 @@ bin/bbk9588-qemu-system-mipsel.exe
   搬运真实样本；internal codec sample rate、mute/volume/route 接入 QEMU audio
   backend。音频虚拟时钟不依赖 host callback，frame-info 诊断包输出采样率、FIFO、
   DMA samples、output frames 和 xrun。MSC 独立位于 `0xb0021000`，不再与 AIC 重叠。
-- UART0 基础 16550/JZ4740 模型：`0xb0030000` 按
+- 独立 UART0 基础 16550/JZ4740 模型 `hw/char/jz4740_uart.c`：`0xb0030000` 按
   `URBR/UTHR/UDLLR/UDLHR/UIER/UIIR/UFCR/ULCR/UMCR/ULSR/UMSR/USPR/ISR`
   组织 8-bit register slot，支持 `DLAB`、16 字节 RX FIFO、FIFO reset、
   `UIIR` pending、`ULSR` line status 和 serial chardev 输出。
-- UDC no-host idle 模型：`0xb3040000` 按 JZ4740 common register reset
+- 独立 UDC no-host idle 模型 `hw/usb/jz4740_udc.c`：`0xb3040000` 按
+  JZ4740 common register reset
   value 提供 `FAddr/Power/IntrIn/IntrOut/IntrInE/IntrOutE/IntrUSB/IntrUSBE`
-  等寄存器、indexed endpoint 配置寄存器和 IRQ25 连线；无 USB host 时
+  等寄存器、indexed endpoint 配置寄存器和 IRQ24 连线；无 USB host 时
   FIFO/count/status 保持空闲，不回显 guest shadow register；不再提供
   `irq24-period-ms` 合成中断源。
+- 独立 JZ4740 CIM idle 模型 `hw/misc/jz4740_cim.c`：将原匿名 `0xb3060000`
+  shadow window 按手册还原为 `CIMCFG/CIMCR/CIMST/CIMIID/CIMRXFIFO/CIMDA/`
+  `CIMFA/CIMFID/CIMCMD`，支持 RW mask、FIFO empty、disable-done、status W0C、
+  IRQ17、reset 和 migration。9588 未连接 camera sensor，不合成图像或 CIM DMA。
 - INTC/TCU 基本寄存器模型：JZ4740 `ICSR/ICMR/ICMSR/ICMCR/ICPR`
   与 TCU enable/flag/mask set-clear 语义、reset mask，以及 byte/halfword
   MMIO lane 访问；`tcu-period-ms` 仅作为显式诊断/调速 machine property，
@@ -143,7 +160,9 @@ bin/bbk9588-qemu-system-mipsel.exe
 
 overlay 还包含少量 `target/mips` 侧 instrumentation/helper，用于当前 machine model
 和诊断；filesystem/resource probe 写入诊断 RAM 前受 `storage-trace=on` 门控，
-默认启动不会因此改写 guest 内存。周期性 progress 采样使用
+默认启动不会因此改写 guest 内存。独立、无 guest MMIO 的 `hw/misc/bbk9588_diag.c`
+持有 input event ring 以及 storage/MSC/NAND-target/DMAC trace sequence，并把调用方
+显式提供的 PC/INTC/DMAC 快照写入诊断 RAM；默认 trace 关闭。周期性 progress 采样使用
 `progress-trace-period-ms` 显式诊断 property，不再以旧的资源泵命名。
 Python/GDB 侧遗留的 resource hook、filesystem scan、file-open probe 和 GUI
 dispatcher 诊断服务在 `bbk9588` machine 上统一返回 disabled；默认路径不再通过

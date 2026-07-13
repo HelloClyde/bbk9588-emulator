@@ -8,7 +8,6 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-
 BOOTROM_MAGIC = b"BBKUBOOT"
 BOOTROM_HEADER_VERSION = 1
 DEFAULT_PAGE_SIZE = 2048
@@ -19,10 +18,39 @@ DEFAULT_NAND_TOTAL_SIZE = (
     DEFAULT_NAND_BLOCKS * DEFAULT_PAGES_PER_BLOCK * (DEFAULT_PAGE_SIZE + DEFAULT_SPARE_SIZE)
 )
 DEFAULT_BOOTROM_BACKUP_ADDR = 0x2000
+ECC_BLOCK_BYTES = 512
+BOOT_ECC_OOB_OFFSET = 6
+DATA_ECC_OOB_OFFSET = 4
+
+
+def page_oob_ecc(data: bytes, *, offset: int) -> bytes:
+    from emu.qemu.ecc import jz4740_page_oob_ecc
+
+    return jz4740_page_oob_ecc(data, offset=offset)
 
 
 def ranges_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
     return start_a < end_b and start_b < end_a
+
+
+def write_page_with_ecc(
+    output,
+    *,
+    page: int,
+    data: bytes,
+    page_size: int,
+    spare_size: int,
+    ecc_oob_offset: int,
+) -> None:
+    if len(data) != page_size:
+        raise ValueError("page data must match the configured NAND page size")
+    oob_ecc = page_oob_ecc(data, offset=ecc_oob_offset)
+    if len(oob_ecc) > spare_size:
+        raise ValueError("spare area is too small for JZ4740 ECC parity")
+    output.seek(page * (page_size + spare_size))
+    output.write(data)
+    output.write(oob_ecc)
+    output.write(b"\xff" * (spare_size - len(oob_ecc)))
 
 
 def main() -> None:
@@ -79,6 +107,12 @@ def main() -> None:
     stride = args.page_size + args.spare_size
     if args.page_size <= 0 or args.spare_size < 0 or args.pages_per_block <= 0:
         raise SystemExit("page, spare, and block geometry must be positive")
+    if args.page_size % ECC_BLOCK_BYTES:
+        raise SystemExit("--page-size must be a multiple of the 512-byte JZ4740 ECC block")
+    if args.spare_size < len(
+        page_oob_ecc(b"\xff" * args.page_size, offset=BOOT_ECC_OOB_OFFSET)
+    ):
+        raise SystemExit("--spare-size is too small for JZ4740 ECC parity")
     if args.physical_blocks < 0:
         raise SystemExit("--physical-blocks must be non-negative")
     os_image = args.base_nand.read_bytes() if args.base_nand is not None else b""
@@ -145,7 +179,6 @@ def main() -> None:
             if args.uboot_loader_copy_bytes > 0:
                 uboot_loader_copy_pages = (args.uboot_loader_copy_bytes + args.page_size - 1) // args.page_size
             uboot_marker_end = args.uboot_page_base + max(uboot_pages, uboot_loader_copy_pages)
-            uboot_marker_end = max(uboot_marker_end, args.fat_page_base)
         if args.uboot_page_base < 0 or args.uboot_page_base >= args.fat_page_base:
             raise SystemExit("--uboot-page-base must be before --fat-page-base")
         if loader_end > args.uboot_page_base:
@@ -179,6 +212,7 @@ def main() -> None:
     out_size = max(required_pages, physical_pages) * stride
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    programmed_pages: set[int] = set()
     with args.output.open("wb") as f:
         chunk = b"\xFF" * (1024 * 1024)
         remaining = out_size
@@ -190,24 +224,42 @@ def main() -> None:
             chunk = os_image[page * args.page_size : (page + 1) * args.page_size]
             if len(chunk) < args.page_size:
                 chunk += b"\xFF" * (args.page_size - len(chunk))
-            f.seek((args.os_page_base + page) * stride)
-            f.write(chunk)
-            f.write(b"\xFF" * args.spare_size)
+            write_page_with_ecc(
+                f,
+                page=args.os_page_base + page,
+                data=chunk,
+                page_size=args.page_size,
+                spare_size=args.spare_size,
+                ecc_oob_offset=DATA_ECC_OOB_OFFSET,
+            )
+            programmed_pages.add(args.os_page_base + page)
         for page in range(loader_pages):
             chunk = loader[page * args.page_size : (page + 1) * args.page_size]
             if len(chunk) < args.page_size:
                 chunk += b"\xFF" * (args.page_size - len(chunk))
-            f.seek((args.loader_page_base + page) * stride)
-            f.write(chunk)
-            f.write(b"\xFF" * args.spare_size)
+            write_page_with_ecc(
+                f,
+                page=args.loader_page_base + page,
+                data=chunk,
+                page_size=args.page_size,
+                spare_size=args.spare_size,
+                ecc_oob_offset=BOOT_ECC_OOB_OFFSET,
+            )
+            programmed_pages.add(args.loader_page_base + page)
         if loader_backup_page is not None:
             for page in range(loader_pages):
                 chunk = loader[page * args.page_size : (page + 1) * args.page_size]
                 if len(chunk) < args.page_size:
                     chunk += b"\xFF" * (args.page_size - len(chunk))
-                f.seek((loader_backup_page + page) * stride)
-                f.write(chunk)
-                f.write(b"\xFF" * args.spare_size)
+                write_page_with_ecc(
+                    f,
+                    page=loader_backup_page + page,
+                    data=chunk,
+                    page_size=args.page_size,
+                    spare_size=args.spare_size,
+                    ecc_oob_offset=BOOT_ECC_OOB_OFFSET,
+                )
+                programmed_pages.add(loader_backup_page + page)
         if uboot:
             if args.legacy_uboot_header:
                 header = bytearray(args.page_size)
@@ -221,26 +273,46 @@ def main() -> None:
                     args.uboot_entry,
                     len(uboot),
                 )
-                f.seek(args.uboot_page_base * stride)
-                f.write(header)
-                f.write(b"\xFF" * args.spare_size)
+                write_page_with_ecc(
+                    f,
+                    page=args.uboot_page_base,
+                    data=bytes(header),
+                    page_size=args.page_size,
+                    spare_size=args.spare_size,
+                    ecc_oob_offset=BOOT_ECC_OOB_OFFSET,
+                )
+                programmed_pages.add(args.uboot_page_base)
             for page in range(uboot_pages):
                 chunk = uboot[page * args.page_size : (page + 1) * args.page_size]
                 if len(chunk) < args.page_size:
                     chunk += b"\xFF" * (args.page_size - len(chunk))
-                f.seek((uboot_payload_page + page) * stride)
-                f.write(chunk)
-                f.write(b"\xFF" * args.spare_size)
+                write_page_with_ecc(
+                    f,
+                    page=uboot_payload_page + page,
+                    data=chunk,
+                    page_size=args.page_size,
+                    spare_size=args.spare_size,
+                    ecc_oob_offset=BOOT_ECC_OOB_OFFSET,
+                )
+                programmed_pages.add(uboot_payload_page + page)
         for page in range(page_count):
             chunk = fat[page * args.page_size : (page + 1) * args.page_size]
             if len(chunk) < args.page_size:
                 chunk += b"\x00" * (args.page_size - len(chunk))
-            f.seek((args.fat_page_base + page) * stride)
-            f.write(chunk)
-            f.write(b"\xFF" * args.spare_size)
+            write_page_with_ecc(
+                f,
+                page=args.fat_page_base + page,
+                data=chunk,
+                page_size=args.page_size,
+                spare_size=args.spare_size,
+                ecc_oob_offset=DATA_ECC_OOB_OFFSET,
+            )
+            programmed_pages.add(args.fat_page_base + page)
         if args.spare_size >= 5:
-            spare = bytearray(b"\xFF" * args.spare_size)
-            spare[2:5] = b"\x00\x00\x00"
+            erased_ecc = page_oob_ecc(
+                b"\xff" * args.page_size,
+                offset=BOOT_ECC_OOB_OFFSET,
+            )
             boot_ranges = [
                 (args.loader_page_base, loader_end),
                 (args.uboot_page_base, uboot_marker_end),
@@ -251,8 +323,11 @@ def main() -> None:
                 if end_page <= start_page:
                     continue
                 for page in range(start_page, end_page):
-                    f.seek(page * stride + args.page_size)
-                    f.write(spare)
+                    f.seek(page * stride + args.page_size + 2)
+                    f.write(b"\x00\x00\x00")
+                    if page not in programmed_pages:
+                        f.seek(page * stride + args.page_size + BOOT_ECC_OOB_OFFSET)
+                        f.write(erased_ecc[BOOT_ECC_OOB_OFFSET:])
 
     print(
         f"wrote {args.output} size=0x{out_size:x} "

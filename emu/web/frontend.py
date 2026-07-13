@@ -162,7 +162,6 @@ HTML = r"""<!doctype html>
         <h2>NAND 镜像</h2>
         <div class="row">
           <div id="imageStatus" class="image-status grow">bbk9588_nand.bin</div>
-          <button id="restoreNandImage" class="warn" title="恢复基础 NAND 镜像">↺ 恢复</button>
         </div>
       </section>
       <section class="panel">
@@ -559,23 +558,6 @@ function formatWebAudio(transport) {
   const error = audioLastError ? ` ${audioLastError}` : '';
   return `${state} ${packets} / ${transport?.ws_connections ?? 0}${error}`;
 }
-async function restoreNandImage() {
-  if (!window.confirm('恢复基础镜像会删除这个镜像的全部持久化写入。继续？')) return;
-  imageStatusEl.textContent = '正在恢复基础镜像...';
-  stopPolling();
-  try {
-    const status = await api('/api/command', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({op:'restore-nand-image'})
-    });
-    renderStatus(status);
-    connectWs().catch(console.error);
-    imageStatusEl.textContent = basename(status.nand_image) || 'bbk9588_nand.bin';
-  } catch (err) {
-    imageStatusEl.textContent = String(err.message || err);
-  }
-}
 function syncDrawerState() {
   const mobile = mobileLayoutQuery.matches;
   const controlsOpen = mobile && activeDrawer === 'controls';
@@ -871,9 +853,7 @@ function renderStatus(s) {
     ['audio xrun', `${formatCounter(qemuAudio.underruns)} / ${formatCounter(qemuAudio.overruns)}`],
     ['boot', s.boot_mode || ''],
     ['nand', basename(s.nand_image || '')],
-    ['nand writes', s.qemu?.nand_writes_persistent ? 'persistent' : 'disposable'],
-    ['nand checkpoint', basename(s.qemu?.nand_checkpoint_image || '')],
-    ['nand runtime', basename(s.qemu?.nand_runtime_image || '')],
+    ['nand writes', s.qemu?.nand_write_mode || s.nand_write_mode || 'none'],
     ['orientation', s.orientation || ''],
     ['input calib', `${s.frontend_input_calibration ? 'on' : 'off'}:${s.frontend_input_calibration_stage_label || s.frontend_input_calibration_stage || 0}`],
     ['touch queue', s.pending_touches ?? 0],
@@ -1291,7 +1271,6 @@ document.getElementById('stop').onclick = async () => {
 frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
-document.getElementById('restoreNandImage').onclick = restoreNandImage;
 openControlsDrawerEl.onclick = () => openDrawer('controls');
 openStatusDrawerEl.onclick = () => openDrawer('status');
 drawerBackdropEl.onclick = closeDrawers;
@@ -1902,17 +1881,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--nand-image", type=Path, help="Raw NAND image backing the frontend emulator.")
     ap.add_argument(
-        "--qemu-persist-nand",
-        dest="qemu_persist_nand",
+        "--no-nand",
         action="store_true",
-        default=True,
-        help="Reuse a persistent writable NAND copy across QEMU and Web restarts.",
-    )
-    ap.add_argument(
-        "--no-qemu-persist-nand",
-        dest="qemu_persist_nand",
-        action="store_false",
-        help="Use and delete a disposable writable NAND copy.",
+        help="Do not attach NAND in direct-boot diagnostic runs.",
     )
     ap.add_argument(
         "--frontend-input-calibration",

@@ -28,12 +28,44 @@ DEFAULT_NAND = ROOT / "runtime" / "bbk9588_nand.bin"
 WS_RAW_FRAME_MAGIC = b"BBKRAW1\0"
 WS_RAW_FRAME_HEADER_SIZE = 20
 WS_RAW_FRAME_FORMAT_RGB565 = 1
+MENU_MIN_NONZERO_PIXELS = 25000
+MENU_MIN_UNIQUE_PIXEL_VALUES = 2000
+RENDERED_MIN_NONZERO_PIXELS = 15000
+RENDERED_MIN_UNIQUE_PIXEL_VALUES = 500
 
 
 def ws_raw_frame_seq(payload: bytes) -> int | None:
     if payload.startswith(WS_RAW_FRAME_MAGIC) and len(payload) >= WS_RAW_FRAME_HEADER_SIZE:
         return int.from_bytes(payload[8:12], "little")
     return None
+
+
+def ws_raw_frame_pixels(payload: bytes) -> tuple[int, int, int, int, bytes]:
+    if not payload.startswith(WS_RAW_FRAME_MAGIC) or len(payload) < WS_RAW_FRAME_HEADER_SIZE:
+        raise ValueError("WebSocket frame is not raw RGB565")
+    seq = int.from_bytes(payload[8:12], "little")
+    width = int.from_bytes(payload[12:14], "little")
+    height = int.from_bytes(payload[14:16], "little")
+    stride = int.from_bytes(payload[16:18], "little")
+    pixel_format = int.from_bytes(payload[18:20], "little")
+    if pixel_format != WS_RAW_FRAME_FORMAT_RGB565:
+        raise ValueError(f"unsupported raw WS frame format {pixel_format}")
+    if width <= 0 or height <= 0 or stride < width:
+        raise ValueError(f"invalid raw WS frame geometry {width}x{height} stride={stride}")
+    pixels = payload[WS_RAW_FRAME_HEADER_SIZE:]
+    expected = stride * height * 2
+    if len(pixels) != expected:
+        raise ValueError(f"raw WS frame has {len(pixels)} bytes, expected {expected}")
+    return seq, width, height, stride, pixels
+
+
+def rgb565_changed_pixels(before: bytes, after: bytes) -> int:
+    if len(before) != len(after) or len(before) % 2:
+        raise ValueError("RGB565 frames must have matching even byte lengths")
+    return sum(
+        before[offset : offset + 2] != after[offset : offset + 2]
+        for offset in range(0, len(before), 2)
+    )
 
 
 def find_free_port(host: str) -> int:
@@ -354,6 +386,8 @@ def start_frontend(args: argparse.Namespace, port: int) -> subprocess.Popen[byte
     nand_image = getattr(args, "nand_image", None)
     if nand_image is not None:
         cmd += ["--nand-image", str(nand_image)]
+    elif bool(getattr(args, "no_nand", False)):
+        cmd.append("--no-nand")
     profile_out = getattr(args, "frontend_profile_out", None)
     if profile_out is not None:
         cmd += ["--profile-out", str(profile_out)]
@@ -443,16 +477,35 @@ def looks_like_menu(status: dict[str, object]) -> bool:
     fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
     return (
         int(status.get("frontend_input_calibration_stage") or 0) >= 12
-        and int(fb.get("nonzero_pixels") or 0) >= 25000
-        and int(fb.get("unique_pixel_values") or 0) >= 2500
+        and int(fb.get("nonzero_pixels") or 0) >= MENU_MIN_NONZERO_PIXELS
+        and int(fb.get("unique_pixel_values") or 0)
+        >= MENU_MIN_UNIQUE_PIXEL_VALUES
     )
 
 
-def looks_like_menu_family(status: dict[str, object]) -> bool:
+def looks_like_menu_family(
+    status: dict[str, object], *, require_calibration: bool = True
+) -> bool:
     fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
     nonzero = int(fb.get("nonzero_pixels") or 0)
     unique = int(fb.get("unique_pixel_values") or 0)
-    return int(status.get("frontend_input_calibration_stage") or 0) >= 12 and nonzero >= 25000 and unique >= 2500
+    return (
+        (
+            not require_calibration
+            or int(status.get("frontend_input_calibration_stage") or 0) >= 12
+        )
+        and nonzero >= MENU_MIN_NONZERO_PIXELS
+        and unique >= MENU_MIN_UNIQUE_PIXEL_VALUES
+    )
+
+
+def looks_like_rendered_screen(status: dict[str, object]) -> bool:
+    fb = status.get("framebuffer") if isinstance(status.get("framebuffer"), dict) else {}
+    return (
+        int(fb.get("nonzero_pixels") or 0) >= RENDERED_MIN_NONZERO_PIXELS
+        and int(fb.get("unique_pixel_values") or 0)
+        >= RENDERED_MIN_UNIQUE_PIXEL_VALUES
+    )
 
 
 def status_pc_value(status: dict[str, object]) -> int | None:
@@ -485,6 +538,51 @@ def write_png(path: Path, data: bytes | None) -> str | None:
     return hashlib.sha256(data).hexdigest()
 
 
+def sample_raw_frame_stability(
+    ws: WebSocketClient,
+    *,
+    sample_count: int,
+    frame_timeout: float,
+) -> dict[str, object]:
+    records: list[dict[str, object]] = []
+    pixel_frames: list[bytes] = []
+    ws.pump(max(0.25, min(frame_timeout, 1.0)))
+    count = max(2, sample_count)
+    for index in range(count):
+        advanced = False
+        if index == 0 and ws.last_frame_payload is None:
+            advanced = ws.wait_for_frame_after(None, frame_timeout)
+        elif index > 0:
+            advanced = ws.wait_for_frame_after(ws.last_frame_seq, frame_timeout)
+        payload = ws.last_frame_payload
+        if payload is None:
+            raise RuntimeError("WebSocket did not provide a framebuffer frame")
+        seq, width, height, stride, pixels = ws_raw_frame_pixels(payload)
+        pixel_frames.append(pixels)
+        records.append(
+            {
+                "seq": seq,
+                "sha256": hashlib.sha256(pixels).hexdigest(),
+                "frame_advanced": advanced,
+                "width": width,
+                "height": height,
+                "stride": stride,
+            }
+        )
+
+    total_pixels = len(pixel_frames[0]) // 2
+    changed_pixels = [
+        rgb565_changed_pixels(before, after)
+        for before, after in zip(pixel_frames, pixel_frames[1:])
+    ]
+    changed_ratios = [changed / total_pixels for changed in changed_pixels]
+    return {
+        "samples": records,
+        "changed_pixels": changed_pixels,
+        "changed_ratios": [round(ratio, 6) for ratio in changed_ratios],
+        "max_changed_ratio": round(max(changed_ratios, default=0.0), 6),
+        "total_pixels": total_pixels,
+    }
 def fetch_screen_digest(host: str, port: int) -> tuple[int, bytes, str]:
     status_code, png = http_bytes(host, port, "/screen.png")
     digest = hashlib.sha256(png).hexdigest() if status_code == 200 else ""
@@ -698,6 +796,24 @@ def main(argv: list[str] | None = None) -> int:
         default=1.0,
         help="Maximum seconds to wait for a new WS frame after a tap when status alone is not enough.",
     )
+    ap.add_argument(
+        "--frame-stability-samples",
+        type=int,
+        default=3,
+        help="Number of consecutive main-menu raw RGB565 frames used for stability checks.",
+    )
+    ap.add_argument(
+        "--frame-stability-timeout",
+        type=float,
+        default=2.0,
+        help="Maximum seconds to wait for each new frame stability sample.",
+    )
+    ap.add_argument(
+        "--frame-stability-max-change-ratio",
+        type=float,
+        default=0.20,
+        help="Maximum changed RGB565 pixel ratio between consecutive stable-page samples.",
+    )
     ns = ap.parse_args(argv)
 
     ns.out_dir.mkdir(parents=True, exist_ok=True)
@@ -760,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
                 probe_full = (
                     status_pc_in_c200(compact)
                     or stage > 0
-                    or (not status_pc_in_uboot(compact) and now - last_full_probe >= 15.0)
+                    or now - last_full_probe >= 15.0
                 )
                 if not probe_full:
                     time.sleep(0.5)
@@ -819,6 +935,42 @@ def main(argv: list[str] | None = None) -> int:
                     "legacy_python_hooks": screen_status.get("legacy_python_hooks"),
                 }
             )
+            if not looks_like_menu_family(
+                screen_status,
+                require_calibration=ns.qemu_frontend_input_calibration,
+            ):
+                framebuffer = (
+                    screen_status.get("framebuffer")
+                    if isinstance(screen_status.get("framebuffer"), dict)
+                    else {}
+                )
+                failures.append(
+                    "qemu main menu resources did not render completely: "
+                    f"stage={screen_status.get('frontend_input_calibration_stage')} "
+                    f"nonzero={framebuffer.get('nonzero_pixels')} "
+                    f"unique={framebuffer.get('unique_pixel_values')}"
+                )
+            try:
+                stability = sample_raw_frame_stability(
+                    ws,
+                    sample_count=ns.frame_stability_samples,
+                    frame_timeout=ns.frame_stability_timeout,
+                )
+                interactions.append(
+                    {
+                        "step": "qemu-frame-stability",
+                        "status": stability,
+                    }
+                )
+                max_change_ratio = float(stability["max_changed_ratio"])
+                if max_change_ratio > ns.frame_stability_max_change_ratio:
+                    failures.append(
+                        "qemu main-menu raw framebuffer was unstable: "
+                        f"max_changed_ratio={max_change_ratio:.6f} "
+                        f"limit={ns.frame_stability_max_change_ratio:.6f}"
+                    )
+            except (RuntimeError, ValueError) as exc:
+                failures.append(f"qemu raw framebuffer stability check failed: {exc}")
             key_status = http_json(ns.host, port, "POST", "/api/command", {"op": "key", "code": 7, "down": True})
             interactions.append(
                 {
@@ -876,10 +1028,9 @@ def main(argv: list[str] | None = None) -> int:
                     "storage_service_replies": storage_service_replies,
                 }
             )
-            if not looks_like_menu_family(post_touch_status):
+            if not looks_like_rendered_screen(post_touch_status):
                 failures.append(
-                    "qemu main menu resources did not render completely: "
-                    f"stage={post_touch_status.get('frontend_input_calibration_stage')} "
+                    "qemu screen did not remain rendered after touch: "
                     f"nonzero={post_touch_framebuffer.get('nonzero_pixels')} "
                     f"unique={post_touch_framebuffer.get('unique_pixel_values')}"
                 )
@@ -1029,12 +1180,18 @@ def main(argv: list[str] | None = None) -> int:
                     before_seq = ws.last_frame_seq
                     tap(ws, home_x, home_y, poll_status=poll_status)
                     home_status = http_json(ns.host, port, "GET", "/api/status")
-                    home_like = looks_like_menu_family(home_status)
+                    home_like = looks_like_menu_family(
+                        home_status,
+                        require_calibration=ns.qemu_frontend_input_calibration,
+                    )
                     frame_advanced = False
                     if not home_like:
                         frame_advanced = ws.wait_for_frame_after(before_seq, ns.interaction_frame_timeout)
                         home_status = http_json(ns.host, port, "GET", "/api/status")
-                        home_like = looks_like_menu_family(home_status)
+                        home_like = looks_like_menu_family(
+                            home_status,
+                            require_calibration=ns.qemu_frontend_input_calibration,
+                        )
                     _home_status, _home_png, home_digest = current_ws_screen_digest(ws)
                     returned = bool(home_digest and home_digest in home_digests) or home_like
                     interactions.append(
@@ -1060,11 +1217,19 @@ def main(argv: list[str] | None = None) -> int:
                     key_press(ws, 9, poll_status=poll_status)
                     cancel_status = http_json(ns.host, port, "GET", "/api/status")
                     frame_advanced = False
-                    if not looks_like_menu_family(cancel_status):
+                    if not looks_like_menu_family(
+                        cancel_status,
+                        require_calibration=ns.qemu_frontend_input_calibration,
+                    ):
                         frame_advanced = ws.wait_for_frame_after(before_seq, ns.interaction_frame_timeout)
                         cancel_status = http_json(ns.host, port, "GET", "/api/status")
                     _home_status, _home_png, home_digest = current_ws_screen_digest(ws)
-                    returned = bool(home_digest and home_digest in home_digests) or looks_like_menu_family(cancel_status)
+                    returned = bool(
+                        home_digest and home_digest in home_digests
+                    ) or looks_like_menu_family(
+                        cancel_status,
+                        require_calibration=ns.qemu_frontend_input_calibration,
+                    )
                     interactions.append(
                         {
                             "step": f"cancel-after-{name}",

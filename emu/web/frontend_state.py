@@ -28,23 +28,13 @@ from emu.qemu.system import (
     QemuProcessBackend,
     build_bbk_qemu_config,
     classify_guest_pc,
-    ensure_runtime_nand_checkpoint,
-    restore_runtime_nand_checkpoint,
+    migrate_legacy_nand_checkpoint,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "build"
 COMBINED_NAND_IMAGE_CANDIDATES = (
     ROOT / DEFAULT_QEMU_NAND_IMAGE,
-    BUILD / "bbk9588_nand_loader0_uboot40_fat_page1c40_root512_ftloob.bin",
-    BUILD / "bbk9588_nand_loader0_uboot40_fat_page1c40_root256_ftloob.bin",
-    BUILD / "bbk9588_nand_loader0_uboot40_fat_page1c40.bin",
-    BUILD / "bbk9588_nand_fat_page1c40_root512_ftloob.bin",
-    BUILD / "bbk9588_nand_fat_page1c40_root256_ftloob.bin",
-    BUILD / "bbk9588_nand_fat_page1c40.bin",
-    BUILD / "bbk9588_nand_uboot40_fat_page1c40_root512_ftloob.bin",
-    BUILD / "bbk9588_nand_uboot40_fat_page1c40_root256_ftloob.bin",
-    BUILD / "bbk9588_nand_uboot40_fat_page1c40.bin",
 )
 NAND_IMAGE_GLOB_PATTERNS = (
     "bbk9588_nand*.bin",
@@ -339,10 +329,13 @@ class FrontendState:
         self.nand_files_lock = threading.Lock()
         self.nand_files_cache_path = BUILD / "nand_fs_cache" / "bbk9588_fat.img"
         self.nand_files_cache_signature: tuple[str, int, int] | None = None
+        self.nand_legacy_checkpoint_migrated: str | None = None
 
         self.reset()
 
     def _default_nand_image(self) -> Path | None:
+        if bool(getattr(self.args, "no_nand", False)):
+            return None
         if self.args.nand_image is not None:
             return self.args.nand_image
         for candidate in COMBINED_NAND_IMAGE_CANDIDATES:
@@ -409,44 +402,16 @@ class FrontendState:
             self._publish_snapshot_locked()
             return self.snapshot()
 
-    def restore_nand_image(self, path: object | None = None) -> dict[str, object]:
-        selected = (
-            self._default_nand_image()
-            if path is None or not str(path).strip()
-            else self._resolve_nand_image_path(path)
-        )
-        if selected is None:
-            raise FileNotFoundError("no NAND base image is selected")
-        backend = self.qemu_backend
-        if backend is not None:
-            self.stop()
-        retained_work: Path | None = None
-        if backend is not None:
-            backend_status = backend.snapshot()
-            runtime = backend_status.get("nand_runtime_image")
-            if backend_status.get("nand_last_commit_error") and runtime:
-                retained_work = Path(str(runtime))
-        checkpoint, existed = restore_runtime_nand_checkpoint(
-            selected,
-            retained_work_path=retained_work,
-        )
-        self.args.nand_image = selected
-        result = self.reset()
-        result["nand_restored"] = True
-        result["nand_checkpoint_removed"] = existed
-        result["nand_checkpoint_path"] = str(checkpoint)
-        return result
-
-    def _nand_files_checkpoint(self) -> Path:
+    def _nand_files_image(self) -> Path:
         selected = self._default_nand_image()
         if selected is None:
-            raise FileNotFoundError("default NAND image is missing")
-        return ensure_runtime_nand_checkpoint(selected)
+            raise FileNotFoundError("active NAND image is missing")
+        return selected.resolve()
 
     def _nand_files_fat_snapshot(self) -> Path:
-        checkpoint = self._nand_files_checkpoint()
-        stat = checkpoint.stat()
-        signature = (str(checkpoint.resolve()), stat.st_size, stat.st_mtime_ns)
+        image = self._nand_files_image()
+        stat = image.stat()
+        signature = (str(image), stat.st_size, stat.st_mtime_ns)
         cache_path = getattr(
             self,
             "nand_files_cache_path",
@@ -457,7 +422,7 @@ class FrontendState:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = cache_path.with_suffix(".tmp")
             try:
-                extract_logical_fat_image(checkpoint, temporary)
+                extract_logical_fat_image(image, temporary)
                 os.replace(temporary, cache_path)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -485,14 +450,9 @@ class FrontendState:
             backend = self.qemu_backend
             if backend is not None:
                 self.stop()
-                backend_status = backend.snapshot()
-                commit_error = backend_status.get("nand_last_commit_error")
-                if commit_error:
-                    self.reset()
-                    raise RuntimeError(f"could not commit running NAND before file operation: {commit_error}")
-            checkpoint = self._nand_files_checkpoint()
+            image = self._nand_files_image()
             try:
-                mutate_nand_files(checkpoint, operation)
+                mutate_nand_files(image, operation)
                 self._invalidate_nand_files_cache()
             except Exception:
                 if backend is not None:
@@ -645,6 +605,12 @@ class FrontendState:
         if self.qemu_worker is not None and self.qemu_worker.is_alive() and self.qemu_worker is not threading.current_thread():
             self.qemu_worker.join(timeout=2.0)
 
+        nand_image = self._default_nand_image()
+        if nand_image is not None:
+            migrated = migrate_legacy_nand_checkpoint(nand_image)
+            if migrated is not None:
+                self.nand_legacy_checkpoint_migrated = str(migrated)
+
         with self.lock:
             BUILD.mkdir(parents=True, exist_ok=True)
             self.cancel_run.clear()
@@ -668,10 +634,7 @@ class FrontendState:
                 monitor="none",
                 gdb=getattr(self.args, "qemu_gdb", "none"),
                 timeout_seconds=float(getattr(self.args, "qemu_timeout", 5.0)),
-                nand_image=self._default_nand_image(),
-                persist_nand_writes=bool(
-                    getattr(self.args, "qemu_persist_nand", True)
-                ),
+                nand_image=nand_image,
                 bbk_machine_options=machine_options,
                 extra_args=extra_args,
                 firmware_patches=getattr(self.args, "qemu_firmware_patch", None),
@@ -1350,13 +1313,6 @@ class FrontendState:
         if op in {"set-nand-image", "set_nand_image", "select-nand-image", "select_nand_image"}:
             reset = self._coerce_optional_bool(msg.get("reset"))
             return self.set_nand_image(msg.get("path") or msg.get("image"), reset=reset is not False)
-        if op in {
-            "restore-nand-image",
-            "restore_nand_image",
-            "restore-base-image",
-            "restore_base_image",
-        }:
-            return self.restore_nand_image(msg.get("path") or msg.get("image"))
         if op in {"qemu-storage-service", "qemu_storage_service"}:
             return {"error": "qemu-storage-service is disabled; legacy Python/GDB storage hooks are not part of the bbk9588 default path"}
         if op in {
@@ -1650,6 +1606,10 @@ class FrontendState:
             "running": active,
             "boot_mode": getattr(self.args, "boot_mode", "nand"),
             "nand_image": str(effective_nand_image.resolve()) if effective_nand_image is not None else "",
+            "nand_write_mode": "direct" if effective_nand_image is not None else "none",
+            "nand_legacy_checkpoint_migrated": getattr(
+                self, "nand_legacy_checkpoint_migrated", None
+            ),
             "orientation": getattr(self.args, "orientation", "rot180"),
             "reset_at": self.reset_at,
             "reset_elapsed_seconds": reset_elapsed,
@@ -1834,6 +1794,25 @@ class FrontendState:
 
         if self.frontend_input_calibration_stage < point_count * 2:
             if not pc_unknown and not in_touch_boot and pc != 0:
+                try:
+                    gui = backend.guest_gui_state_snapshot()
+                except Exception:
+                    return
+                active = int(str(gui.get("active_object_80474048") or "0x0"), 16)
+                if active == 0x80959670 or bool(gui.get("active_object_ready")):
+                    self.frontend_input_calibration_stage = 12
+                    self.frontend_input_calibration_last_stage_step += 1
+                    self.qemu_frontend_input_calibration_last_action_at = now
+                    self.qemu_frontend_input_calibration_log.append(
+                        {
+                            "event": "qemu-frontend-input-calibration-complete",
+                            "pc": f"0x{pc:08x}",
+                            "ra": f"0x{ra:08x}",
+                            "active": gui.get("active_object_80474048"),
+                            "reason": "main-menu-already-active",
+                        }
+                    )
+                    del self.qemu_frontend_input_calibration_log[:-16]
                 return
             point_index = self.frontend_input_calibration_stage // 2
             down = self.frontend_input_calibration_stage % 2 == 0

@@ -103,6 +103,8 @@ $runtimeTools = @(
     "__init__.py",
     "build_runtime_images.ps1",
     "make_combined_nand.py",
+    "stamp_nand_ecc.py",
+    "audit_ftl_nand.py",
     "make_fat16_image.py",
     "stamp_ftl_oob.py"
 )

@@ -19,6 +19,8 @@ REQUIRED_COMMON = (
     "emu/qemu/system.py",
     "tools/build_runtime_images.ps1",
     "tools/make_combined_nand.py",
+    "tools/stamp_nand_ecc.py",
+    "tools/audit_ftl_nand.py",
     "tools/make_fat16_image.py",
     "tools/stamp_ftl_oob.py",
     "emu/web/frontend.py",

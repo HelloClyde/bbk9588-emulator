@@ -75,6 +75,9 @@ NAND 作为同仓库的独立 Release asset 发布。
 runtime/bbk9588_nand.bin
 ```
 
+这是唯一活动 NAND，QEMU 会直接原地保存应用写入，不会另建 checkpoint 或 work copy。
+再次使用 `-Nand` 导入会显式替换它，可用于恢复或更换镜像。
+
 强制重建镜像：
 
 ```powershell

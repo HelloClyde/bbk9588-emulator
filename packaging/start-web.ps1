@@ -72,14 +72,9 @@ function Import-NandSource([string]$Source, [string]$Destination) {
         }
         Copy-Item -LiteralPath $imageSource -Destination $temporaryImage -Force
         Move-Item -LiteralPath $temporaryImage -Destination $Destination -Force
-        $runtimeDir = Split-Path -Parent $Destination
-        $packageRoot = Split-Path -Parent $runtimeDir
-        $checkpointDir = Join-Path $runtimeDir "qemu_nand_persistent"
-        $workDir = Join-Path $packageRoot "build\qemu_nand_runs"
-        foreach ($derivedPath in @($checkpointDir, $workDir)) {
-            if (Test-Path -LiteralPath $derivedPath) {
-                Remove-Item -LiteralPath $derivedPath -Recurse -Force
-            }
+        $legacyCheckpointDir = Join-Path (Split-Path -Parent $Destination) "qemu_nand_persistent"
+        if (Test-Path -LiteralPath $legacyCheckpointDir) {
+            Remove-Item -LiteralPath $legacyCheckpointDir -Recurse -Force
         }
         $stream = [System.IO.File]::OpenRead($Destination)
         try {

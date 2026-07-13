@@ -13,6 +13,7 @@ DEFAULT_PAGE_SIZE = 2048
 DEFAULT_SPARE_SIZE = 64
 DEFAULT_PAGES_PER_BLOCK = 64
 DEFAULT_NAND_BLOCKS = 4096
+FTL_LOGICAL_HIGH_BITS = 0xFFFF0000
 
 
 def main() -> None:
@@ -112,17 +113,27 @@ def main() -> None:
             data[oob + 2] = last_valid_page
             data[oob + 3] = 0x00
             struct.pack_into("<H", data, oob + args.spare_size - 6, args.sequence & 0xFFFF)
-            struct.pack_into("<I", data, oob + args.spare_size - 4, logical_block & 0xFFFF)
+            struct.pack_into(
+                "<I",
+                data,
+                oob + args.spare_size - 4,
+                FTL_LOGICAL_HIGH_BITS | (logical_block & 0xFFFF),
+            )
 
         oob = first_page * stride + args.page_size
         # C200's FTL scan reads the first page spare area of each block.
         # At spare[-6] it compares a 16-bit generation counter; at spare[-4]
         # it accepts normal mappings when the low 16 bits are < block_count.
         # The scan also compares first-page and last-valid-page spare[-6:]
-        # byte-for-byte, so every stamped valid page must use the same 32-bit
-        # logical tail rather than leaving the high half erased.
+        # byte-for-byte. C200 writes only the low 16-bit logical id and leaves
+        # the high half erased, so synthetic tags must use the same convention.
         struct.pack_into("<H", data, oob + args.spare_size - 6, args.sequence & 0xFFFF)
-        struct.pack_into("<I", data, oob + args.spare_size - 4, logical_block & 0xFFFF)
+        struct.pack_into(
+            "<I",
+            data,
+            oob + args.spare_size - 4,
+            FTL_LOGICAL_HIGH_BITS | (logical_block & 0xFFFF),
+        )
 
     free_start = physical_block_base + count
     for physical_block in range(free_start, max_physical_blocks):

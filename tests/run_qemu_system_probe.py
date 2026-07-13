@@ -5835,6 +5835,7 @@ def run_probe(ns: argparse.Namespace) -> int:
         image=ns.image,
         payload=ns.payload,
         payload_addr=ns.payload_addr,
+        nand_image=ns.nand_image,
         load_addr=ns.load_addr,
         pc=ns.pc,
         machine=ns.machine,
@@ -7438,6 +7439,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--boot-mode", choices=["nand", "c200", "uboot"], default="c200")
     ap.add_argument("--image", type=Path)
     ap.add_argument("--payload", type=Path)
+    ap.add_argument(
+        "--nand-image",
+        type=Path,
+        help="Caller-owned writable NAND fixture; omitted by default.",
+    )
     ap.add_argument("--payload-addr", type=lambda value: int(value, 0), default=0x4000)
     ap.add_argument("--load-addr", type=lambda value: int(value, 0))
     ap.add_argument("--pc", type=lambda value: int(value, 0))
