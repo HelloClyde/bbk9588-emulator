@@ -386,6 +386,8 @@ def start_frontend(args: argparse.Namespace, port: int) -> subprocess.Popen[byte
     nand_image = getattr(args, "nand_image", None)
     if nand_image is not None:
         cmd += ["--nand-image", str(nand_image)]
+    elif bool(getattr(args, "no_nand", False)):
+        cmd.append("--no-nand")
     profile_out = getattr(args, "frontend_profile_out", None)
     if profile_out is not None:
         cmd += ["--profile-out", str(profile_out)]

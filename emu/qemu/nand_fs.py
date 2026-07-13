@@ -16,6 +16,7 @@ from typing import Any
 from pyfatfs.EightDotThree import EightDotThree
 from pyfatfs.PyFatFS import PyFatFS
 
+from .ecc import jz4740_page_oob_ecc
 from .ftl import scan_ftl_image
 
 PAGE_SIZE = 2048
@@ -181,8 +182,17 @@ def inject_logical_fat_image(nand_path: Path, fat_path: Path) -> None:
                         raise IOError("short FAT image while injecting NAND")
                     if len(data) < PAGE_SIZE:
                         data += b"\x00" * (PAGE_SIZE - len(data))
-                    output.seek(physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE)
-                    output.write(data)
+                    page_offset = physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE
+                    output.seek(page_offset)
+                    previous = output.read(PAGE_SIZE)
+                    if len(previous) != PAGE_SIZE:
+                        raise IOError("short NAND page while injecting FAT image")
+                    if previous != data:
+                        output.seek(page_offset)
+                        output.write(data)
+                        parity = jz4740_page_oob_ecc(data, offset=4)
+                        output.seek(page_offset + PAGE_SIZE + 4)
+                        output.write(parity[4:])
                     remaining -= min(PAGE_SIZE, remaining)
             if remaining:
                 raise IOError(f"FAT injection left {remaining} bytes unwritten")

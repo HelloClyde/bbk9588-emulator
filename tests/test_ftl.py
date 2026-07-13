@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
@@ -19,7 +18,6 @@ from emu.qemu.ftl import (
     scan_ftl_image,
     sequence_is_newer,
 )
-from emu.qemu.system import commit_runtime_nand_checkpoint, ensure_runtime_nand_checkpoint
 
 
 def _write_tag(
@@ -175,56 +173,6 @@ class FtlTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(data[PAGE_SIZE + 58 : PAGE_SIZE + 64], b"\x01\x00\x00\x00\xff\xff")
-
-    def test_checkpoint_creation_and_reuse_migrate_legacy_tags(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source.bin"
-            image = bytearray(b"\xff" * RAW_BLOCK_SIZE)
-            _write_tag(image, 0, 0, 1, high=0)
-            source.write_bytes(image)
-            old_cwd = Path.cwd()
-            try:
-                os.chdir(root)
-                checkpoint = ensure_runtime_nand_checkpoint(source)
-                self.assertEqual(count_legacy_logical_tail_pages(checkpoint), 0)
-                self.assertEqual(count_legacy_logical_tail_pages(source), 2)
-
-                legacy = bytearray(checkpoint.read_bytes())
-                for page in (0, PAGES_PER_BLOCK - 1):
-                    oob = page * PAGE_STRIDE + PAGE_SIZE
-                    legacy[oob + 62 : oob + 64] = b"\x00\x00"
-                checkpoint.write_bytes(legacy)
-                reopened = ensure_runtime_nand_checkpoint(source)
-                self.assertEqual(reopened, checkpoint)
-                self.assertEqual(count_legacy_logical_tail_pages(reopened), 0)
-            finally:
-                os.chdir(old_cwd)
-
-    def test_checkpoint_commit_maps_from_migrated_torn_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source.bin"
-            runtime = root / "runtime.bin"
-            checkpoint = root / "checkpoint.bin"
-            image = bytearray(b"\xff" * RAW_BLOCK_SIZE)
-            _write_tag(image, 0, 0, 3, high=0)
-            last_oob = (PAGES_PER_BLOCK - 1) * PAGE_STRIDE + PAGE_SIZE
-            image[last_oob + 62 : last_oob + 64] = b"\xff\xff"
-            source.write_bytes(image)
-            runtime.write_bytes(image)
-            normalize_c200_logical_tail_pages(runtime)
-            runtime_data = bytearray(runtime.read_bytes())
-            runtime_data[0] = 0xA5
-            runtime.write_bytes(runtime_data)
-
-            commit_runtime_nand_checkpoint(source, runtime, checkpoint)
-            result = scan_ftl_image(checkpoint, scan_start_block=0)
-            checkpoint_first_byte = checkpoint.read_bytes()[0]
-
-        self.assertEqual(result.mapping[0].physical, 0)
-        self.assertEqual(checkpoint_first_byte, 0xA5)
-
 
 if __name__ == "__main__":
     unittest.main()

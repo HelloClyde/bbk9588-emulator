@@ -112,24 +112,21 @@ runtime/bbk9588_nand.bin
 
 ## 运行时写入策略
 
-QEMU 前端会把源 NAND 镜像复制到：
+`runtime/bbk9588_nand.bin` 是唯一活动 NAND。Web、`QemuProcessBackend` 和
+`run_qemu()` 都把调用方明确传入的路径直接交给 QEMU，page program/block erase 使用
+writethrough 原地写回；代码不再创建、提交或删除 persistent/disposable work copy，
+也不再使用 canonical checkpoint。测试自行在临时目录创建 NAND fixture，probe 默认
+不挂载 NAND。
 
-```text
-build/qemu_nand_runs/
-```
+升级旧版本时，如果存在与活动镜像对应的旧 `runtime/qemu_nand_persistent/` checkpoint，
+首次启动会先规范化 legacy logical tag、原子替换活动 NAND 并删除该 checkpoint；后续
+启动只使用活动 NAND。
 
-普通前端会话不会直接修改 `runtime/bbk9588_nand.bin` 基础镜像；持久 checkpoint
-也位于 `runtime/`，因此清理 `build/` 不会删除用户数据。
-checkpoint 压实只把 runtime 最新 logical block 的 data page 写回 canonical physical
-block，并对变化页重新生成数据区 OOB `4+9*n` RS parity；canonical sequence/logical
-metadata 暂时保留。旧 checkpoint 第一次打开时会原子迁移到 C200 的 16-bit logical
-tag 格式，避免与后续 guest page program 混用。这仍是固件 FTL 掉电恢复完成前的
-兼容层，不等同于真机提交协议。
-
-Web 右侧“文件”标签管理的是当前持久 checkpoint。目录浏览和导出使用只读 FAT
-快照；新建目录、导入、改名和删除会先正常停止 QEMU、提交 work copy，再原子更新
-checkpoint 并重启 QEMU。该工具只用于离线安装和维护文件，不参与 C200 运行时的
-FTL/FAT 访问。
+Web 右侧“文件”标签直接管理活动 NAND。目录浏览和导出使用只读 FAT 快照；新建目录、
+导入、改名和删除会先停止 QEMU，再原子更新同一 NAND、重算变化 data page 的 OOB
+`4+9*n` RS parity 并重启。该工具只用于离线安装和维护文件，不参与 C200 运行时的
+FTL/FAT 访问。需要恢复镜像时，重新运行 `start-web.cmd -Nand <镜像或ZIP>` 显式替换
+`runtime/bbk9588_nand.bin`，不会维护隐藏基础副本。
 
 ## 发布规则
 

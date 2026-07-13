@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+- Web/QEMU 改为 writethrough 直接读写唯一活动 raw NAND，删除 persistent/disposable
+  work copy、canonical checkpoint、正常停止压实流程和相关状态/CLI；测试改为显式管理
+  临时 fixture，probe 默认不挂载 NAND。旧 checkpoint 首次启动会原子迁入活动镜像。
+- Windows QEMU 子进程加入 kill-on-close Job Object；Web 被强制终止时由内核同步结束
+  QEMU，避免孤儿进程继续占用或并发写入唯一活动 NAND。
+- NAND 文件管理器改为停机后直接更新活动 NAND，并为变化 data page 重算 U-Boot/C200
+  数据区 `4+9*n` RS parity；恢复镜像改由启动器显式重新导入，不保留隐藏基础副本。
 - 还原 U-Boot/C200 FTL cold-scan 的 last-valid-page、完整 6-byte tail 和 16-bit 环形
   sequence 规则，新增共享 parser、严格镜像审计和 commit-tail 掉电注入工具。修正构造
   镜像 logical tag 高半字：C200 只写低 16 位，高半字必须保持 `0xffff`；旧 checkpoint

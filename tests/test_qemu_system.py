@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -50,17 +51,16 @@ from emu.qemu.system import (
     QemuPayload,
     QemuProcessBackend,
     QemuSystemConfig,
+    _assign_windows_kill_on_close_job,
+    _close_windows_job,
     build_bbk_qemu_config,
     build_qemu_command,
     classify_guest_pc,
-    commit_runtime_nand_checkpoint,
     decode_cp0,
     find_qemu,
     find_workspace_file,
-    persistent_runtime_nand_checkpoint_path,
-    prepare_runtime_nand_image,
+    migrate_legacy_nand_checkpoint,
     qemu_subprocess_env,
-    restore_runtime_nand_checkpoint,
 )
 from emu.web.frontend_state import (
     FRONTEND_INPUT_CALIBRATION_TARGETS,
@@ -509,14 +509,10 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertFalse(any("C200.bin" in arg for arg in command), command)
         self.assertFalse(any("u_boot_9588_4740.bin" in arg for arg in command), command)
         self.assertFalse(any(arg.startswith("loader,file=") for arg in command), command)
-        self.assertFalse(config.persist_nand_writes)
-
-        persistent = build_bbk_qemu_config(
-            nand_image=nand,
-            machine="bbk9588",
-            persist_nand_writes=True,
-        )
-        self.assertTrue(persistent.persist_nand_writes)
+        drive = command[command.index("-drive") + 1]
+        self.assertIn("cache=writethrough", drive)
+        self.assertIn(nand.resolve().as_posix(), drive)
+        self.assertNotIn("qemu_nand_runs", drive)
 
     def test_bbk9588_bootrom_source_does_not_load_fat_kernel(self) -> None:
         source = (
@@ -1134,7 +1130,10 @@ class QemuSystemCommandTests(unittest.TestCase):
         machine_arg = command[command.index("-M") + 1]
         self.assertTrue(machine_arg.startswith("bbk9588,"), machine_arg)
         self.assertIn("-drive", command)
-        self.assertIn(f"if=mtd,index=0,format=raw,file={nand_qemu}", command)
+        self.assertIn(
+            f"if=mtd,index=0,format=raw,cache=writethrough,file={nand_qemu}",
+            command,
+        )
 
     def test_builds_bbk9588_machine_with_input_chardev(self) -> None:
         image = Path("C200.bin")
@@ -2606,31 +2605,58 @@ class QemuSystemCommandTests(unittest.TestCase):
                 self.returncode = -9
 
         def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+            calls["args"] = args
             calls["kwargs"] = kwargs
             return FakeProcess()
 
         with tempfile.TemporaryDirectory() as tmp:
-            payload = Path(tmp) / "C200.bin"
-            payload.write_bytes(b"\0" * 16)
+            nand = Path(tmp) / "nand.bin"
+            nand.write_bytes(b"\xff" * 4096)
             config = QemuSystemConfig(
                 executable=sys.executable,
+                machine="bbk9588",
                 monitor="none",
                 gdb="none",
                 bbk_input="none",
                 bbk_frame="none",
-                boot_payload=QemuPayload(payload, 0x4000),
-                boot_pc=0x80004000,
+                bbk_machine_options=("bootrom-nand=on",),
+                nand_image=nand,
             )
             backend = QemuProcessBackend(config)
             with mock.patch.object(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000, create=True):
                 with mock.patch.object(subprocess, "Popen", side_effect=fake_popen):
                     backend.start()
                     backend.stop()
+            nand_survived = nand.exists()
 
         kwargs = calls.get("kwargs")
         self.assertIsInstance(kwargs, dict)
         assert isinstance(kwargs, dict)
         self.assertEqual(kwargs.get("creationflags"), 0x4000)
+        popen_args = calls.get("args")
+        self.assertIsInstance(popen_args, tuple)
+        assert isinstance(popen_args, tuple)
+        command = popen_args[0]
+        self.assertIn(nand.resolve().as_posix(), " ".join(command))
+        self.assertNotIn("qemu_nand_runs", " ".join(command))
+        self.assertTrue(nand_survived)
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object test")
+    def test_windows_job_handle_close_terminates_child_process(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        try:
+            handle, error = _assign_windows_kill_on_close_job(proc)
+            self.assertIsNone(error)
+            self.assertIsNotNone(handle)
+            _close_windows_job(handle)
+            proc.wait(timeout=5)
+            self.assertIsNotNone(proc.returncode)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
     def test_qemu_process_backend_stop_prefers_hmp_quit(self) -> None:
         class FakeProcess:
@@ -3796,77 +3822,6 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertEqual(layout["root_lba"], 0x119)
             self.assertEqual(layout["first_data_lba"], 0x139)
 
-    def test_runtime_nand_image_is_disposable_copy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "nand.bin"
-            original = b"\xEB\x3C\x90" + b"\xFF" * 509
-            source.write_bytes(original)
-
-            runtime = prepare_runtime_nand_image(source)
-            try:
-                self.assertNotEqual(runtime, source.resolve())
-                self.assertEqual(runtime.read_bytes(), original)
-                runtime.write_bytes(b"\x00" * len(original))
-                self.assertEqual(source.read_bytes(), original)
-            finally:
-                runtime.unlink(missing_ok=True)
-
-    def test_runtime_nand_checkpoint_compacts_latest_logical_mapping(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "nand.bin"
-            stride = 2048 + 64
-            pages_per_block = 64
-            block_size = stride * pages_per_block
-            image = bytearray(b"\xFF" * (block_size * 2))
-            for page in range(pages_per_block):
-                offset = page * stride
-                image[offset : offset + 2048] = bytes([page]) * 2048
-                oob = offset + 2048
-                image[oob + 1] = 0
-                image[oob + 2] = 0x3F
-                image[oob + 58 : oob + 60] = (1).to_bytes(2, "little")
-                image[oob + 60 : oob + 64] = (0).to_bytes(4, "little")
-            source.write_bytes(image)
-
-            old_cwd = Path.cwd()
-            try:
-                os.chdir(root)
-                runtime = prepare_runtime_nand_image(source, persistent=True)
-                runtime_data = bytearray(runtime.read_bytes())
-                relocated = bytearray(runtime_data[:block_size])
-                relocated[123] = 0xA5
-                for page in range(pages_per_block):
-                    oob = page * stride + 2048
-                    relocated[oob + 58 : oob + 60] = (2).to_bytes(2, "little")
-                runtime_data[:block_size] = b"\xFF" * block_size
-                runtime_data[block_size:] = relocated
-                runtime.write_bytes(runtime_data)
-                checkpoint = commit_runtime_nand_checkpoint(source, runtime)
-                expected_checkpoint = persistent_runtime_nand_checkpoint_path(source)
-                reopened = prepare_runtime_nand_image(source, persistent=True)
-            finally:
-                os.chdir(old_cwd)
-
-            reopened_data = reopened.read_bytes()
-            self.assertNotEqual(runtime, reopened)
-            self.assertEqual(reopened_data[123], 0xA5)
-            self.assertEqual(reopened_data[2048 : 2048 + 4], b"\xFF\x00\x3F\xFF")
-            self.assertEqual(reopened_data[2048 + 58 : 2048 + 60], b"\x01\x00")
-            self.assertEqual(reopened_data[2048 + 62 : 2048 + 64], b"\xff\xff")
-            expected_ecc = jz4740_page_oob_ecc(
-                reopened_data[:2048], offset=4
-            )
-            self.assertEqual(
-                reopened_data[2048 + 4 : 2048 + len(expected_ecc)],
-                expected_ecc[4:],
-            )
-            self.assertEqual(checkpoint, expected_checkpoint)
-            self.assertEqual(source.read_bytes()[123], 0)
-            runtime.unlink(missing_ok=True)
-            reopened.unlink(missing_ok=True)
-
     def test_nand_file_manager_round_trips_fat16_operations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3920,10 +3875,27 @@ class QemuSystemCommandTests(unittest.TestCase):
                 fs.move("/应用/安装/demo.bda", "/应用/安装/雷霆.bda")
                 fs.movedir("/应用/安装", "/应用/游戏", create=True)
 
+            before_mutation = nand_image.read_bytes()
             mutate_nand_files(nand_image, install)
             listing = list_nand_directory(nand_image, "/应用/游戏")
             self.assertEqual(listing["entries"][0]["name"], "雷霆.bda")
             self.assertEqual(read_nand_file(nand_image, "/应用/游戏/雷霆.bda")[1], b"BDA-TEST")
+            raw = nand_image.read_bytes()
+            changed_pages = []
+            for page_offset in range(0, len(raw), PAGE_STRIDE):
+                page_data = raw[page_offset : page_offset + PAGE_SIZE]
+                if page_data == before_mutation[page_offset : page_offset + PAGE_SIZE]:
+                    continue
+                changed_pages.append(page_offset // PAGE_STRIDE)
+                expected_ecc = jz4740_page_oob_ecc(page_data, offset=4)
+                self.assertEqual(
+                    raw[
+                        page_offset + PAGE_SIZE + 4 :
+                        page_offset + PAGE_SIZE + len(expected_ecc)
+                    ],
+                    expected_ecc[4:],
+                )
+            self.assertTrue(changed_pages)
 
             mutate_nand_files(nand_image, lambda writable: writable.removetree("/应用/游戏"))
             self.assertEqual(list_nand_directory(nand_image, "/应用")["entries"], [])
@@ -3931,211 +3903,50 @@ class QemuSystemCommandTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_nand_path("/应用/../系统")
 
-    def test_runtime_nand_persistent_paths_are_isolated_by_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            first_source = root / "first" / "nand.bin"
-            second_source = root / "second" / "nand.bin"
-            first_source.parent.mkdir()
-            second_source.parent.mkdir()
-            first_source.write_bytes(b"first")
-            second_source.write_bytes(b"second")
-
-            first = persistent_runtime_nand_checkpoint_path(first_source)
-            second = persistent_runtime_nand_checkpoint_path(second_source)
-
-            self.assertNotEqual(first, second)
-            self.assertIn("qemu_nand_persistent", str(first))
-            self.assertIn("qemu_nand_persistent", str(second))
-
-    def test_backend_cleanup_discards_unready_persistent_work_copy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            checkpoint = root / "checkpoint.bin"
-            work = root / "work.bin"
-            disposable = root / "disposable.bin"
-            checkpoint.write_bytes(b"checkpoint")
-            work.write_bytes(b"incomplete")
-            disposable.write_bytes(b"disposable")
-
-            backend = QemuProcessBackend(
-                QemuSystemConfig(persist_nand_writes=True)
-            )
-            backend._runtime_nand_image = work
-            backend._runtime_nand_source = root / "source.bin"
-            backend._runtime_nand_checkpoint = checkpoint
-            backend._runtime_nand_persistent = True
-            backend._cleanup_runtime_nand_locked(commit=True)
-            self.assertTrue(checkpoint.exists())
-            self.assertEqual(checkpoint.read_bytes(), b"checkpoint")
-            self.assertFalse(work.exists())
-            self.assertIsNone(backend._runtime_nand_image)
-            self.assertEqual(backend._runtime_nand_commit_count, 0)
-
-            backend._runtime_nand_image = disposable
-            backend._runtime_nand_persistent = False
-            backend._cleanup_runtime_nand_locked()
-            self.assertFalse(disposable.exists())
-
-    def test_backend_status_exposes_persistent_nand_paths(self) -> None:
-        backend = QemuProcessBackend(
-            QemuSystemConfig(persist_nand_writes=True)
-        )
-        backend._runtime_nand_source = Path("base.bin").resolve()
-        backend._runtime_nand_image = Path("work.bin").resolve()
-        backend._runtime_nand_checkpoint = Path("checkpoint.bin").resolve()
-        backend._runtime_nand_persistent = True
+    def test_backend_status_exposes_direct_active_nand(self) -> None:
+        image = Path("runtime") / "bbk9588_nand.bin"
+        backend = QemuProcessBackend(QemuSystemConfig(nand_image=image))
 
         snapshot = backend.snapshot()
 
-        self.assertTrue(snapshot["nand_writes_persistent"])
-        self.assertEqual(
-            snapshot["nand_runtime_image"],
-            str(Path("work.bin").resolve()),
-        )
-        self.assertEqual(
-            snapshot["nand_checkpoint_image"],
-            str(Path("checkpoint.bin").resolve()),
-        )
-        self.assertEqual(
-            snapshot["nand_source_image"],
-            str(Path("base.bin").resolve()),
-        )
+        self.assertEqual(snapshot["nand_write_mode"], "direct")
+        self.assertEqual(snapshot["nand_image"], str(image.resolve()))
+        self.assertNotIn("nand_runtime_image", snapshot)
+        self.assertNotIn("nand_checkpoint_image", snapshot)
+        self.assertNotIn("nand_writes_persistent", snapshot)
 
-    def test_backend_cleanup_commits_ready_persistent_work_copy(self) -> None:
+    def test_legacy_checkpoint_migrates_once_into_active_nand(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / "source.bin"
-            work = root / "work.bin"
-            checkpoint = root / "checkpoint.bin"
-            source.write_bytes(b"source")
-            work.write_bytes(b"work")
-            backend = QemuProcessBackend(
-                QemuSystemConfig(persist_nand_writes=True)
-            )
-            backend._runtime_nand_source = source
-            backend._runtime_nand_image = work
-            backend._runtime_nand_checkpoint = checkpoint
-            backend._runtime_nand_persistent = True
-            backend.latest_frame_chardev = (1, time.time(), b"frame")
-
-            with mock.patch(
-                "emu.qemu.system.commit_runtime_nand_checkpoint",
-                return_value=checkpoint,
-            ) as commit:
-                backend._cleanup_runtime_nand_locked(commit=True)
-
-            commit.assert_called_once_with(source, work, checkpoint)
-            self.assertEqual(backend._runtime_nand_commit_count, 1)
-            self.assertIsNone(backend._runtime_nand_last_commit_error)
-            self.assertFalse(work.exists())
-
-    def test_backend_cleanup_preserves_work_copy_when_commit_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source.bin"
-            work = root / "work.bin"
-            checkpoint = root / "checkpoint.bin"
-            source.write_bytes(b"source")
-            work.write_bytes(b"user data")
-            backend = QemuProcessBackend(
-                QemuSystemConfig(persist_nand_writes=True)
-            )
-            backend._runtime_nand_source = source
-            backend._runtime_nand_image = work
-            backend._runtime_nand_checkpoint = checkpoint
-            backend._runtime_nand_persistent = True
-            backend.latest_frame_chardev = (1, time.time(), b"frame")
-
-            with mock.patch(
-                "emu.qemu.system.commit_runtime_nand_checkpoint",
-                side_effect=IOError("commit failed"),
-            ):
-                backend._cleanup_runtime_nand_locked(commit=True)
-
-            self.assertTrue(work.exists())
-            self.assertEqual(work.read_bytes(), b"user data")
-            self.assertEqual(backend._runtime_nand_image, work)
-            self.assertIn("commit failed", backend._runtime_nand_last_commit_error or "")
-
-    def test_restore_runtime_nand_checkpoint_removes_only_derived_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "base.bin"
-            source.write_bytes(b"base")
+            active = root / "bbk9588_nand.bin"
+            active.write_bytes(b"\xff" * RAW_BLOCK_SIZE)
+            digest = hashlib.sha1(
+                os.path.normcase(str(active.resolve())).encode("utf-8")
+            ).hexdigest()[:16]
+            checkpoint = root / "runtime" / "qemu_nand_persistent" / f"nand_{digest}.bin"
+            checkpoint.parent.mkdir(parents=True)
+            latest = bytearray(b"\xff" * RAW_BLOCK_SIZE)
+            latest[0] = 0xA5
+            checkpoint.write_bytes(latest)
             old_cwd = Path.cwd()
             try:
                 os.chdir(root)
-                checkpoint = persistent_runtime_nand_checkpoint_path(source)
-                checkpoint.parent.mkdir(parents=True)
-                checkpoint.write_bytes(b"checkpoint")
-                runs = (Path("build") / "qemu_nand_runs").resolve()
-                runs.mkdir(parents=True)
-                work = runs / "work.bin"
-                work.write_bytes(b"work")
-                removed, existed = restore_runtime_nand_checkpoint(
-                    source,
-                    retained_work_path=work,
-                )
+                migrated = migrate_legacy_nand_checkpoint(active)
+                repeated = migrate_legacy_nand_checkpoint(active)
             finally:
                 os.chdir(old_cwd)
 
-            self.assertEqual(removed, checkpoint)
-            self.assertTrue(existed)
+            self.assertEqual(migrated, checkpoint.resolve())
+            self.assertIsNone(repeated)
+            self.assertEqual(active.read_bytes()[0], 0xA5)
             self.assertFalse(checkpoint.exists())
-            self.assertFalse(work.exists())
-            self.assertEqual(source.read_bytes(), b"base")
 
-    def test_restore_runtime_nand_checkpoint_rejects_external_work_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "base.bin"
-            external = root / "external.bin"
-            source.write_bytes(b"base")
-            external.write_bytes(b"keep")
-            old_cwd = Path.cwd()
-            try:
-                os.chdir(root)
-                checkpoint = persistent_runtime_nand_checkpoint_path(source)
-                checkpoint.parent.mkdir(parents=True)
-                checkpoint.write_bytes(b"checkpoint")
-                with self.assertRaisesRegex(ValueError, "outside"):
-                    restore_runtime_nand_checkpoint(
-                        source,
-                        retained_work_path=external,
-                    )
-            finally:
-                os.chdir(old_cwd)
-
-            self.assertTrue(checkpoint.exists())
-            self.assertTrue(external.exists())
-
-    def test_frontend_restore_nand_command_restarts_from_base(self) -> None:
+    def test_frontend_file_manager_targets_selected_active_nand(self) -> None:
         state = FrontendState.__new__(FrontendState)
-        selected = Path("base.bin").resolve()
-        checkpoint = Path("checkpoint.bin").resolve()
-        backend = mock.Mock()
-        backend.snapshot.return_value = {
-            "nand_runtime_image": None,
-            "nand_last_commit_error": None,
-        }
+        selected = Path("runtime") / "bbk9588_nand.bin"
         state.args = argparse.Namespace(nand_image=selected)
-        state.qemu_backend = backend
-        state.stop = mock.Mock(return_value={})  # type: ignore[method-assign]
-        state.reset = mock.Mock(return_value={"running": True})  # type: ignore[method-assign]
 
-        with mock.patch(
-            "emu.web.frontend_state.restore_runtime_nand_checkpoint",
-            return_value=(checkpoint, True),
-        ) as restore:
-            result = state.command({"op": "restore-nand-image"})
-
-        state.stop.assert_called_once_with()
-        state.reset.assert_called_once_with()
-        restore.assert_called_once_with(selected, retained_work_path=None)
-        self.assertTrue(result["nand_restored"])
-        self.assertTrue(result["nand_checkpoint_removed"])
-        self.assertEqual(result["nand_checkpoint_path"], str(checkpoint))
+        self.assertEqual(state._nand_files_image(), selected.resolve())
 
     def test_frontend_storage_trace_command_routes_to_qemu(self) -> None:
         state = FrontendState.__new__(FrontendState)
@@ -6890,16 +6701,19 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(selected[0].get("path"), str(nand.resolve()))
         self.assertEqual(selected[0].get("size"), 4096)
 
-    def test_default_nand_and_checkpoint_live_outside_build_directory(self) -> None:
+    def test_default_active_nand_lives_outside_build_directory(self) -> None:
         self.assertEqual(
             DEFAULT_QEMU_NAND_IMAGE,
             Path("runtime") / "bbk9588_nand.bin",
         )
-        checkpoint = persistent_runtime_nand_checkpoint_path(
-            Path("runtime") / "bbk9588_nand.bin"
-        )
-        self.assertEqual(checkpoint.parent.name, "qemu_nand_persistent")
-        self.assertEqual(checkpoint.parent.parent.name, "runtime")
+
+    def test_explicit_nand_import_discards_only_legacy_checkpoint_state(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "packaging" / "start-web.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"qemu_nand_persistent"', script)
+        self.assertNotIn("qemu_nand_runs", script)
 
     def test_frontend_qemu_backend_status_and_stop(self) -> None:
         if find_qemu() is None:

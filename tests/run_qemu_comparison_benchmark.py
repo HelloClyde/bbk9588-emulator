@@ -31,6 +31,7 @@ def qemu_backend_probe(ns: argparse.Namespace) -> dict[str, object]:
         ram_mb=ns.ram_mb,
         timeout_seconds=ns.qemu_timeout,
         machine=ns.qemu_machine,
+        nand_image=ns.nand_image,
         cpu=ns.qemu_cpu,
         accel=ns.qemu_accel,
         firmware_patches=ns.qemu_firmware_patch,
@@ -61,7 +62,8 @@ def qemu_web_probe(ns: argparse.Namespace) -> dict[str, object]:
         port=port,
         use_existing=False,
         frame_push_min_interval=0.04,
-        nand_image=None,
+        nand_image=ns.nand_image,
+        no_nand=ns.nand_image is None,
         frontend_profile_out=None,
         qemu_extra_arg=[],
         qemu_machine_option=[],
@@ -139,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--boot-mode", choices=["nand", "c200", "uboot"], default="c200")
     ap.add_argument("--qemu", default="qemu-system-mipsel")
+    ap.add_argument(
+        "--nand-image",
+        type=Path,
+        help="Caller-owned writable NAND fixture; omitted for direct boot.",
+    )
     ap.add_argument("--qemu-machine", default="bbk9588")
     ap.add_argument("--qemu-cpu", default="24Kf")
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256")

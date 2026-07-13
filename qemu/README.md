@@ -102,19 +102,15 @@ bin/bbk9588-qemu-system-mipsel.exe
   测试可用 `-global bbk9588-nand.fail-program-block=N` 或
   `-global bbk9588-nand.fail-erase-block=N` 让指定 physical block 的操作返回
   ready+FAIL `0x41` 且保持 backing 不变；默认值禁用故障注入。
-- Web 默认不直接修改基础 NAND。每次运行从 `runtime/qemu_nand_persistent/` 中与基础
-  镜像路径绑定的 canonical checkpoint 创建隔离 work copy；正常停止且已有有效画面
-  时，将 work copy 的最新 OOB logical block view 压实回 checkpoint。这样既保留应用
-  写入，也保持 loader/U-Boot 所需的 canonical boot layout。启动未完成、异常退出或
-  checkpoint 提交失败时不会覆盖上一个可启动 checkpoint；提交失败的 work copy 会
-  保留用于恢复。一次性测试和 probe 默认仍使用并删除 disposable copy。
-  压实过程中，发生变化的 data page 会按数据区 OOB `4+9*n` 重新生成 JZ4740 RS
-  parity，避免新 data 与旧 OOB ECC 不匹配；sequence/logical tag 仍保留 canonical
-  形式，直到固件 FTL 掉电恢复路径完成。
-  构造 OOB logical tag 只写低 16 位，高 16 位保持 `0xffff`，与 C200 page program
-  一致；已有旧 checkpoint 会在复用前原子迁移，避免 first/last-valid-page tail 混用。
-  Web 左侧“↺ 恢复”是唯一删除所选镜像 checkpoint 的默认操作，执行前要求确认；
-  普通 reset/Web 重启只提交或复用 checkpoint，不会恢复基础镜像。
+- Web/QEMU 直接读写调用方传入的唯一活动 raw NAND，drive 使用 writethrough；正常停止、
+  QEMU 崩溃或 Web 重启都不触发 host FTL 压实，也不创建或删除 work copy/checkpoint。
+  测试自行创建临时 NAND fixture，direct-boot probe 默认不挂载 NAND。构造 OOB logical
+  tag 只写低 16 位，高 16 位保持 `0xffff`，与 C200 page program 一致。旧版本 checkpoint
+  仅在升级后的首次启动原子迁移到活动 NAND，迁移后删除。Windows 前端通过
+  kill-on-close Job Object 保证 Web 被强杀时同步结束 QEMU，避免孤儿进程继续写活动镜像。
+- Web 文件管理在 QEMU 停止时直接修改活动 NAND，并对变化 data page 重新生成数据区
+  OOB `4+9*n` RS parity。恢复/更换镜像通过启动器显式导入 `.bin` 或单镜像 ZIP，不保留
+  隐藏基础副本。
 - DMAC 基础 channel 模型：`0xb3020000` 按 JZ4740
   `DSA/DTA/DTC/DRT/DCS/DCM/DDA/DMAC/DIRQP/DDR` 组织 channel
   register，MSC 读写通过 channel enable + global `DMAE` 完成并置

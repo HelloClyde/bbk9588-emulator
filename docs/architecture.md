@@ -81,6 +81,12 @@ LCD scanout 只采用 JZ LCD descriptor source，不再读取固定 guest mirror
 framebuffer fallback。BootROM 的 normal/backup 选择也属于 machine 启动策略，只通过
 raw NAND 的只读 backing API 取 first-stage 数据。
 
+运行层只维护一个调用方明确指定的活动 raw NAND。QEMU 使用 writethrough 直接写该
+文件；Python 不创建 persistent/disposable work copy，也不执行 host canonical FTL
+压实。测试在自己的临时目录管理 fixture，probe 未显式传 NAND 时不挂载介质。Windows
+前端用 kill-on-close Job Object 约束 QEMU 子进程，Web 被强杀时不会留下继续写 NAND
+的孤儿 QEMU。
+
 标准 BBK9588 NAND 镜像存在两种固件原生 OOB ECC 布局：BootROM 和 first-stage boot
 copy 使用 `6+9*n`，U-Boot 常规 C200/FAT NAND 路径使用 `4+9*n`。默认 boot copy 从
 page `0x40` 读取 `0xe0000` bytes，因此 `stamp_nand_ecc.py` 以 page `0x200` 为默认
