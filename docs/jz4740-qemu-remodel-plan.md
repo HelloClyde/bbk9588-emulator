@@ -35,9 +35,9 @@ patch。当前版本已经具备可用的启动、显示、输入和存储路径
 | LCD | controller、descriptor DMA、IRQ 和 BBK panel/status 窗口已拆为独立 QOM device；固定 guest mirror 与 alias scanout 已删除，完整 panel command 细节留作非阻塞研究项 |
 | SADC/Touch/GPIO | SADC、GPIO 已拆为独立 QOM device，当前交互路径基本完成；板级接线真机确认仍未完成 |
 | AIC/I2S/audio codec | 独立 AIC、internal codec、audio DMA、host/Web output 已实现并经用户实际验收；外部板级 route trace 属于非阻塞研究项 |
-| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立；MSC 已与 raw NAND 解耦，USB packet transport、独立可选介质、完整 PM 和剩余 DMA request 仍是缺口 |
+| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立，MSC/DMAC/AIC transport 已进入无 MMIO board bridge；MSC 已与 raw NAND 解耦，USB packet transport、独立可选介质、完整 PM 和剩余 DMA request 仍是缺口 |
 | Python/Web 收敛 | 默认路径已完成，旧诊断代码仍可继续删除 |
-| QEMU 文件结构 | 部分完成，主要 SoC 设备、host output/input bridge 和 storage/input diagnostic recorder 已独立；touch/progress/graphics 诊断及少量 transport glue 仍在 `bbk9588.c` |
+| QEMU 文件结构 | 部分完成，主要 SoC 设备、host output/input、DMA bridge 和全部 diagnostic recorder 已独立；板级 wake、touch GPIO/SADC 接线等 glue 仍在 `bbk9588.c` |
 
 ## 当前阶段优先级
 
@@ -82,16 +82,21 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 
 主要代码位置：
 
-- `qemu/overlay/hw/mips/bbk9588.c`：machine、BootROM 策略、板级连线、MSC 无介质
-  DMA transport，以及尚未迁移的 touch/progress/graphics 板级诊断。
+- `qemu/overlay/hw/mips/bbk9588.c`：machine、BootROM 策略、板级 IRQ/wake/touch
+  连线、progress timer 和诊断所需的板级 wake 快照。
 - `qemu/overlay/hw/display/bbk9588_host_bridge.c`：独立无 MMIO 的 host bridge，负责
   LCD RGB565 scanout、frame/audio/perf chardev、控制台和刷新定时器。
 - `qemu/overlay/hw/input/bbk9588_host_input.c`：独立无 MMIO 的 host input bridge，
   负责 input chardev 生命周期和 `T/K` 文本协议解析，再通过 typed callback 接入
   machine 的 SADC/GPIO 板级连线。
+- `qemu/overlay/hw/dma/bbk9588_dma_bridge.c`：独立无 guest MMIO 的 board transport，
+  连接 MSC command/data、DMAC bulk/AIC endpoint 和 diagnostic sample；machine 不再
+  实现 peripheral ops。DMAC IRQ 保留很薄的 board adapter，以触发 INTC/TCU level
+  重采样，不能机械改成直接 GPIO 接线。
 - `qemu/overlay/hw/misc/bbk9588_diag.c`：独立无 guest MMIO 的 diagnostic recorder，
-  持有 input event ring 以及 storage/MSC/NAND-target/DMAC trace sequence，并把 machine
-  显式提供的 PC、INTC 和 DMAC 快照写入保留的 guest diagnostic RAM。
+  持有 input、storage、MSC、NAND-target、DMAC、touch、progress 和 graphics trace
+  状态；通过显式连接的设备源和 machine 提供的板级 wake 快照写入保留的 guest
+  diagnostic RAM 或输出 panel trace。
 - `qemu/overlay/hw/sd/jz4740_msc.c`：独立 MSC register/response FIFO、command/DMA
   pending、`IREG` 写一清零、`IMASK`/IRQ14、reset、migration 和诊断接口。
 - `qemu/overlay/hw/display/bbk9588_panel.c`：独立 BBK `0xb0043000` panel/status
@@ -549,12 +554,12 @@ underrun/overrun 都为 `0/0`，第二轮没有遗留 DMA completion、rearm 或
 
 ## 结构重构
 
-当前 `bbk9588.c` 约 2270 行。AIC、raw NAND、EMC、MSC、LCD controller、BBK
+当前 `bbk9588.c` 约 1560 行。AIC、raw NAND、EMC、MSC、LCD controller、BBK
 panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 已迁移到
 独立文件；host scanout、frame/audio/perf chardev 也已迁移到独立 host bridge，
 host input chardev/parser 已迁移到独立 input bridge，storage/input recorder 已迁移到
-独立 diagnostic device。machine 仍持有 touch/progress/graphics 板级诊断和 MSC/DMAC
-等设备间 transport glue。
+独立 diagnostic device，MSC/DMAC/AIC transport 已迁移到独立 DMA bridge。machine
+仍持有 IRQ/wake、touch GPIO/SADC 和 BootROM 等真正的板级策略。
 
 - [x] 设备寄存器常量和 helper 已按模块分区，raw NAND 已有独立
   state/MMIO/backing/reset/migration/ops。
@@ -598,8 +603,13 @@ host input chardev/parser 已迁移到独立 input bridge，storage/input record
   决定。
 - [x] 新建 `hw/misc/bbk9588_diag.c`，迁移 input event ring 和
   storage/MSC/NAND-target/DMAC trace sequence/guest RAM recorder；删除全局活动 board
-  指针，PC/INTC/DMAC 状态改由调用方显式快照。
-- [ ] 继续收敛 touch/progress/graphics 诊断和 MSC/DMAC 等剩余设备间 transport glue。
+  指针，PC/INTC/DMAC 状态改由 recorder 的显式连接设备源采样。
+- [x] 将 touch/progress/graphics trace 状态、设备诊断采样、guest RAM writer 和 panel
+  日志 recorder 迁移到 `bbk9588_diag.c`；machine 只保留属性配置、progress timer 和
+  板级 wake 快照。
+- [x] 新建 `hw/dma/bbk9588_dma_bridge.c`，迁移 MSC kick/command/data、DMAC bulk/AIC
+  endpoint 和 diagnostics/trace callback；machine 只创建并连接 bridge。DMAC IRQ
+  仍经 board adapter 更新 INTC 并执行 level 重采样，避免 guest 唤醒后中断忙循环。
 - [ ] 每个设备使用独立 state、MemoryRegion、IRQ input/output、reset 和迁移状态。
 
 拆文件时不要顺手改变行为；先给当前 MMIO 契约加运行时测试，再做机械迁移。
@@ -686,10 +696,18 @@ host input chardev/parser 已迁移到独立 input bridge，storage/input record
     panel qtest 和 224 项非音频回归通过；标准 raw NAND 默认 trace 关闭时 3.5 秒输出
     3 帧，key/touch 4 次输入均成功。开启 trace 后诊断 RAM 实测 storage sequence
     `0x7f6`、input ring count 2，证明 recorder 实际写入。
-27. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
+27. [x] 将 touch/progress/graphics trace 的状态、序号、设备诊断采样和 guest RAM/log
+    recorder 收敛到 `bbk9588-diag`；machine 只传入显式设备源和板级 wake 快照，默认
+    trace 关闭时 guest 行为不变。
+28. [x] 将 MSC command/data、DMAC bulk/AIC endpoint 和 diagnostics callback 迁入独立
+    无 guest MMIO 的 `bbk9588-dma-bridge`，machine 不再持有 peripheral ops。DMAC IRQ
+    保留 board adapter；直接连接 INTC GPIO 会在输入唤醒后留下持续 pending，实测造成
+    单核 100% 中断忙循环。Windows QEMU 构建、226 项系统测试和单一活动 raw NAND Web
+    冷启动、按键、触摸回归通过。
+29. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
     正常 10-block remap raw 重启、单-block pre-commit 回退及 raw NAND FAIL qtest 已通过；
     仍缺多-block 提交边界、垃圾回收、sequence wrap 和物理故障下的 guest 恢复。
-28. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
+30. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
 
 ## 关键验收清单
 

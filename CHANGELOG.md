@@ -19,7 +19,13 @@
   guest MMIO 的 `bbk9588_host_input`；machine 只保留 GPIO/SADC 板级回调。
 - 将 input event ring 以及 storage/MSC/NAND-target/DMAC trace 的 sequence 和 guest RAM
   recorder 迁移到独立、无 guest MMIO 的 `bbk9588_diag`；删除 machine 全局活动实例
-  指针，调用方改为显式传递 PC、INTC 和 DMAC 快照。诊断默认仍关闭。
+  指针，recorder 改为从显式连接的 CPU/INTC/DMAC 源采样。诊断默认仍关闭。
+- 将 touch/progress/graphics trace 的开关、序号、设备快照和 guest RAM/log recorder
+  迁移到 `bbk9588_diag`；machine 只保留诊断启动属性、progress timer 和板级 wake
+  快照连线，不再直接写 touch/progress 诊断内存或格式化 panel trace。
+- 新增无 guest MMIO 的 `bbk9588_dma_bridge`，迁移 MSC command/data、DMAC bulk、AIC
+  endpoint 和相关诊断 callback；machine 不再持有 peripheral ops。DMAC IRQ 保留板级
+  INTC/TCU level 重采样 adapter，避免输入唤醒后持续 pending 导致单核满载。
 - 还原 U-Boot/C200 FTL cold-scan 的 last-valid-page、完整 6-byte tail 和 16-bit 环形
   sequence 规则，新增共享 parser、严格镜像审计和 commit-tail 掉电注入工具。修正构造
   镜像 logical tag 高半字：C200 只写低 16 位，高半字必须保持 `0xffff`；旧 checkpoint

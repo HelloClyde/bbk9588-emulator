@@ -31,6 +31,7 @@
 #include "hw/display/bbk9588_host_bridge.h"
 #include "hw/display/bbk9588_panel.h"
 #include "hw/display/jz4740_lcd.h"
+#include "hw/dma/bbk9588_dma_bridge.h"
 #include "hw/dma/jz4740_dmac.h"
 #include "hw/gpio/jz4740_gpio.h"
 #include "hw/input/bbk9588_host_input.h"
@@ -70,18 +71,9 @@
 #define BBK9588_LCD_BYTES          (BBK9588_LCD_STRIDE * BBK9588_LCD_HEIGHT)
 #define BBK9588_LCD_VBLANK_PERIOD_MS 33
 #define BBK9588_GUI_EVENT_OBJ_OFF  0xf0u
-#define BBK9588_AIC_DATA_PHYS      0x10020034u
-#define BBK9588_DIAG_VA            0x89f00000u
-#define BBK9588_TOUCH_TRACE_VA     (BBK9588_DIAG_VA + 0x0100u)
-#define BBK9588_TOUCH_TRACE_MAGIC  0x54434b42u
 #define BBK9588_NAND_READ_SOURCE_RUNTIME 1u
 #define BBK9588_NAND_READ_REQUEST_BLANK 8u
 #define BBK9588_NAND_READ_FINAL_BLANK 16u
-#define BBK9588_PROGRESS_TRACE_VA  (BBK9588_DIAG_VA + 0x0500u)
-#define BBK9588_PROGRESS_TRACE_MAGIC 0x50544b42u
-#define BBK9588_PROGRESS_TRACE_SLOTS 8u
-#define BBK9588_PROGRESS_TRACE_WORDS 12u
-#define BBK9588_PROGRESS_TRACE_HEADER_WORDS 4u
 #define BBK9588_NAND_TARGET_BLOCK 0x2540u
 #define BBK9588_NAND_TARGET_PAGE 0x256au
 #define BBK9588_NAND_TARGET_EVENT_ERASE 1u
@@ -96,11 +88,6 @@
 #define KSEG1_TO_PHYS(addr)        ((addr) & 0x1fffffff)
 
 typedef struct Bbk9588MachineState Bbk9588MachineState;
-
-static void bbk9588_dmac_trace_sample(void *opaque, uint32_t event,
-                                      unsigned channel, hwaddr offset,
-                                      uint32_t value);
-static uint32_t bbk9588_ldl_le(const uint8_t *p);
 
 struct Bbk9588MachineState {
     MachineState parent_obj;
@@ -132,6 +119,7 @@ struct Bbk9588MachineState {
     JZ4740EMCState *emc;
     JZ4740CIMState *cim;
     JZ4740CPMState *cpm;
+    Bbk9588DMABridgeState *dma_bridge;
     JZ4740DMACState *dmac;
     JZ4740MSCState *msc;
     JZ4740GPIOState *gpio;
@@ -146,12 +134,9 @@ struct Bbk9588MachineState {
     uint32_t sysctrl_wake_count;
     Bbk9588NandState *nand_dev;
     bool storage_trace_enabled;
-    bool graphics_trace_enabled;
-    bool touch_trace_enabled;
-    uint32_t graphics_trace_count;
-    bool progress_trace_enabled;
-    uint32_t progress_trace_seq;
-    uint32_t nand_ready_raise_count;
+    bool graphics_trace;
+    bool touch_trace;
+    bool progress_trace;
     char *input_chardev;
     char *frame_chardev;
     char *nand_image;
@@ -175,30 +160,8 @@ static void bbk9588_queue_input_event(Bbk9588MachineState *board,
 static void bbk9588_key_apply_host_input(void *opaque, uint32_t key_code,
                                          bool down);
 static void bbk9588_update_irq(Bbk9588MachineState *board);
-static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
-                                       uint32_t reason);
-static void bbk9588_progress_trace_sample(Bbk9588MachineState *board,
-                                          uint32_t reason);
-static void bbk9588_phys_write_le32(hwaddr addr, uint32_t value);
-
-static void bbk9588_phys_read(hwaddr addr, void *buf, hwaddr len)
-{
-    cpu_physical_memory_read(BBK9588_KSEG_TO_PHYS(addr), buf, len);
-}
-
-static uint32_t bbk9588_phys_read_le32(hwaddr addr)
-{
-    uint8_t buf[4];
-
-    bbk9588_phys_read(addr, buf, sizeof(buf));
-    return buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
-}
-
-static uint32_t bbk9588_cpu_pc(Bbk9588MachineState *board)
-{
-    return board && board->cpu ?
-           board->cpu->env.active_tc.PC & 0xffffffffu : 0;
-}
+static void bbk9588_touch_diag_record(Bbk9588MachineState *board,
+                                      uint32_t reason);
 
 static void bbk9588_wake_cpu(Bbk9588MachineState *board)
 {
@@ -263,7 +226,7 @@ static void bbk9588_drive_cpu_irq(Bbk9588MachineState *board)
         board->intc_last_cp0_status = board->cpu->env.CP0_Status;
         board->intc_last_cp0_cause = board->cpu->env.CP0_Cause;
     }
-    bbk9588_touch_trace_update(board, 0x51);
+    bbk9588_touch_diag_record(board, 0x51);
     if (board->intc_resample_timer) {
         if (level && board->cpu_irq_output_enabled) {
             timer_mod(board->intc_resample_timer,
@@ -314,9 +277,9 @@ static void bbk9588_nand_raise_ready(Bbk9588MachineState *board)
     if (!board) {
         return;
     }
-    board->nand_ready_raise_count++;
+    bbk9588_diag_note_nand_ready(board->diag);
     jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C, 0x40000000u);
-    bbk9588_touch_trace_update(board, 0x52);
+    bbk9588_touch_diag_record(board, 0x52);
 }
 
 static void bbk9588_progress_trace_schedule(Bbk9588MachineState *board)
@@ -328,70 +291,6 @@ static void bbk9588_progress_trace_schedule(Bbk9588MachineState *board)
     timer_mod(board->progress_trace_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
               board->progress_trace_period_ms);
-}
-
-static bool bbk9588_guest_ram_va_valid(uint32_t va, uint32_t size)
-{
-    uint32_t phys = BBK9588_KSEG_TO_PHYS(va);
-
-    return (va & 0xe0000000u) == 0x80000000u &&
-           size <= BBK9588_RAM_SIZE &&
-           phys <= BBK9588_RAM_SIZE - size;
-}
-
-static void bbk9588_progress_trace_sample(Bbk9588MachineState *board,
-                                          uint32_t reason)
-{
-    JZ4740TCUDiagnostics tcu_diag;
-    uint32_t base = BBK9588_PROGRESS_TRACE_VA;
-    uint32_t total_size = (BBK9588_PROGRESS_TRACE_HEADER_WORDS +
-                           BBK9588_PROGRESS_TRACE_SLOTS *
-                           BBK9588_PROGRESS_TRACE_WORDS) * 4;
-    uint32_t seq;
-    uint32_t slot;
-    uint32_t entry;
-    uint32_t pc = 0;
-    uint32_t cause = 0;
-    uint32_t status = 0;
-
-    if (!board || !board->progress_trace_enabled ||
-        !bbk9588_guest_ram_va_valid(base, total_size)) {
-        return;
-    }
-
-    if (board->cpu) {
-        CPUMIPSState *env = &board->cpu->env;
-
-        pc = env->active_tc.PC & 0xffffffffu;
-        cause = env->CP0_Cause;
-        status = env->CP0_Status;
-    }
-    jz4740_tcu_get_diagnostics(board->tcu, &tcu_diag);
-
-    seq = ++board->progress_trace_seq;
-    slot = (seq - 1) % BBK9588_PROGRESS_TRACE_SLOTS;
-    entry = base + (BBK9588_PROGRESS_TRACE_HEADER_WORDS +
-                    slot * BBK9588_PROGRESS_TRACE_WORDS) * 4;
-
-    bbk9588_phys_write_le32(base + 0x00, BBK9588_PROGRESS_TRACE_MAGIC);
-    bbk9588_phys_write_le32(base + 0x04, seq);
-    bbk9588_phys_write_le32(base + 0x08, slot);
-    bbk9588_phys_write_le32(base + 0x0c, BBK9588_PROGRESS_TRACE_SLOTS);
-
-    bbk9588_phys_write_le32(entry + 0x00, seq);
-    bbk9588_phys_write_le32(entry + 0x04, reason);
-    bbk9588_phys_write_le32(entry + 0x08, pc);
-    bbk9588_phys_write_le32(entry + 0x0c,
-                            jz4740_intc_pending(board->intc));
-    bbk9588_phys_write_le32(entry + 0x10,
-                            jz4740_intc_mask(board->intc));
-    bbk9588_phys_write_le32(entry + 0x14, tcu_diag.pending_mask);
-    bbk9588_phys_write_le32(entry + 0x18, bbk9588_phys_read_le32(0x804bf440));
-    bbk9588_phys_write_le32(entry + 0x1c, bbk9588_phys_read_le32(0x804bf444));
-    bbk9588_phys_write_le32(entry + 0x20, bbk9588_phys_read_le32(0x80473f08));
-    bbk9588_phys_write_le32(entry + 0x24, bbk9588_phys_read_le32(0x80473f38));
-    bbk9588_phys_write_le32(entry + 0x28, cause);
-    bbk9588_phys_write_le32(entry + 0x2c, status);
 }
 
 static void bbk9588_queue_input_event(Bbk9588MachineState *board,
@@ -475,7 +374,7 @@ static void bbk9588_progress_trace_timer_cb(void *opaque)
 {
     Bbk9588MachineState *board = opaque;
 
-    bbk9588_progress_trace_sample(board, 2);
+    bbk9588_diag_progress_record(board->diag, 2);
 
     bbk9588_progress_trace_schedule(board);
 }
@@ -617,23 +516,6 @@ static void bbk9588_create_emc_device(Bbk9588MachineState *board)
         board->emc, bbk9588_emc_board_write, board);
 }
 
-
-static void bbk9588_phys_write(hwaddr addr, const void *buf, hwaddr len)
-{
-    cpu_physical_memory_write(BBK9588_KSEG_TO_PHYS(addr), buf, len);
-}
-
-static void bbk9588_phys_write_le32(hwaddr addr, uint32_t value)
-{
-    uint8_t buf[4] = {
-        value & 0xff,
-        (value >> 8) & 0xff,
-        (value >> 16) & 0xff,
-        (value >> 24) & 0xff,
-    };
-
-    bbk9588_phys_write(addr, buf, sizeof(buf));
-}
 
 static bool bbk9588_bootrom_nand_page_valid(Bbk9588NandState *nand,
                                             uint64_t page)
@@ -923,184 +805,6 @@ static bool bbk9588_bootrom_load_from_nand(Bbk9588MachineState *board)
     exit(1);
 }
 
-static uint32_t bbk9588_ldl_le(const uint8_t *p)
-{
-    return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
-}
-
-static void bbk9588_msc_kick_dmac(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-
-    if (board->dmac) {
-        jz4740_dmac_kick(board->dmac);
-    }
-}
-
-static void bbk9588_msc_command(void *opaque, uint32_t command,
-                                uint32_t argument)
-{
-    Bbk9588MachineState *board = opaque;
-
-    bbk9588_diag_msc_record(
-        board->diag, BBK9588_DIAG_MSC_COMMAND, argument >> 9,
-        0, 0, command, argument, 0, bbk9588_cpu_pc(board));
-}
-
-static bool bbk9588_msc_dma_transfer(Bbk9588MachineState *board,
-                                     unsigned channel, uint32_t source,
-                                     uint32_t target, uint32_t words)
-{
-    JZ4740MSCDMATransfer transfer;
-    uint8_t *buf;
-    bool ok = true;
-
-    if (!board->msc ||
-        !jz4740_msc_begin_dma(board->msc, channel, source, target, words,
-                              &transfer)) {
-        return false;
-    }
-    bbk9588_diag_storage_record(
-        board->diag, BBK9588_DIAG_STORAGE_DMAC_TRANSFER |
-        (transfer.read ? 1u : 2u),
-        transfer.words, transfer.dma_phys);
-    if (transfer.bytes == 0) {
-        jz4740_msc_finish_dma(board->msc, false);
-        return true;
-    }
-    if (transfer.sectors == 0 || transfer.sectors > 128) {
-        return false;
-    }
-
-    buf = g_malloc0(transfer.sectors * 512u);
-    if (transfer.read) {
-        /* No removable MSC medium is attached by default. */
-        bbk9588_diag_msc_record(
-            board->diag, BBK9588_DIAG_MSC_READ,
-            transfer.lba, transfer.dma_phys, transfer.bytes,
-            transfer.command, transfer.argument,
-            ok ? bbk9588_ldl_le(buf) : 0xffffffffu,
-            bbk9588_cpu_pc(board));
-        if (ok) {
-            cpu_physical_memory_write(
-                transfer.dma_phys, buf,
-                MIN(transfer.bytes, transfer.sectors * 512u));
-        }
-    } else {
-        cpu_physical_memory_read(
-            transfer.dma_phys, buf,
-            MIN(transfer.bytes, transfer.sectors * 512u));
-        bbk9588_diag_msc_record(
-            board->diag, BBK9588_DIAG_MSC_WRITE,
-            transfer.lba, transfer.dma_phys, transfer.bytes,
-            transfer.command, transfer.argument, bbk9588_ldl_le(buf),
-            bbk9588_cpu_pc(board));
-    }
-    jz4740_msc_finish_dma(board->msc, ok);
-    g_free(buf);
-    return true;
-}
-
-static void bbk9588_dmac_trace_sample(void *opaque, uint32_t event,
-                                      unsigned channel, hwaddr offset,
-                                      uint32_t value)
-{
-    Bbk9588MachineState *board = opaque;
-    uint32_t channel_regs[7];
-
-    if (!board || !board->storage_trace_enabled) {
-        return;
-    }
-
-    channel_regs[0] = jz4740_dmac_get_reg(board->dmac, 0x304);
-    channel_regs[1] = jz4740_dmac_get_reg(board->dmac, 0x50);
-    channel_regs[2] = jz4740_dmac_get_reg(board->dmac, 0x54);
-    channel_regs[3] = jz4740_dmac_get_reg(board->dmac, 0x48);
-    channel_regs[4] = jz4740_dmac_get_reg(board->dmac, 0x70);
-    channel_regs[5] = jz4740_dmac_get_reg(board->dmac, 0x74);
-    channel_regs[6] = jz4740_dmac_get_reg(board->dmac, 0x68);
-    bbk9588_diag_dmac_record(
-        board->diag, event, channel, offset, value, bbk9588_cpu_pc(board),
-        jz4740_intc_pending(board->intc), jz4740_intc_mask(board->intc),
-        channel_regs);
-}
-
-static bool bbk9588_dmac_bulk_transfer(void *opaque, unsigned channel,
-                                       uint32_t request, uint32_t source,
-                                       uint32_t target, uint32_t count,
-                                       uint32_t command)
-{
-    return bbk9588_msc_dma_transfer(opaque, channel, source, target, count);
-}
-
-static bool bbk9588_dmac_endpoint_address_valid(void *opaque,
-                                                unsigned request,
-                                                uint32_t address)
-{
-    return (request == JZ4740_DMAC_REQUEST_AIC_TX ||
-            request == JZ4740_DMAC_REQUEST_AIC_RX) &&
-           BBK9588_KSEG_TO_PHYS(address) == BBK9588_AIC_DATA_PHYS;
-}
-
-static size_t bbk9588_dmac_endpoint_write(void *opaque, unsigned request,
-                                          const uint8_t *buf, size_t bytes,
-                                          unsigned width)
-{
-    Bbk9588MachineState *board = opaque;
-
-    if (!board->aic || request != JZ4740_DMAC_REQUEST_AIC_TX) {
-        return 0;
-    }
-    return jz4740_aic_dma_write_tx(board->aic, buf, bytes, width);
-}
-
-static size_t bbk9588_dmac_endpoint_read(void *opaque, unsigned request,
-                                         uint8_t *buf, size_t bytes,
-                                         unsigned width)
-{
-    Bbk9588MachineState *board = opaque;
-
-    if (!board->aic || request != JZ4740_DMAC_REQUEST_AIC_RX) {
-        return 0;
-    }
-    return jz4740_aic_dma_read_rx(board->aic, buf, bytes, width);
-}
-
-static void bbk9588_dmac_endpoint_complete(void *opaque, unsigned request)
-{
-    Bbk9588MachineState *board = opaque;
-
-    if (board->aic && request == JZ4740_DMAC_REQUEST_AIC_TX) {
-        jz4740_aic_notify_tx_dma_boundary(board->aic);
-    }
-}
-
-static void bbk9588_dmac_endpoint_diagnostics(
-    void *opaque, unsigned request,
-    JZ4740DMACEndpointDiagnostics *diagnostics)
-{
-    Bbk9588MachineState *board = opaque;
-    JZ4740AICDiagnostics aic;
-
-    if (!board->aic) {
-        return;
-    }
-    jz4740_aic_get_diagnostics(board->aic, &aic);
-    diagnostics->underruns = aic.underruns;
-    diagnostics->fifo_level = request == JZ4740_DMAC_REQUEST_AIC_RX ?
-                              aic.rx_fifo_level : aic.tx_fifo_level;
-}
-
-static const JZ4740DMACPeripheralOps bbk9588_dmac_peripheral_ops = {
-    .bulk_transfer = bbk9588_dmac_bulk_transfer,
-    .address_valid = bbk9588_dmac_endpoint_address_valid,
-    .write = bbk9588_dmac_endpoint_write,
-    .read = bbk9588_dmac_endpoint_read,
-    .complete = bbk9588_dmac_endpoint_complete,
-    .get_diagnostics = bbk9588_dmac_endpoint_diagnostics,
-    .trace = bbk9588_dmac_trace_sample,
-};
-
 static void bbk9588_dmac_irq_handler(void *opaque, int n, int level)
 {
     Bbk9588MachineState *board = opaque;
@@ -1142,207 +846,23 @@ static void bbk9588_touch_sync_latch(Bbk9588MachineState *board)
     (void)board;
 }
 
-static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
-                                        uint32_t reason)
+static void bbk9588_touch_diag_record(Bbk9588MachineState *board,
+                                      uint32_t reason)
 {
-    JZ4740GPIODiagnostics gpio_diag;
-    JZ4740INTCDiagnostics intc_diag;
-    JZ4740EMCDiagnostics emc_diag;
-    Bbk9588NandDiagnostics nand_diag;
-    JZ4740MSCDiagnostics msc_diag;
-    JZ4740SADCDiagnostics sadc_diag;
-    JZ4740TCUDiagnostics tcu_diag;
+    Bbk9588DiagBoardSnapshot snapshot = {
+        .intc_last_cp0_status = board->intc_last_cp0_status,
+        .intc_last_cp0_cause = board->intc_last_cp0_cause,
+        .extgpio_wake_enable = board->extgpio_wake_enable_80,
+        .sysctrl_wake_count = board->sysctrl_wake_count,
+        .sysctrl_wake_pending = board->sysctrl_wake_pending,
+    };
 
-    if (!board || !board->touch_trace_enabled ||
-        !bbk9588_guest_ram_va_valid(BBK9588_TOUCH_TRACE_VA, 0x154)) {
-        return;
-    }
-
-    uint32_t pc = board->cpu ? board->cpu->env.active_tc.PC : 0;
-
-    jz4740_gpio_get_diagnostics(board->gpio, &gpio_diag);
-    jz4740_intc_get_diagnostics(board->intc, &intc_diag);
-    jz4740_emc_get_diagnostics(board->emc, &emc_diag);
-    bbk9588_nand_get_diagnostics(board->nand_dev, &nand_diag);
-    jz4740_msc_get_diagnostics(board->msc, &msc_diag);
-    jz4740_sadc_get_diagnostics(board->sadc, &sadc_diag);
-    jz4740_tcu_get_diagnostics(board->tcu, &tcu_diag);
-
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x00,
-                            BBK9588_TOUCH_TRACE_MAGIC);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x04, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x08, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x0c, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x10,
-                            sadc_diag.touch_down ? 1u : 0u);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x14,
-                            sadc_diag.touch_raw_x);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x18,
-                            sadc_diag.touch_raw_y);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x1c,
-                            sadc_diag.status);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x20,
-                            sadc_diag.next_axis);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x24,
-                            intc_diag.pending);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x28, pc);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x2c, reason);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x30,
-                            sadc_diag.conversion_events_remaining);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x34,
-                            sadc_diag.control);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x38,
-                            sadc_diag.last_read_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x3c,
-                            sadc_diag.last_read_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x40,
-                            sadc_diag.last_write_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x44,
-                            sadc_diag.last_write_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x48,
-                            gpio_diag.last_read_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x4c,
-                            gpio_diag.last_read_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x50,
-                            gpio_diag.last_flag_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x54,
-                            gpio_diag.last_flag_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x58,
-                            intc_diag.mask);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x5c,
-                            tcu_diag.enabled_mask);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x60,
-                            tcu_diag.pending_mask);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x64,
-                            tcu_diag.compare[0]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x68,
-                            tcu_diag.compare[1]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x6c,
-                            tcu_diag.period_ms[0]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x70,
-                            tcu_diag.period_ms[1]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x74,
-                            (uint32_t)(tcu_diag.deadline_ns[0] / SCALE_MS));
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x78,
-                            (uint32_t)(tcu_diag.deadline_ns[1] / SCALE_MS));
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x7c,
-                            intc_diag.unmasked_pending);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x80,
-                            intc_diag.output_level);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x84,
-                            intc_diag.update_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x88,
-                            board->intc_last_cp0_status);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x8c,
-                            board->intc_last_cp0_cause);
-    if (board->cpu) {
-        CPUState *cs = CPU(board->cpu);
-
-        bbk9588_phys_write_le32(
-            BBK9588_TOUCH_TRACE_VA + 0x90,
-            board->cpu->env.bbk9588_irq_ip2_level ? 1u : 0u);
-        bbk9588_phys_write_le32(
-            BBK9588_TOUCH_TRACE_VA + 0x94,
-            (uint32_t)cs->interrupt_request);
-    }
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x98,
-                            intc_diag.last_read_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x9c,
-                            intc_diag.last_read_value);
-    if (board->dmac) {
-        bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x144,
-                                jz4740_dmac_get_reg(board->dmac, 0x304));
-        bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x148,
-                                jz4740_dmac_get_reg(board->dmac, 0x70));
-        bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x14c,
-                                jz4740_dmac_get_reg(board->dmac, 0x74));
-        bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x150,
-                                jz4740_dmac_get_reg(board->dmac, 0x68));
-    }
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xa0,
-                            intc_diag.last_write_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xa4,
-                            intc_diag.last_write_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xa8, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xac, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xb0,
-                            tcu_diag.last_read_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xb4,
-                            tcu_diag.last_read_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xb8,
-                            tcu_diag.last_write_offset);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xbc,
-                            tcu_diag.last_write_value);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xc0,
-                            tcu_diag.irq_raise_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xc4, 0);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xc8,
-                            msc_diag.read_pending ? 1u : 0u);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xcc,
-                            msc_diag.write_pending ? 1u : 0u);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xd0,
-                            msc_diag.data_ready ? 1u : 0u);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xd4,
-                            msc_diag.read_lba);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xd8,
-                            msc_diag.write_lba);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xdc,
-                            msc_diag.dma_complete_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xe0,
-                            msc_diag.last_command);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xe4,
-                            msc_diag.last_argument);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xe8,
-                            msc_diag.last_dma_phys);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xec,
-                            msc_diag.last_dma_words);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xf0,
-                            board->nand_ready_raise_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xf4,
-                            nand_diag.page_read_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xf8,
-                            nand_diag.program_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0xfc,
-                            nand_diag.erase_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x100,
-                            nand_diag.command);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x104,
-                            nand_diag.last_page);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x108,
-                            nand_diag.last_column);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x10c,
-                            nand_diag.last_block);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x110,
-                            nand_diag.busy_reads);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x114,
-                            emc_diag.nfints);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x118,
-                            nand_diag.address_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x11c,
-                            gpio_diag.flag[JZ4740_GPIO_PORT_C]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x120,
-                            jz4740_cpm_clkgr_wake_mask(board->cpm));
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x124,
-                            jz4740_cpm_scr_wake_mask(board->cpm));
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x128,
-                            board->extgpio_wake_enable_80);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x12c,
-                            board->sysctrl_wake_pending ? 1u : 0u);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x130,
-                            board->sysctrl_wake_count);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x134,
-                            tcu_diag.irq_mask);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x138,
-                            tcu_diag.compare[4]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x13c,
-                            tcu_diag.period_ms[4]);
-    bbk9588_phys_write_le32(BBK9588_TOUCH_TRACE_VA + 0x140,
-                            (uint32_t)(tcu_diag.deadline_ns[4] / SCALE_MS));
+    bbk9588_diag_touch_record(board->diag, reason, &snapshot);
 }
 
 static void bbk9588_sadc_trace(void *opaque, uint32_t reason)
 {
-    bbk9588_touch_trace_update(opaque, reason);
+    bbk9588_touch_diag_record(opaque, reason);
 }
 
 static void bbk9588_touch_set_state(Bbk9588MachineState *board,
@@ -1358,7 +878,7 @@ static void bbk9588_touch_set_state(Bbk9588MachineState *board,
 
 static void bbk9588_gpio_trace(void *opaque, uint32_t reason)
 {
-    bbk9588_touch_trace_update(opaque, reason);
+    bbk9588_touch_diag_record(opaque, reason);
 }
 
 static uint32_t bbk9588_gpio_sample_input(void *opaque, unsigned port,
@@ -1383,56 +903,6 @@ static uint32_t bbk9588_gpio_sample_input(void *opaque, unsigned port,
     return level;
 }
 
-static void bbk9588_panel_trace_write(void *opaque, hwaddr offset,
-                                      uint64_t value, unsigned size)
-{
-    Bbk9588MachineState *board = opaque;
-    JZ4740LCDDiagnostics lcd;
-
-    if (!board || !board->graphics_trace_enabled) {
-        return;
-    }
-    if (board->graphics_trace_count++ >= 4096) {
-        return;
-    }
-    jz4740_lcd_get_diagnostics(board->lcd, &lcd);
-    error_report(
-        "bbk9588-panel[%u] off=0x%04" HWADDR_PRIx
-        " size=%u value=0x%08" PRIx64
-        " r0000=0x%08x r0004=0x%08x r0008=0x%08x r000c=0x%08x"
-        " r0010=0x%08x r0014=0x%08x r0018=0x%08x r001c=0x%08x"
-        " r0020=0x%08x r0024=0x%08x r0028=0x%08x r002c=0x%08x"
-        " r0030=0x%08x r0034=0x%08x r0038=0x%08x r003c=0x%08x"
-        " r0040=0x%08x r0044=0x%08x r0048=0x%08x r004c=0x%08x"
-        " lcd_desc=0x%08x lcd_fb=0x%08x lcd_source=%u",
-        board->graphics_trace_count - 1,
-        offset,
-        size,
-        value,
-        bbk9588_panel_get_reg(board->panel, 0x0000),
-        bbk9588_panel_get_reg(board->panel, 0x0004),
-        bbk9588_panel_get_reg(board->panel, 0x0008),
-        bbk9588_panel_get_reg(board->panel, 0x000c),
-        bbk9588_panel_get_reg(board->panel, 0x0010),
-        bbk9588_panel_get_reg(board->panel, 0x0014),
-        bbk9588_panel_get_reg(board->panel, 0x0018),
-        bbk9588_panel_get_reg(board->panel, 0x001c),
-        bbk9588_panel_get_reg(board->panel, 0x0020),
-        bbk9588_panel_get_reg(board->panel, 0x0024),
-        bbk9588_panel_get_reg(board->panel, 0x0028),
-        bbk9588_panel_get_reg(board->panel, 0x002c),
-        bbk9588_panel_get_reg(board->panel, 0x0030),
-        bbk9588_panel_get_reg(board->panel, 0x0034),
-        bbk9588_panel_get_reg(board->panel, 0x0038),
-        bbk9588_panel_get_reg(board->panel, 0x003c),
-        bbk9588_panel_get_reg(board->panel, 0x0040),
-        bbk9588_panel_get_reg(board->panel, 0x0044),
-        bbk9588_panel_get_reg(board->panel, 0x0048),
-        bbk9588_panel_get_reg(board->panel, 0x004c),
-        lcd.descriptor_address,
-        lcd.framebuffer_address,
-        lcd.frame_source_kind);
-}
 
 static void bbk9588_create_aic_device(MachineState *machine,
                                       Bbk9588MachineState *board)
@@ -1473,6 +943,29 @@ static void bbk9588_create_diag_device(Bbk9588MachineState *board)
     board->diag = BBK9588_DIAG(dev);
     bbk9588_diag_set_storage_enabled(board->diag,
                                      board->storage_trace_enabled);
+    bbk9588_diag_set_graphics_enabled(board->diag, board->graphics_trace);
+    bbk9588_diag_set_touch_enabled(board->diag, board->touch_trace);
+    bbk9588_diag_set_progress_enabled(board->diag, board->progress_trace);
+}
+
+static void bbk9588_connect_diag_sources(Bbk9588MachineState *board)
+{
+    Bbk9588DiagSources sources = {
+        .cpu = CPU(board->cpu),
+        .nand = board->nand_dev,
+        .panel = board->panel,
+        .cpm = board->cpm,
+        .dmac = board->dmac,
+        .emc = board->emc,
+        .gpio = board->gpio,
+        .intc = board->intc,
+        .lcd = board->lcd,
+        .msc = board->msc,
+        .sadc = board->sadc,
+        .tcu = board->tcu,
+    };
+
+    bbk9588_diag_connect_sources(board->diag, &sources);
 }
 
 static void bbk9588_create_host_bridge(Bbk9588MachineState *board)
@@ -1579,8 +1072,6 @@ static void bbk9588_create_lcd_device(MachineState *machine,
                        qdev_get_gpio_in(DEVICE(board->intc),
                                         JZ4740_INTC_IRQ_LCD));
     board->lcd = JZ4740_LCD(dev);
-    jz4740_lcd_set_trace_enabled(board->lcd,
-                                  board->graphics_trace_enabled);
 }
 
 static void bbk9588_create_panel_device(Bbk9588MachineState *board)
@@ -1592,7 +1083,7 @@ static void bbk9588_create_panel_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0043000u));
     board->panel = BBK9588_PANEL(dev);
     bbk9588_panel_set_write_callback(
-        board->panel, bbk9588_panel_trace_write, board);
+        board->panel, bbk9588_diag_panel_write, board->diag);
 }
 
 static void bbk9588_create_sadc_device(Bbk9588MachineState *board)
@@ -1684,8 +1175,6 @@ static void bbk9588_create_dmac_device(MachineState *machine,
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3020000u));
     sysbus_connect_irq(sbd, 0, board->dmac_irq);
     board->dmac = JZ4740_DMAC(dev);
-    jz4740_dmac_set_peripheral_ops(board->dmac,
-                                   &bbk9588_dmac_peripheral_ops, board);
 }
 
 static void bbk9588_create_msc_device(Bbk9588MachineState *board)
@@ -1699,8 +1188,16 @@ static void bbk9588_create_msc_device(Bbk9588MachineState *board)
                        qdev_get_gpio_in(DEVICE(board->intc),
                                         JZ4740_INTC_IRQ_MSC));
     board->msc = JZ4740_MSC(dev);
-    jz4740_msc_set_kick_callback(board->msc, bbk9588_msc_kick_dmac, board);
-    jz4740_msc_set_command_callback(board->msc, bbk9588_msc_command, board);
+}
+
+static void bbk9588_create_dma_bridge(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_BBK9588_DMA_BRIDGE);
+
+    qdev_realize(dev, NULL, &error_fatal);
+    board->dma_bridge = BBK9588_DMA_BRIDGE(dev);
+    bbk9588_dma_bridge_connect(board->dma_bridge, board->dmac, board->msc,
+                               board->aic, board->diag);
 }
 
 static void bbk9588_cpu_reset(void *opaque)
@@ -1833,7 +1330,7 @@ static bool bbk9588_get_graphics_trace(Object *obj, Error **errp)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    return board->graphics_trace_enabled;
+    return board->graphics_trace;
 }
 
 static void bbk9588_set_graphics_trace(Object *obj, bool value,
@@ -1841,15 +1338,15 @@ static void bbk9588_set_graphics_trace(Object *obj, bool value,
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    board->graphics_trace_enabled = value;
-    jz4740_lcd_set_trace_enabled(board->lcd, value);
+    board->graphics_trace = value;
+    bbk9588_diag_set_graphics_enabled(board->diag, value);
 }
 
 static bool bbk9588_get_touch_trace(Object *obj, Error **errp)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    return board->touch_trace_enabled;
+    return board->touch_trace;
 }
 
 static void bbk9588_set_touch_trace(Object *obj, bool value,
@@ -1857,14 +1354,15 @@ static void bbk9588_set_touch_trace(Object *obj, bool value,
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    board->touch_trace_enabled = value;
+    board->touch_trace = value;
+    bbk9588_diag_set_touch_enabled(board->diag, value);
 }
 
 static bool bbk9588_get_progress_trace(Object *obj, Error **errp)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    return board->progress_trace_enabled;
+    return board->progress_trace;
 }
 
 static void bbk9588_set_progress_trace(Object *obj, bool value,
@@ -1872,7 +1370,8 @@ static void bbk9588_set_progress_trace(Object *obj, bool value,
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    board->progress_trace_enabled = value;
+    board->progress_trace = value;
+    bbk9588_diag_set_progress_enabled(board->diag, value);
 }
 
 static bool bbk9588_get_bootrom_nand(Object *obj, Error **errp)
@@ -1973,6 +1472,9 @@ static void bbk9588_instance_finalize(Object *obj)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
+    if (board->dma_bridge) {
+        object_unref(OBJECT(board->dma_bridge));
+    }
     if (board->aic) {
         object_unref(OBJECT(board->aic));
     }
@@ -2056,11 +1558,9 @@ static void bbk9588_instance_init(Object *obj)
     board->cpu_irq_output_enabled = true;
     board->intc_output_level = false;
     board->storage_trace_enabled = false;
-    board->graphics_trace_enabled = false;
-    board->touch_trace_enabled = false;
-    board->graphics_trace_count = 0;
-    board->progress_trace_enabled = false;
-    board->progress_trace_seq = 0;
+    board->graphics_trace = false;
+    board->touch_trace = false;
+    board->progress_trace = false;
     board->bootrom_nand_enabled = false;
     board->nand_id_code = BBK9588_NAND_DEFAULT_ID_CODE;
     board->bootrom_nand_page = BBK9588_BOOTROM_NAND_PAGE;
@@ -2133,9 +1633,11 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_create_msc_device(board);
     bbk9588_create_nand_device(board);
     bbk9588_create_emc_device(board);
+    bbk9588_connect_diag_sources(board);
     bbk9588_touch_sync_latch(board);
-    bbk9588_touch_trace_update(board, 7u);
+    bbk9588_touch_diag_record(board, 7u);
     bbk9588_create_aic_device(machine, board);
+    bbk9588_create_dma_bridge(board);
     bbk9588_host_bridge_connect_display(board->host_bridge, board->lcd,
                                         board->panel);
     bbk9588_host_bridge_connect_audio(board->host_bridge, board->aic,

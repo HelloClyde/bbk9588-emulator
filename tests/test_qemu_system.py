@@ -524,7 +524,7 @@ class QemuSystemCommandTests(unittest.TestCase):
             / "bbk9588.c"
         ).read_text(encoding="utf-8")
         start = source.index("static bool bbk9588_bootrom_load_from_nand")
-        end = source.index("static uint32_t bbk9588_ldl_le", start)
+        end = source.index("static void bbk9588_tcu_irq_handler", start)
         bootrom_load = source[start:end]
         helper_start = source.index("static bool bbk9588_bootrom_nand_page_valid")
         helper_end = source.index("static bool bbk9588_bootrom_load_raw_payload", helper_start)
@@ -815,19 +815,18 @@ class QemuSystemCommandTests(unittest.TestCase):
                 backend.stop()
 
     def test_bbk9588_source_removes_legacy_storage_bridge_and_fat_scan(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
 
         self.assertNotIn("msc_oob_lba", source)
-        msc_start = source.index("static bool bbk9588_msc_dma_transfer")
-        msc_end = source.index("static void bbk9588_dmac_trace_sample", msc_start)
-        msc_dma = source[msc_start:msc_end]
+        msc_start = dma_bridge.index("static bool bridge_msc_dma_transfer")
+        msc_end = dma_bridge.index("static void bridge_dmac_trace", msc_start)
+        msc_dma = dma_bridge[msc_start:msc_end]
         self.assertNotIn("nand_dev", msc_dma)
         self.assertNotIn("Bbk9588NandState", msc_dma)
         self.assertNotIn("bbk9588_read_ftl_logical_sector", source)
@@ -896,7 +895,6 @@ class QemuSystemCommandTests(unittest.TestCase):
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
-
         self.assertIn("static void diag_mirror_input", source)
         self.assertIn("bbk9588_diag_queue_input", source)
         self.assertNotIn("event_queue_pop_to_record", source)
@@ -921,20 +919,23 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("bbk9588_probe_write_u32(BBK9588_FS_PROBE_VA + 0x00", helper)
 
     def test_bbk9588_progress_trace_timer_not_named_legacy_python_resource_hook(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        diag = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("progress_trace_timer", source)
         self.assertIn("progress_trace_period_ms", source)
         self.assertIn('"progress-trace-period-ms"', source)
         self.assertIn("Trace bbk9588 CPU/IRQ/runtime progress into diagnostic guest RAM", source)
         self.assertIn("bbk9588_progress_trace_schedule(board);", source)
+        self.assertIn("bbk9588_diag_progress_record(board->diag, 2);", source)
+        self.assertIn("void bbk9588_diag_progress_record", diag)
+        self.assertIn("uint32_t progress_seq;", diag)
+        self.assertNotIn("BBK9588_PROGRESS_TRACE_MAGIC", source)
         self.assertNotIn("CPU/IRQ/resource progress", source)
         self.assertNotIn("legacy_python_resource_hook_timer", source)
         self.assertNotIn("legacy_python_resource_hook_period_ms", source)
@@ -997,26 +998,24 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('"reserved_0c"', probe_source)
 
     def test_bbk9588_touch_trace_is_explicit_diagnostic(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        diag = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
 
-        start = source.index("static void bbk9588_touch_trace_update")
-        end = source.index("static void bbk9588_sadc_trace", start)
-        touch_trace = source[start:end]
-
-        self.assertIn("bool touch_trace_enabled;", source)
-        self.assertIn("board->touch_trace_enabled = false;", source)
-        self.assertIn('object_class_property_add_bool(oc, "touch-trace"', source)
-        self.assertIn("bbk9588_get_touch_trace", source)
-        self.assertIn("bbk9588_set_touch_trace", source)
-        self.assertIn("!board || !board->touch_trace_enabled ||", touch_trace)
-        self.assertIn("BBK9588_TOUCH_TRACE_VA", touch_trace)
+        self.assertIn("bool touch_enabled;", diag)
+        self.assertIn("void bbk9588_diag_touch_record", diag)
+        self.assertIn("!s || !s->touch_enabled || !board ||", diag)
+        self.assertIn("TOUCH_TRACE_VA", diag)
+        self.assertIn('object_class_property_add_bool(oc, "touch-trace"', board)
+        self.assertIn("bbk9588_get_touch_trace", board)
+        self.assertIn("bbk9588_set_touch_trace", board)
+        self.assertIn("bbk9588_diag_touch_record", board)
+        self.assertNotIn("BBK9588_TOUCH_TRACE_VA", board)
+        self.assertNotIn("static void bbk9588_touch_trace_update", board)
 
     def test_builds_bbk9588_uboot_machine_with_raw_first_stage_by_default(self) -> None:
         nand = Path("build") / "bbk9588_nand_uboot40_fat_page1c40_root512_ftloob.bin"
@@ -1381,6 +1380,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         tcu_header = (
             overlay / "include" / "hw" / "timer" / "jz4740_tcu.h"
         ).read_text(encoding="utf-8")
+        diag = (overlay / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("#define JZ4740_INTC_ICSR      0x00u", intc_source)
         self.assertIn("#define JZ4740_INTC_ICMR      0x04u", intc_source)
@@ -1438,7 +1440,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("board->sysctrl_wake_pending", board)
         self.assertIn("jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU2)", board)
         self.assertIn("output == JZ4740_TCU_EVENT ? bbk9588_tcu_event_handler", board)
-        self.assertIn("jz4740_tcu_get_diagnostics(board->tcu, &tcu_diag);", board)
+        self.assertIn(
+            "jz4740_tcu_get_diagnostics(s->sources.tcu, &tcu);", diag
+        )
         self.assertIn("if (level && board->cpu_irq_output_enabled)", board)
         self.assertNotIn("BBK9588_MMIO_TCU", board)
         self.assertNotIn("static void bbk9588_tcu_write(", board)
@@ -1743,6 +1747,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
         meson = (root / "hw" / "mips" / "meson.build").read_text(
             encoding="utf-8"
         )
@@ -1751,13 +1758,25 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("struct Bbk9588DiagState", source)
         self.assertIn("bbk9588_diag_queue_input", source)
         self.assertIn("bbk9588_diag_storage_record", source)
-        self.assertIn("bbk9588_diag_dmac_record", source)
+        self.assertIn("bbk9588_diag_dmac_sample", source)
+        self.assertIn("bbk9588_diag_touch_record", source)
+        self.assertIn("bbk9588_diag_progress_record", source)
+        self.assertIn("bbk9588_diag_panel_write", source)
+        self.assertIn("Bbk9588DiagSources sources;", source)
+        self.assertIn("uint32_t graphics_count;", source)
+        self.assertIn("uint32_t progress_seq;", source)
+        self.assertIn("uint32_t nand_ready_count;", source)
         self.assertIn("qdev_new(TYPE_BBK9588_DIAG)", board)
-        self.assertIn("bbk9588_diag_dmac_record", board)
+        self.assertIn("bbk9588_diag_dmac_sample", dma_bridge)
+        self.assertNotIn("bbk9588_diag_dmac_sample", board)
+        self.assertIn("bbk9588_diag_connect_sources", board)
         self.assertIn("../misc/bbk9588_diag.c", meson)
         self.assertNotIn("bbk9588_active_board", board)
         self.assertNotIn("uint32_t input_event_words", board)
         self.assertNotIn("uint32_t dmac_trace_seq", board)
+        self.assertNotIn("uint32_t graphics_trace_count", board)
+        self.assertNotIn("uint32_t progress_trace_seq", board)
+        self.assertNotIn("BBK9588_TOUCH_TRACE_VA", board)
         self.assertNotIn("bbk9588_storage_trace_record", board)
 
     def test_qemu_bbk9588_panel_ready_frame_done_and_w1c(self) -> None:
@@ -1798,6 +1817,9 @@ class QemuSystemCommandTests(unittest.TestCase):
             root / "include" / "hw" / "input" / "jz4740_sadc.h"
         ).read_text(encoding="utf-8")
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        diag = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
             encoding="utf-8"
         )
 
@@ -1854,7 +1876,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         )
         self.assertIn("JZ4740_INTC_IRQ_SADC", board)
         self.assertIn("jz4740_sadc_set_touch(board->sadc, raw_x, raw_y, down);", board)
-        self.assertIn("jz4740_sadc_get_diagnostics(board->sadc, &sadc_diag);", board)
+        self.assertIn("jz4740_sadc_get_diagnostics(s->sources.sadc, &sadc);", diag)
         self.assertNotIn("QEMUTimer *sadc_timer;", board)
         self.assertNotIn("uint8_t sadc_status_event;", board)
         self.assertNotIn("static uint32_t bbk9588_sadc_read", board)
@@ -1982,6 +2004,15 @@ class QemuSystemCommandTests(unittest.TestCase):
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
+        dma_header = (
+            root / "include" / "hw" / "dma" / "bbk9588_dma_bridge.h"
+        ).read_text(encoding="utf-8")
+        meson = (root / "hw" / "mips" / "meson.build").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("#define JZ4740_DMAC_CHANNELS 6u", header)
         self.assertIn("#define DMAC_DMACR            0x300u", source)
@@ -2020,10 +2051,11 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("qemu_set_irq(s->irq, level);", source)
         self.assertIn("qdev_init_gpio_in(DEVICE(obj), dmac_request_input", source)
         self.assertIn("qdev_get_gpio_in(DEVICE(board->dmac),", board)
-        self.assertIn("jz4740_dmac_set_peripheral_ops(board->dmac,", board)
+        self.assertIn('#define TYPE_BBK9588_DMA_BRIDGE "bbk9588-dma-bridge"', dma_header)
+        self.assertIn("jz4740_dmac_set_peripheral_ops(s->dmac,", dma_bridge)
         self.assertIn(
-            "bbk9588_msc_dma_transfer(opaque, channel, source, target, count)",
-            board,
+            "bridge_msc_dma_transfer(s, channel, source, target, count)",
+            dma_bridge,
         )
         self.assertIn(
             "sysbus_mmio_map(sbd, 0, "
@@ -2033,6 +2065,15 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("BBK9588_MMIO_DMAC", board)
         self.assertNotIn("bbk9588.dmac", board)
         self.assertNotIn("static void bbk9588_dmac_try_audio_transfer", board)
+        self.assertNotIn("JZ4740DMACPeripheralOps", board)
+        self.assertIn("static void bbk9588_dmac_irq_handler", board)
+        self.assertIn("jz4740_intc_set_irq(board->intc, JZ4740_INTC_IRQ_DMA", board)
+        self.assertIn("bbk9588_update_irq(board);", board)
+        self.assertIn(
+            "board->dmac_irq = qemu_allocate_irq(bbk9588_dmac_irq_handler",
+            board,
+        )
+        self.assertIn("../dma/bbk9588_dma_bridge.c", meson)
 
 
     def test_jz4740_aic_source_models_fifo_dma_irq_and_host_audio(self) -> None:
@@ -2044,6 +2085,9 @@ class QemuSystemCommandTests(unittest.TestCase):
             encoding="utf-8"
         )
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(encoding="utf-8")
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
         host_bridge = (
             root / "hw" / "display" / "bbk9588_host_bridge.c"
         ).read_text(encoding="utf-8")
@@ -2066,7 +2110,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("uint64_t pending_output_frames;", source)
         self.assertIn("if (s->tx_dma_boundary)", source)
         self.assertIn("jz4740_aic_process_output(s, pending)", source)
-        self.assertIn("jz4740_aic_notify_tx_dma_boundary(board->aic);", board)
+        self.assertIn("jz4740_aic_notify_tx_dma_boundary(s->aic);", dma_bridge)
         self.assertIn("qemu_set_irq(s->irqs[JZ4740_AIC_IRQ], irq);", source)
         self.assertIn("audio_be_open_out", source)
         self.assertIn("audio_be_open_in", source)
@@ -2099,21 +2143,19 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("jz4740_aic.c", meson)
 
     def test_bbk9588_msc_dma_does_not_use_raw_nand_backing(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "hw"
-            / "mips"
-            / "bbk9588.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
         nand_header = (
-            Path(__file__).resolve().parents[1]
-            / "qemu/overlay/include/hw/block/bbk9588_nand.h"
+            root / "include" / "hw" / "block" / "bbk9588_nand.h"
         ).read_text(encoding="utf-8")
-        start = source.index("static bool bbk9588_msc_dma_transfer")
-        end = source.index("static void bbk9588_dmac_trace_sample", start)
-        msc_complete = source[start:end]
+        start = dma_bridge.index("static bool bridge_msc_dma_transfer")
+        end = dma_bridge.index("static void bridge_dmac_trace", start)
+        msc_complete = dma_bridge[start:end]
 
         self.assertNotIn("msc_oob_lba", source)
         self.assertNotIn("Bbk9588NandState", msc_complete)
@@ -2153,6 +2195,12 @@ class QemuSystemCommandTests(unittest.TestCase):
         machine = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
+        dma_bridge = (root / "hw" / "dma" / "bbk9588_dma_bridge.c").read_text(
+            encoding="utf-8"
+        )
+        diag = (root / "hw" / "misc" / "bbk9588_diag.c").read_text(
+            encoding="utf-8"
+        )
         meson = (root / "hw" / "mips" / "meson.build").read_text(
             encoding="utf-8"
         )
@@ -2187,9 +2235,10 @@ class QemuSystemCommandTests(unittest.TestCase):
             machine,
         )
         self.assertIn("JZ4740_INTC_IRQ_MSC", machine)
-        self.assertIn("jz4740_msc_set_kick_callback", machine)
-        self.assertIn("jz4740_msc_set_command_callback", machine)
-        self.assertIn("jz4740_msc_get_diagnostics", machine)
+        self.assertIn("jz4740_msc_set_kick_callback", dma_bridge)
+        self.assertIn("jz4740_msc_set_command_callback", dma_bridge)
+        self.assertIn("bbk9588_dma_bridge_connect", machine)
+        self.assertIn("jz4740_msc_get_diagnostics(s->sources.msc, &msc);", diag)
         self.assertIn("../sd/jz4740_msc.c", meson)
         self.assertNotIn("bbk9588_is_msc_window", machine)
         self.assertNotIn("BBK9588_MMIO_GRAPHICS", machine)
