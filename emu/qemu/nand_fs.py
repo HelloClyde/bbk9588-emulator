@@ -16,6 +16,8 @@ from typing import Any
 from pyfatfs.EightDotThree import EightDotThree
 from pyfatfs.PyFatFS import PyFatFS
 
+from .ftl import scan_ftl_image
+
 PAGE_SIZE = 2048
 SPARE_SIZE = 64
 PAGE_STRIDE = PAGE_SIZE + SPARE_SIZE
@@ -101,24 +103,11 @@ def join_nand_path(parent: object, name: object) -> str:
 
 
 def _nand_block_map(path: Path) -> dict[int, tuple[int, int]]:
-    size = path.stat().st_size
-    if size == 0 or size % RAW_BLOCK_SIZE:
-        raise ValueError(f"unsupported NAND geometry: {path} size={size}")
-    block_count = size // RAW_BLOCK_SIZE
-    mapping: dict[int, tuple[int, int]] = {}
-    with path.open("rb") as stream:
-        for physical in range(block_count):
-            stream.seek(physical * RAW_BLOCK_SIZE + PAGE_SIZE + SPARE_SIZE - 6)
-            tail = stream.read(6)
-            if len(tail) != 6:
-                raise IOError(f"short NAND OOB read from {path}")
-            sequence = int.from_bytes(tail[:2], "little")
-            logical = int.from_bytes(tail[2:], "little") & 0xFFFF
-            if sequence == 0xFFFF or logical >= block_count:
-                continue
-            current = mapping.get(logical)
-            if current is None or sequence >= current[0]:
-                mapping[logical] = (sequence, physical)
+    result = scan_ftl_image(path)
+    mapping = {
+        logical: (record.sequence or 0, record.physical)
+        for logical, record in result.mapping.items()
+    }
     if 0 not in mapping:
         raise ValueError(f"NAND image has no logical FTL block zero: {path}")
     return mapping

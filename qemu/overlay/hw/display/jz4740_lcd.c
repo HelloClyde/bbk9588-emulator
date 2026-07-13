@@ -95,6 +95,7 @@ struct JZ4740LCDState {
     uint32_t command[2];
     uint32_t descriptor_address;
     uint32_t framebuffer_address;
+    uint32_t frame_source_kind;
     uint64_t ram_size;
     uint32_t frame_bytes;
     bool descriptor_valid;
@@ -247,6 +248,7 @@ static bool jz4740_lcd_fetch_descriptor(JZ4740LCDState *s,
     }
     s->framebuffer_address = framebuffer;
     s->framebuffer_valid = true;
+    s->frame_source_kind = JZ4740_LCD_FRAME_SOURCE_DESCRIPTOR;
     return true;
 }
 
@@ -440,6 +442,7 @@ void jz4740_lcd_get_diagnostics(JZ4740LCDState *s,
     diagnostics->interrupt_id = jz4740_lcd_reg(s, LCD_IID);
     diagnostics->descriptor_address = s->descriptor_address;
     diagnostics->framebuffer_address = s->framebuffer_address;
+    diagnostics->frame_source_kind = s->frame_source_kind;
     diagnostics->descriptor_valid = s->descriptor_valid;
     diagnostics->framebuffer_valid = s->framebuffer_valid;
     diagnostics->irq_level = s->irq_level;
@@ -495,33 +498,6 @@ bool jz4740_lcd_refresh_frame_source(JZ4740LCDState *s)
     return true;
 }
 
-bool jz4740_lcd_observe_alias_write(JZ4740LCDState *s, hwaddr offset,
-                                    uint32_t value)
-{
-    uint32_t address;
-
-    if (!s) {
-        return false;
-    }
-    if ((offset == LCD_DA0 || offset == LCD_DA1) &&
-        jz4740_lcd_candidate_va(s, value, LCD_DESC_BYTES, &address)) {
-        s->descriptor_address = address;
-        s->descriptor_valid = true;
-        if (jz4740_lcd_refresh_frame_source(s)) {
-            jz4740_lcd_notify_frame_source(s);
-            return true;
-        }
-        return false;
-    }
-    if (jz4740_lcd_candidate_va(s, value, s->frame_bytes, &address)) {
-        s->framebuffer_address = address;
-        s->framebuffer_valid = true;
-        jz4740_lcd_notify_frame_source(s);
-        return true;
-    }
-    return false;
-}
-
 void jz4740_lcd_signal_frame_done(JZ4740LCDState *s)
 {
     if (!s || !(jz4740_lcd_reg(s, LCD_CTRL) & LCD_CTRL_ENA)) {
@@ -542,6 +518,7 @@ static void jz4740_lcd_reset_hold(Object *obj, ResetType type)
     memset(s->command, 0, sizeof(s->command));
     s->descriptor_address = 0;
     s->framebuffer_address = 0;
+    s->frame_source_kind = JZ4740_LCD_FRAME_SOURCE_NONE;
     s->descriptor_valid = false;
     s->framebuffer_valid = false;
     s->irq_level = false;
@@ -553,6 +530,9 @@ static int jz4740_lcd_post_load(void *opaque, int version_id)
 {
     JZ4740LCDState *s = opaque;
 
+    if (version_id < 2 && s->framebuffer_valid) {
+        s->frame_source_kind = JZ4740_LCD_FRAME_SOURCE_DESCRIPTOR;
+    }
     s->irq_level = false;
     jz4740_lcd_update_irq(s);
     return 0;
@@ -560,7 +540,7 @@ static int jz4740_lcd_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_jz4740_lcd = {
     .name = TYPE_JZ4740_LCD,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = jz4740_lcd_post_load,
     .fields = (const VMStateField[]) {
@@ -570,6 +550,7 @@ static const VMStateDescription vmstate_jz4740_lcd = {
         VMSTATE_UINT32(framebuffer_address, JZ4740LCDState),
         VMSTATE_BOOL(descriptor_valid, JZ4740LCDState),
         VMSTATE_BOOL(framebuffer_valid, JZ4740LCDState),
+        VMSTATE_UINT32_V(frame_source_kind, JZ4740LCDState, 2),
         VMSTATE_END_OF_LIST()
     },
 };

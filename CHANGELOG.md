@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+- 还原 U-Boot/C200 FTL cold-scan 的 last-valid-page、完整 6-byte tail 和 16-bit 环形
+  sequence 规则，新增共享 parser、严格镜像审计和 commit-tail 掉电注入工具。修正构造
+  镜像 logical tag 高半字：C200 只写低 16 位，高半字必须保持 `0xffff`；旧 checkpoint
+  会原子迁移，避免运行写入后出现 torn mapping。名片文件写入触发的 10 个 logical
+  remap 已通过不经 checkpoint 的 raw 冷启动恢复；新增 reference/committed remap
+  pre-commit 故障快照，验证 torn 新块回退旧块及固件启动清理。多 block/垃圾回收和
+  guest 故障恢复矩阵仍待完成。
+- raw NAND device 新增按 physical block 注入 page-program/block-erase failure 的属性；
+  失败命令返回 ready+FAIL `0x41` 且不改 backing，成功命令恢复 ready `0x40`。qtest
+  同时校验进程内读回和 QEMU 退出后的 raw 文件。
+- 将匿名 `0xb3060000` shadow MMIO 替换为独立 JZ4740 CIM idle device：实现手册
+  CFG/CR mask、RX FIFO empty、disable-done、status W0C、IRQ17、reset 和 migration；
+  BBK 9588 无摄像头 sensor，因此不合成图像数据或 descriptor DMA。
+- 将 BBK 板级 `0xb0043000` panel/status register、ready/frame-done、W1C、reset 和
+  migration 从 machine 迁移到独立 `hw/display/bbk9588_panel.c`；JZ4740 LCDC 仍只负责
+  `0xb3050000` controller/descriptor/IRQ，host scanout 和 frame chardev 保留为板级 bridge。
+- 将 MSC register bank、response FIFO、command/DMA pending、`IREG` 写一清零、
+  `IMASK`/IRQ、reset、migration 和诊断状态迁移到独立 `hw/sd/jz4740_msc.c`；machine
+  只保留 DMAC RAM 搬运、无介质读零/写丢弃策略和 storage trace，并连接 INTC source 14。
+- 将 UDC no-host register、indexed endpoint config、interrupt status/enable、IRQ、
+  reset 和 migration 从 machine 迁移到独立 `hw/usb/jz4740_udc.c`；USB attach、packet
+  transport 和 endpoint FIFO backend 仍明确保留为后续功能缺口。
+- 将 UART0 register bank、16-byte RX FIFO、DLAB/divisor、loopback、serial chardev、
+  IRQ、reset 和 migration 从 machine 迁移到独立 `hw/char/jz4740_uart.c`；machine
+  只连接 serial0、MMIO 和 INTC source 9。
+- 实现 JZ4740 NAND ECC core 和 EMC data path：支持 512-byte Hamming encode、
+  RS(511,503) encode/decode、NFPAR/NFERR/NFINTS/NFINTE、W0C status 与 EMC IRQ；
+  删除 raw NAND 内旧的 fake BCH busy/done 状态。
+- 修复持久 checkpoint 压实后的 OOB parity：只要 runtime data page 发生变化，就按
+  U-Boot/C200 数据区 `4+9*n` 重新生成 RS parity，同时保留 canonical FTL metadata。
+- BootROM 现在按 OOB `6+9*n` 校验并纠正 first-stage，1~4 symbol 错误可恢复，
+  uncorrectable normal area 会回退到 backup，并按手册在第一张 invalid page 处结束
+  “最多 8 KiB”的加载。镜像工具区分 boot OOB `+6` 与 U-Boot 数据区 OOB `+4`，
+  修复启用真实 ECC 后 U-Boot 无法加载 C200 内核的问题。
+- 删除 `0x804a6b88` guest LCD mirror、`0xa1f82000` 固定 framebuffer fallback 和
+  `0xb0043000` alias observer，修正 JZ LCD descriptor DMA 的 physical RAM 地址被
+  machine 拒绝的问题。新增连续 raw RGB565 hash/逐像素差异回归；descriptor-only
+  冷启动、主菜单、输入和 4 帧稳定性 smoke 通过。
+- 将 JZ4740 EMC register block、IRQ、reset 和 migration 迁移到独立
+  `hw/mem/jz4740_emc.c`，并将 raw NAND backing、几何、命令状态、program/erase、
+  OOB 和 ready/busy 迁移到独立 `hw/block/bbk9588_nand.c`。machine 仅保留 BootROM
+  策略、诊断 trace 以及 GPIO/wake 板级接线。
 - 将 JZ4740 RTC 的 seconds、1 Hz、alarm、hibernate registers、timer、IRQ、reset
   和 migration 从 `bbk9588.c` 迁移到独立 `hw/rtc/jz4740_rtc.c` QOM device。
 - 将 JZ4740 GPIO 的 4-port register banks、外部 pin level、FLG latch、4 路 IRQ、

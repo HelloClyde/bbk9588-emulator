@@ -87,7 +87,7 @@ for (physical = start_block; physical < block_count; physical++) {
     oob = read_oob(first_page_of_block);
 
     if (oob[1] != 0xff) {
-        last_valid_page = oob[2];
+        last_valid_page = *(u16 *)(oob + 2);
         if (last_valid_page < pages_per_block) {
             last_oob = read_oob(first_page + last_valid_page);
             if (last_oob[-6..-1] != oob[-6..-1]) {
@@ -112,6 +112,7 @@ for (physical = start_block; physical < block_count; physical++) {
     logical = tail & 0xffff;
     if (logical < block_count) {
         seq = *(u16 *)(oob + oob_size - 6);
+        // Replace only when (old_seq - seq) mod 65536 > 0x8000.
         update_logical_to_physical(logical, physical, seq);
         continue;
     }
@@ -129,6 +130,29 @@ for (physical = start_block; physical < block_count; physical++) {
   额外读取 last-valid-page OOB，总量仍不大。
 - 反汇编中没有看到遇到 `"bbt8"` 后直接退出整盘扫描的早退逻辑；
   `"bbt8"` 更像 BBT 候选标记，外层 block 循环仍会继续。
+- bad-block 检查读取 block 最后一页 OOB 的第一个字节；非 `0xff` 时重试，仍失败则
+  将该 physical block 标记为 bad。
+- sequence 不是简单取数值最大值。候选替换使用 16-bit 环形序号：
+  `((old_seq - new_seq) & 0xffff) > 0x8000` 时 new 较新；相等或正好相差
+  `0x8000` 时保留先扫描到的 physical block。
+
+## C200 对应实现与写入格式
+
+从 NAND FAT 中提取的 `C200.bin` 含有同源 FTL 实现：初始化入口约为
+`0x8017d8e0`，冷扫函数为 `0x8017db6c`，OOB read helper 为 `0x80184300`。
+它与 U-Boot 一样读取 OOB `u16[2..3]`、比较 first/last-valid-page 的完整末尾
+6 字节，并使用相同的环形 sequence 比较。
+
+C200 写 page tag 时在 `0x8017e980/0x8017e9d0` 使用 `sh` 写
+`spare[-4..-3]` 的 16-bit logical block id，并不写 `spare[-2..-1]`。因此 logical
+tail 的高 16 位应保持 NAND 擦除态 `0xffff`。旧构造镜像把它写成 `0x0000`，C200
+随后更新其他 page 时会在同一 block 中混入 `0xffff`，导致 U-Boot/C200 冷扫的
+first/last-valid-page 比较判定为 torn commit。
+
+当前私有回归中，名片文件保存触发了 10 个 logical remap；正常退出应用后的 raw
+work 可由 U-Boot/C200 原样冷启动并恢复记录。对 logical 36 构造“旧块仍在、新块
+tail torn”的 pre-commit 快照后，冷启动会采用旧块并丢弃未提交记录，随后擦除 torn
+candidate。这验证了单 block 候选恢复，但不等价于完整垃圾回收/多 block 掉电协议。
 
 ## 文件读取路径
 
@@ -181,7 +205,9 @@ OOB 扫描本身不应该是分钟级瓶颈：
 
 ```text
 spare[-6..-5] = sequence
-spare[-4..-1] = logical block id, 或 0xffffffff, 或 "bbt8"
+spare[-4..-3] = 16-bit logical block id
+spare[-2..-1] = 0xffff
+spare[-4..-1] 也可能整体为 0xffffffff 或 "bbt8"
 ```
 
 OOB 映射写正确后，U-Boot 扫描一次即可建立正确的

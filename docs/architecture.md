@@ -39,22 +39,52 @@ QEMU C machine / SoC 模型中。
 - `make_fat16_image.py`
 - `make_combined_nand.py`
 - `stamp_ftl_oob.py`
+- `audit_ftl_nand.py`
 - `build_runtime_images.ps1`
 
 这些工具只消费本地 `系统/`、`应用/`，不向仓库写入可提交数据。
+`emu/qemu/ftl.py` 是只读/离线共享 parser，按 U-Boot/C200 的 last-valid-page、
+完整 6-byte tail 和环形 sequence 规则审计映射；它不参与 guest 运行时 FTL 决策。
 
 ## QEMU 设备模型
 
 `qemu/overlay/` 是对 QEMU 11.0.0 的覆盖源码。release workflow 会下载官方
 QEMU 源码，复制 overlay，编译 `mipsel-softmmu`，再收集 Windows runtime DLL。
 
-当前独立 QOM 设备包括 AIC、LCD controller、SADC、GPIO、RTC、INTC、CPM、DMAC 和
-TCU。LCD device 负责 `0xb3050000` register block、descriptor DMA 和 IRQ；SADC
+当前独立 QOM 设备包括 AIC、raw NAND、EMC、MSC、UART、UDC、LCD controller、BBK
+panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC 和 TCU。MSC device 负责
+`0xb0021000` register bank、
+response FIFO、command/DMA pending、`IREG`/`IMASK`、IRQ14、reset 和 migration；machine
+通过明确的 DMA API 保留 RAM 搬运、默认无介质读零/写丢弃策略和 trace。UART device
+负责 `0xb0030000` register bank、RX FIFO、
+serial chardev、IRQ、reset 和 migration；UDC device 负责 `0xb3040000` no-host
+register、indexed endpoint config、IRQ、reset 和 migration，尚不包含 USB packet
+transport。raw NAND device 负责 `0xb8000000`
+command/address/data window、
+backing、几何、page program、block erase、OOB 和 ready/busy；EMC device 负责
+`0xb3010000` register block、NAND control、Hamming/RS ECC data path、parity/status、
+error index/mask、IRQ、reset 和 migration。raw NAND 的 data window 通过 callback
+向 EMC 提供实际读写字节，NAND device 本身不持有 ECC 状态。raw NAND 还提供
+`fail-program-block`/`fail-erase-block` 调试属性，用于在指定
+physical block 返回 NAND ready+FAIL 而不修改 backing；它们只用于恢复测试，不替代
+固件自己的 bad-block/FTL 决策。LCD device 负责
+`0xb3050000` register block、descriptor DMA 和 IRQ；SADC
 device 负责 `0xb0070000` register block、触摸 FIFO、conversion timer 和 IRQ；GPIO
 device 负责 `0xb0010000` 的 4 个 port、pin level、flag 和 4 路 IRQ；RTC device 负责
-`0xb0003000` 的 seconds、alarm、hibernate、timer 和 IRQ。BBK 9588 的 panel scanout、
-frame chardev、固定 guest mirror 兼容路径以及按键、pen、NAND/wake 板级接线仍由
-machine 连接。
+`0xb0003000` 的 seconds、alarm、hibernate、timer 和 IRQ。独立 BBK panel device 负责
+`0xb0043000` 的 board register、ready/frame-done 和 W1C；panel scanout、frame chardev
+以及按键、pen、NAND ready/busy 和 wake 板级接线仍由 machine 连接。
+`0xb3060000` 已不再是通用 shadow window，而是独立 JZ4740 CIM idle device；9588
+未连接摄像头 sensor，因此它只提供 register mask、FIFO empty、disable-done 和 IRQ17，
+不合成 image stream 或 CIM descriptor DMA。
+LCD scanout 只采用 JZ LCD descriptor source，不再读取固定 guest mirror config 或
+framebuffer fallback。BootROM 的 normal/backup 选择也属于 machine 启动策略，只通过
+raw NAND 的只读 backing API 取 first-stage 数据。
+
+标准 BBK9588 NAND 镜像存在两种固件原生 OOB ECC 布局：BootROM 和 first-stage boot
+copy 使用 `6+9*n`，U-Boot 常规 C200/FAT NAND 路径使用 `4+9*n`。默认 boot copy 从
+page `0x40` 读取 `0xe0000` bytes，因此 `stamp_nand_ecc.py` 以 page `0x200` 为默认
+边界；不同启动布局必须显式传入 `--boot-ecc-end-page`。
 
 设备模型优先级：
 

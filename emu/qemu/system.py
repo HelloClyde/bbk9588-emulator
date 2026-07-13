@@ -21,6 +21,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .ecc import jz4740_page_oob_ecc
+from .ftl import (
+    count_legacy_logical_tail_pages,
+    normalize_c200_logical_tail_pages,
+    scan_ftl_image,
+)
+
 DEFAULT_QEMU_EXECUTABLE = "qemu-system-mipsel"
 DEFAULT_QEMU_MACHINE = "bbk9588"
 DEFAULT_BBK9588_COMPAT_MACHINE_OPTIONS: tuple[str, ...] = ()
@@ -4516,7 +4523,7 @@ class QemuProcessBackend:
                 out["nand_last_column_int"] = int(words[66])
                 out["nand_last_block_int"] = int(words[67])
                 out["nand_busy_reads_int"] = int(words[68])
-                out["nand_bch_busy_reads_int"] = int(words[69])
+                out["emc_nfints_int"] = int(words[69])
                 out["nand_addr_count_int"] = int(words[70])
                 out["gpio_flag_200_int"] = int(words[71])
                 out["sysctrl_wake_pending_bool"] = bool(words[75])
@@ -6095,7 +6102,7 @@ class QemuProcessBackend:
                     trigger_thread.join(timeout=1.0)
 
     def guest_display_surface_snapshot(self) -> dict[str, object]:
-        """Read LCD mirror and active GUI surface descriptors used by C200 drawing."""
+        """Read active GUI surface descriptors used by C200 drawing."""
 
         out: dict[str, object] = {}
         with self._lock:
@@ -6105,30 +6112,8 @@ class QemuProcessBackend:
                 return {"error": "QEMU GDB stub is not connected"}
             try:
                 self._pause_for_gdb_locked()
-                mirror_enabled = self._read_u32_paused_locked(0x80474040) or 0
-                out["mirror_enabled_80474040"] = f"0x{mirror_enabled:08x}"
-                config_va = 0x804A6B88
-                if self._is_guest_ram_va(config_va, 0xE0):
-                    config = self._read_virtual_memory_paused_locked(config_va, 0xE0)
-                    width = struct.unpack_from("<H", config, 0x00)[0]
-                    height = struct.unpack_from("<H", config, 0x04)[0]
-                    fb = struct.unpack_from("<I", config, 0xD8)[0]
-                    reverse = config[0xDC]
-                    out["lcd_mirror_config"] = {
-                        "addr": f"0x{config_va:08x}",
-                        "width": width,
-                        "height": height,
-                        "fb": f"0x{fb:08x}",
-                        "reverse": bool(reverse),
-                        "words_00_1c": [
-                            f"0x{struct.unpack_from('<I', config, off)[0]:08x}"
-                            for off in range(0, 0x20, 4)
-                        ],
-                        "tail_d0_dc": [
-                            f"0x{struct.unpack_from('<I', config, off)[0]:08x}"
-                            for off in range(0xD0, 0xE0, 4)
-                        ],
-                    }
+                if self.config.machine.lower() == "bbk9588":
+                    out["lcd_scanout_source"] = "jz4740-lcd-descriptor"
                 active = self._read_u32_paused_locked(0x80474048) or 0
                 out["active_object_80474048"] = f"0x{active:08x}"
                 if self._is_guest_ram_va(active, 0xD0):
@@ -6263,7 +6248,7 @@ class QemuProcessBackend:
                     self.last_gdb_error = f"{type(exc).__name__}: {exc}"
 
     def enable_lcd_mirror(self) -> dict[str, object]:
-        """Enable the firmware LCD mirror flag used by the C200 GUI renderer."""
+        """Retain the legacy API while descriptor scanout needs no host action."""
 
         row: dict[str, object] = {"event": "qemu-enable-lcd-mirror", "enabled": False}
         if self.config.machine.lower() == "bbk9588":
@@ -6271,8 +6256,8 @@ class QemuProcessBackend:
                 {
                     "enabled": True,
                     "skipped": True,
-                    "reason": "qemu-c-machine-lcd-mirror",
-                    "source": "qemu-c-machine",
+                    "reason": "jz4740-lcd-descriptor-scanout",
+                    "source": "jz4740-lcd",
                 }
             )
             return row
@@ -7517,29 +7502,12 @@ def restore_runtime_nand_checkpoint(
 
 
 def _nand_block_map(path: Path) -> tuple[int, dict[int, tuple[int, int]]]:
-    page_size = 2048
-    stride = page_size + 64
-    pages_per_block = 64
-    block_size = stride * pages_per_block
-    size = path.stat().st_size
-    if size == 0 or size % block_size:
-        raise ValueError(f"unsupported persistent NAND geometry: {path} size={size}")
-    block_count = size // block_size
-    mapping: dict[int, tuple[int, int]] = {}
-    with path.open("rb") as stream:
-        for physical in range(block_count):
-            stream.seek(physical * block_size + page_size + 58)
-            tail = stream.read(6)
-            if len(tail) != 6:
-                raise IOError(f"short NAND OOB read from {path}")
-            sequence = int.from_bytes(tail[:2], "little")
-            logical = int.from_bytes(tail[2:], "little") & 0xFFFF
-            if sequence == 0xFFFF or logical >= block_count:
-                continue
-            current = mapping.get(logical)
-            if current is None or sequence >= current[0]:
-                mapping[logical] = (sequence, physical)
-    return block_count, mapping
+    result = scan_ftl_image(path)
+    mapping = {
+        logical: (record.sequence or 0, record.physical)
+        for logical, record in result.mapping.items()
+    }
+    return result.block_count, mapping
 
 
 def commit_runtime_nand_checkpoint(
@@ -7555,14 +7523,10 @@ def commit_runtime_nand_checkpoint(
         persistent_runtime_nand_checkpoint_path(source_path)
         if checkpoint_path is None else checkpoint_path.resolve()
     )
-    source_blocks, source_map = _nand_block_map(source)
     runtime_blocks, runtime_map = _nand_block_map(runtime)
-    if runtime_blocks != source_blocks:
-        raise ValueError(
-            f"runtime NAND block count {runtime_blocks} != source {source_blocks}"
-        )
 
     page_size = 2048
+    data_ecc_oob_offset = 4
     stride = page_size + 64
     pages_per_block = 64
     block_size = stride * pages_per_block
@@ -7572,8 +7536,13 @@ def commit_runtime_nand_checkpoint(
     )
     try:
         shutil.copy2(source, temporary)
+        normalize_c200_logical_tail_pages(temporary)
+        source_blocks, source_map = _nand_block_map(temporary)
+        if runtime_blocks != source_blocks:
+            raise ValueError(
+                f"runtime NAND block count {runtime_blocks} != source {source_blocks}"
+            )
         with (
-            source.open("rb") as source_stream,
             runtime.open("rb") as runtime_stream,
             temporary.open("r+b") as output_stream,
         ):
@@ -7582,17 +7551,25 @@ def commit_runtime_nand_checkpoint(
                 if runtime_row is None:
                     continue
                 _runtime_seq, physical = runtime_row
-                source_stream.seek(canonical * block_size)
-                output_block = bytearray(source_stream.read(block_size))
+                output_stream.seek(canonical * block_size)
+                output_block = bytearray(output_stream.read(block_size))
                 runtime_stream.seek(physical * block_size)
                 runtime_block = runtime_stream.read(block_size)
                 if len(output_block) != block_size or len(runtime_block) != block_size:
                     raise IOError("short NAND block read while committing checkpoint")
                 for page in range(pages_per_block):
                     offset = page * stride
-                    output_block[offset : offset + page_size] = (
-                        runtime_block[offset : offset + page_size]
+                    runtime_page = runtime_block[offset : offset + page_size]
+                    if output_block[offset : offset + page_size] == runtime_page:
+                        continue
+                    output_block[offset : offset + page_size] = runtime_page
+                    parity = jz4740_page_oob_ecc(
+                        runtime_page, offset=data_ecc_oob_offset
                     )
+                    oob = offset + page_size
+                    output_block[
+                        oob + data_ecc_oob_offset : oob + len(parity)
+                    ] = parity[data_ecc_oob_offset:]
                 output_stream.seek(canonical * block_size)
                 output_stream.write(output_block)
             output_stream.flush()
@@ -7603,6 +7580,22 @@ def commit_runtime_nand_checkpoint(
     return checkpoint
 
 
+def _normalize_runtime_nand_checkpoint(path: Path) -> None:
+    """Atomically migrate old synthetic FTL tags before guest reuse."""
+
+    if count_legacy_logical_tail_pages(path) == 0:
+        return
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.ftl.tmp"
+    )
+    try:
+        shutil.copy2(path, temporary)
+        normalize_c200_logical_tail_pages(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def ensure_runtime_nand_checkpoint(path: Path) -> Path:
     """Create the stable checkpoint for a base NAND image if needed."""
 
@@ -7611,12 +7604,14 @@ def ensure_runtime_nand_checkpoint(path: Path) -> Path:
     checkpoint = persistent_runtime_nand_checkpoint_path(original)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     if checkpoint.exists():
+        _normalize_runtime_nand_checkpoint(checkpoint)
         return checkpoint
     temporary = checkpoint.with_name(
         f".{checkpoint.name}.{os.getpid()}.{time.time_ns()}.tmp"
     )
     try:
         shutil.copy2(source, temporary)
+        normalize_c200_logical_tail_pages(temporary)
         os.replace(temporary, checkpoint)
     finally:
         temporary.unlink(missing_ok=True)
