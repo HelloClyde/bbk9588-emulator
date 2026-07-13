@@ -16,7 +16,8 @@
 patch。当前版本已经具备可用的启动、显示、输入和存储路径，后续优先级改为：
 
 1. 优先让 Web/QEMU 使用可复用的持久运行 NAND，应用创建或修改的文件必须在停止、
-   Web 重启和 QEMU 冷启动后保留；测试/探针继续使用 disposable copy 隔离基准镜像。
+   Web 重启和 QEMU 冷启动后保留；测试自行创建临时 NAND fixture，probe 默认只读，
+   QEMU 运行层不再提供 disposable copy。
 2. 继续补齐 AIC/I2S、板级 codec 和系统提示音验收；游戏、音乐和 host audio 基线
    已经可用。
 3. 音频基线稳定后，将 `bbk9588.c` 按设备拆分，降低继续补硬件模型时
@@ -268,8 +269,12 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   page program/erase 实时写入该文件，正常停止、QEMU 崩溃、Web 强退和下次冷启动都不再
   创建、提交或删除 persistent work copy。
 - [ ] 删除 `ensure_runtime_nand_checkpoint()`、`commit_runtime_nand_checkpoint()` 及
-  persistent checkpoint 状态；`build/qemu_nand_runs/` 只保留测试/probe 的 disposable
-  副本。Release/用户导入的镜像只作为恢复来源，显式“恢复基础镜像”才替换活动 NAND。
+  persistent checkpoint 状态，同时删除 `prepare_runtime_nand_image()`、
+  `build/qemu_nand_runs/` 和 persistent/disposable 分支。Release/用户导入的镜像只作为
+  恢复来源，显式“恢复基础镜像”才替换活动 NAND。
+- [ ] 单元测试和集成测试在各自临时目录创建 NAND fixture 并把该路径直接传给 QEMU；
+  probe 默认只读，确需写入时也必须由调用方显式提供临时镜像。后端不复制、不猜测、
+  不删除调用者传入的 NAND。
 - [ ] NAND 文件管理器在 QEMU 停止后直接操作同一活动 NAND，并完成导入、导出、改名、
   删除后原地冷启动回归；不得再通过 canonical checkpoint 隐式重排 FTL physical block。
 
@@ -647,7 +652,7 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 23. [ ] 将 Web persistent NAND 收敛为唯一活动 raw NAND：删除 canonical checkpoint、
     persistent work copy 和正常停止压实流程；异常退出后直接复用同一文件，文件管理和
     显式恢复也围绕该文件工作。先覆盖正常保存后强杀 QEMU/Web、直接冷启动和严格审计；
-    disposable 测试副本继续隔离。
+    同时完全删除 disposable work-copy 路径，测试自行管理临时 fixture。
 24. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
     正常 10-block remap raw 重启、单-block pre-commit 回退及 raw NAND FAIL qtest 已通过；
     仍缺多-block 提交边界、垃圾回收、sequence wrap 和物理故障下的 guest 恢复。
@@ -658,7 +663,7 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 - [x] 冷启动：只提供 NAND 镜像即可 BootROM -> loader/U-Boot -> C200。
 - [x] BootROM：normal area 失效后会尝试 `0x2000` backup area。
 - [x] 存储层：QEMU C 不解析 FAT boot sector、目录项、cluster 或资源文件。
-- [x] raw 写入：page program/erase/OOB 修改会写入 disposable runtime NAND。
+- [x] raw 写入：page program/erase/OOB 修改会写入调用方显式提供的 raw NAND fixture。
 - [x] raw 故障：可按 physical block 注入 program/erase FAIL；状态为 `0x41`，失败操作
   不改变 raw backing，后续成功操作回到 `0x40`。
 - [x] 持久写入：Web 默认 checkpoint 跨停止、Web 重启和 QEMU 冷启动复用；实际验证
