@@ -2044,6 +2044,9 @@ class QemuSystemCommandTests(unittest.TestCase):
             encoding="utf-8"
         )
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(encoding="utf-8")
+        host_bridge = (
+            root / "hw" / "display" / "bbk9588_host_bridge.c"
+        ).read_text(encoding="utf-8")
         meson = (root / "hw" / "audio" / "meson.build").read_text(
             encoding="utf-8"
         )
@@ -2090,8 +2093,8 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0020000u));", board)
         self.assertIn("TYPE_JZ4740_MSC", board)
         self.assertIn("machine_add_audiodev_property(mc);", board)
-        self.assertIn("#define BBK9588_AUDIO_MAGIC", board)
-        self.assertIn("jz4740_aic_set_output_callback", board)
+        self.assertIn("#define BBK9588_AUDIO_MAGIC", host_bridge)
+        self.assertIn("jz4740_aic_set_output_callback", host_bridge)
         self.assertIn("CONFIG_BBK9588", meson)
         self.assertIn("jz4740_aic.c", meson)
 
