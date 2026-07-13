@@ -88,7 +88,9 @@ bin/bbk9588-qemu-system-mipsel.exe
   chardev、QEMU console 和刷新 timer 位于无 guest MMIO 的独立
   `hw/display/bbk9588_host_bridge.c`。默认启动不再注入
   graphics-done/LCD-ready magic，也不再暴露对应的 machine ready override。
-- input chardev。
+- 独立、无 guest MMIO 的 `hw/input/bbk9588_host_input.c` 持有 input chardev、
+  行缓冲和 `T/K` host 协议 parser；machine 只把 typed key/touch callback 接到
+  GPIO/SADC 板级连线。
 - raw NAND data/OOB 访问和独立 MSC DMA 控制器行为；C200 自己扫描 raw NAND OOB、
   建立 FTL map 并执行 page program/block erase。`hw/sd/jz4740_msc.c` 负责
   `0xb0021000` register、response FIFO、command/DMA pending、`IREG` 写一清零、

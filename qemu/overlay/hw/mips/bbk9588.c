@@ -16,7 +16,6 @@
 #include "system/reset.h"
 #include "system/system.h"
 #include "chardev/char.h"
-#include "chardev/char-fe.h"
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
 #include "hw/core/boards.h"
@@ -34,6 +33,7 @@
 #include "hw/display/jz4740_lcd.h"
 #include "hw/dma/jz4740_dmac.h"
 #include "hw/gpio/jz4740_gpio.h"
+#include "hw/input/bbk9588_host_input.h"
 #include "hw/input/jz4740_sadc.h"
 #include "hw/intc/jz4740_intc.h"
 #include "hw/mem/jz4740_ecc.h"
@@ -147,7 +147,6 @@ static uint32_t bbk9588_ldl_le(const uint8_t *p);
 struct Bbk9588MachineState {
     MachineState parent_obj;
 
-    CharFrontend input_chr;
     MIPSCPU *cpu;
     qemu_irq cpu_irq;
     qemu_irq aic_irq;
@@ -167,6 +166,7 @@ struct Bbk9588MachineState {
     uint32_t intc_last_cp0_cause;
     JZ4740AICState *aic;
     Bbk9588HostBridgeState *host_bridge;
+    Bbk9588HostInputState *host_input;
     JZ4740LCDState *lcd;
     Bbk9588PanelState *panel;
     JZ4740INTCState *intc;
@@ -206,8 +206,6 @@ struct Bbk9588MachineState {
     uint32_t input_event_words[BBK9588_EVENT_QUEUE_SLOTS]
                               [BBK9588_EVENT_QUEUE_WORDS];
     uint32_t nand_ready_raise_count;
-    char input_line[128];
-    size_t input_line_len;
     char *input_chardev;
     char *frame_chardev;
     char *nand_image;
@@ -230,8 +228,8 @@ static void bbk9588_touch_set_state(Bbk9588MachineState *board,
 static void bbk9588_queue_input_event(Bbk9588MachineState *board,
                                       uint32_t kind, uint32_t arg0,
                                       uint32_t arg1, uint32_t arg2);
-static void bbk9588_key_apply_host_input(Bbk9588MachineState *board,
-                                         uint32_t key_code, bool down);
+static void bbk9588_key_apply_host_input(void *opaque, uint32_t key_code,
+                                         bool down);
 static void bbk9588_update_irq(Bbk9588MachineState *board);
 static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
                                        uint32_t reason);
@@ -537,13 +535,12 @@ static void bbk9588_queue_input_event(Bbk9588MachineState *board,
                             BBK9588_EVENT_SCRATCH_MAGIC);
 }
 
-static void bbk9588_touch_apply_host_input(Bbk9588MachineState *board,
-                                           uint16_t raw_x,
-                                           uint16_t raw_y,
-                                           uint16_t x,
-                                           uint16_t y,
-                                           bool down)
+static void bbk9588_touch_apply_host_input(void *opaque, uint16_t raw_x,
+                                           uint16_t raw_y, uint16_t x,
+                                           uint16_t y, bool down)
 {
+    Bbk9588MachineState *board = opaque;
+
     (void)x;
     (void)y;
     bbk9588_touch_set_state(board, raw_x, raw_y, down);
@@ -595,9 +592,11 @@ static bool bbk9588_key_gpio_set_state(Bbk9588MachineState *board,
                                        !down, true);
 }
 
-static void bbk9588_key_apply_host_input(Bbk9588MachineState *board,
-                                         uint32_t key_code, bool down)
+static void bbk9588_key_apply_host_input(void *opaque, uint32_t key_code,
+                                         bool down)
 {
+    Bbk9588MachineState *board = opaque;
+
     if (bbk9588_key_gpio_set_state(board, key_code & 0xff, down)) {
         bbk9588_queue_input_event(board, BBK9588_EVENT_KIND_KEY,
                                   key_code & 0xff, down ? 1 : 0, 0);
@@ -1695,66 +1694,6 @@ static void bbk9588_panel_trace_write(void *opaque, hwaddr offset,
         lcd.frame_source_kind);
 }
 
-static void bbk9588_input_handle_line(Bbk9588MachineState *board,
-                                      const char *line)
-{
-    unsigned x;
-    unsigned y;
-    unsigned raw_x;
-    unsigned raw_y;
-    unsigned down;
-    unsigned key_code;
-
-    if (sscanf(line, "T %u %u %u %u %u", &x, &y, &raw_x, &raw_y,
-               &down) == 5) {
-        bbk9588_touch_apply_host_input(
-            board,
-            (uint16_t)(raw_x > 0xffff ? 0xffff : raw_x),
-            (uint16_t)(raw_y > 0xffff ? 0xffff : raw_y),
-            (uint16_t)(x > 0xffff ? 0xffff : x),
-            (uint16_t)(y > 0xffff ? 0xffff : y),
-            down != 0);
-        return;
-    }
-
-    if (sscanf(line, "K %u %u", &key_code, &down) == 2) {
-        bbk9588_key_apply_host_input(board, key_code & 0xff, down != 0);
-    }
-}
-
-static int bbk9588_input_can_read(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-
-    return (int)(sizeof(board->input_line) - board->input_line_len - 1);
-}
-
-static void bbk9588_input_read(void *opaque, const uint8_t *buf, int size)
-{
-    Bbk9588MachineState *board = opaque;
-
-    for (int i = 0; i < size; i++) {
-        char ch = (char)buf[i];
-
-        if (ch == '\r') {
-            continue;
-        }
-        if (ch == '\n') {
-            board->input_line[board->input_line_len] = 0;
-            if (board->input_line_len > 0) {
-                bbk9588_input_handle_line(board, board->input_line);
-            }
-            board->input_line_len = 0;
-            continue;
-        }
-        if (board->input_line_len + 1 < sizeof(board->input_line)) {
-            board->input_line[board->input_line_len++] = ch;
-        } else {
-            board->input_line_len = 0;
-        }
-    }
-}
-
 static void bbk9588_create_aic_device(MachineState *machine,
                                       Bbk9588MachineState *board)
 {
@@ -1795,6 +1734,17 @@ static void bbk9588_create_host_bridge(Bbk9588MachineState *board)
     bbk9588_host_bridge_configure(
         board->host_bridge, board->frame_chardev,
         board->lcd_refresh_period_ms, bbk9588_guest_insn_count, board);
+}
+
+static void bbk9588_create_host_input(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_BBK9588_HOST_INPUT);
+
+    qdev_realize(dev, NULL, &error_fatal);
+    board->host_input = BBK9588_HOST_INPUT(dev);
+    bbk9588_host_input_configure(
+        board->host_input, board->input_chardev,
+        bbk9588_key_apply_host_input, bbk9588_touch_apply_host_input, board);
 }
 
 static void bbk9588_create_intc_device(Bbk9588MachineState *board)
@@ -2285,6 +2235,9 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->host_bridge) {
         object_unref(OBJECT(board->host_bridge));
     }
+    if (board->host_input) {
+        object_unref(OBJECT(board->host_input));
+    }
     if (board->aic_irq) {
         qemu_free_irq(board->aic_irq);
     }
@@ -2378,7 +2331,6 @@ static void bbk9588_init(MachineState *machine)
     MemoryRegion *system_memory = get_system_memory();
     Clock *cpuclk;
     MIPSCPU *cpu;
-    Chardev *input_chr;
 
     if (machine->ram_size < 32 * MiB) {
         error_report("bbk9588: RAM must be at least 32 MiB");
@@ -2420,14 +2372,7 @@ static void bbk9588_init(MachineState *machine)
     board->progress_trace_timer = timer_new_ms(
         QEMU_CLOCK_REALTIME, bbk9588_progress_trace_timer_cb, board);
 
-    input_chr = board->input_chardev ? qemu_chr_find(board->input_chardev) :
-                serial_hd(1);
-    if (input_chr) {
-        qemu_chr_fe_init(&board->input_chr, input_chr, &error_abort);
-        qemu_chr_fe_set_handlers(&board->input_chr, bbk9588_input_can_read,
-                                 bbk9588_input_read, NULL, NULL, board, NULL,
-                                 true);
-    }
+    bbk9588_create_host_input(board);
     bbk9588_create_host_bridge(board);
     board->extgpio_wake_enable_80 = 0;
     board->sysctrl_wake_pending = false;

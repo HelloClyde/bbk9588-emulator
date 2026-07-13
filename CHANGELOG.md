@@ -15,6 +15,8 @@
 - 将 RGB565 scanout、frame/audio/perf chardev、QEMU console、帧缓存和刷新 timer
   从 machine 迁移到独立、无 guest MMIO 的 `bbk9588_host_bridge`；JZ4740 LCD/AIC/DMAC
   继续只持有 guest 可见硬件状态。
+- 将 input chardev、行缓冲和 `T/K` 文本协议 parser 从 machine 迁移到独立、无
+  guest MMIO 的 `bbk9588_host_input`；machine 只保留 GPIO/SADC 板级回调。
 - 还原 U-Boot/C200 FTL cold-scan 的 last-valid-page、完整 6-byte tail 和 16-bit 环形
   sequence 规则，新增共享 parser、严格镜像审计和 commit-tail 掉电注入工具。修正构造
   镜像 logical tag 高半字：C200 只写低 16 位，高半字必须保持 `0xffff`；旧 checkpoint

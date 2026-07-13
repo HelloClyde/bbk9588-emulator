@@ -1703,6 +1703,36 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("static void bbk9588_lcd_gfx_update", board)
         self.assertNotIn("static void bbk9588_audio_output", board)
 
+    def test_bbk9588_host_input_owns_chardev_protocol_state(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (
+            root / "hw" / "input" / "bbk9588_host_input.c"
+        ).read_text(encoding="utf-8")
+        header = (
+            root / "include" / "hw" / "input" / "bbk9588_host_input.h"
+        ).read_text(encoding="utf-8")
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        meson = (root / "hw" / "mips" / "meson.build").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            '#define TYPE_BBK9588_HOST_INPUT "bbk9588-host-input"',
+            header,
+        )
+        self.assertIn("CharFrontend chr;", source)
+        self.assertIn('sscanf(line, "T %u %u %u %u %u"', source)
+        self.assertIn('sscanf(line, "K %u %u"', source)
+        self.assertIn("bbk9588_host_input_configure", board)
+        self.assertIn("bbk9588_key_apply_host_input", board)
+        self.assertIn("bbk9588_touch_apply_host_input", board)
+        self.assertIn("../input/bbk9588_host_input.c", meson)
+        self.assertNotIn("CharFrontend input_chr;", board)
+        self.assertNotIn("static void bbk9588_input_handle_line", board)
+        self.assertNotIn("static void bbk9588_input_read", board)
+
     def test_qemu_bbk9588_panel_ready_frame_done_and_w1c(self) -> None:
         qemu = find_qemu()
         if qemu is None:

@@ -24,6 +24,9 @@ Web 启动路径默认选择 QEMU `driver=none`，避免服务器声卡与浏览
 - 把触摸/按键转换成 QEMU input chardev 事件。
 - 输出诊断状态。
 
+QEMU 内部由无 guest MMIO 的 `bbk9588-host-input` 持有 input chardev 和 `T/K` 协议
+parser；解析后的 typed 事件才进入 machine 的 GPIO/SADC 板级接线。
+
 ## QEMU 编排
 
 `emu/qemu/system.py` 负责构建 QEMU 命令、启动进程、管理 HMP/QMP 风格的诊断通道和
