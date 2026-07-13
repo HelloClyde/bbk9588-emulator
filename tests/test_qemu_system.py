@@ -1251,15 +1251,32 @@ class QemuSystemCommandTests(unittest.TestCase):
     def test_bbk9588_guest_ips_uses_qemu_tb_counter_and_frame_metrics_packet(self) -> None:
         root = Path(__file__).resolve().parents[1]
         board = (root / "qemu" / "overlay" / "hw" / "mips" / "bbk9588.c").read_text(encoding="utf-8")
+        host_bridge = (
+            root / "qemu" / "overlay" / "hw" / "display" /
+            "bbk9588_host_bridge.c"
+        ).read_text(encoding="utf-8")
         cpu_h = (root / "qemu" / "overlay" / "target" / "mips" / "cpu.h").read_text(encoding="utf-8")
         translate = (root / "qemu" / "overlay" / "target" / "mips" / "tcg" / "translate.c").read_text(encoding="utf-8")
         system = (root / "emu" / "qemu" / "system.py").read_text(encoding="utf-8")
 
-        self.assertIn("#define BBK9588_PERF_MAGIC         0x504b4242u", board)
-        self.assertIn("#define BBK9588_PERF_FORMAT_GUEST_INSNS 0x00004950u", board)
-        self.assertIn("#define BBK9588_PERF_FORMAT_AIC  0x00434941u", board)
-        self.assertIn("jz4740_aic_get_diagnostics(board->aic, &diagnostics);", board)
-        self.assertIn("bbk9588_perf_maybe_send_metrics(board, now);", board)
+        self.assertIn(
+            "#define BBK9588_PERF_MAGIC             0x504b4242u",
+            host_bridge,
+        )
+        self.assertIn(
+            "#define BBK9588_PERF_FORMAT_GUEST_INSNS 0x00004950u",
+            host_bridge,
+        )
+        self.assertIn(
+            "#define BBK9588_PERF_FORMAT_AIC        0x00434941u",
+            host_bridge,
+        )
+        self.assertIn(
+            "jz4740_aic_get_diagnostics(s->aic, &diagnostics);",
+            host_bridge,
+        )
+        self.assertIn("host_maybe_send_metrics(s, now);", host_bridge)
+        self.assertIn("static uint64_t bbk9588_guest_insn_count", board)
         self.assertIn("bbk9588_guest_insn_count_enabled", cpu_h)
         self.assertIn("uint64_t bbk9588_guest_insn_count;", cpu_h)
         self.assertIn("static void gen_bbk9588_guest_insn_count", translate)
@@ -1559,6 +1576,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
+        host_bridge = (
+            root / "hw" / "display" / "bbk9588_host_bridge.c"
+        ).read_text(encoding="utf-8")
 
         self.assertIn('#define TYPE_JZ4740_LCD "jz4740-lcd"', header)
         self.assertIn("#define LCD_CTRL_ENA               0x00000008u", source)
@@ -1593,11 +1613,13 @@ class QemuSystemCommandTests(unittest.TestCase):
             board,
         )
         self.assertIn("JZ4740_INTC_IRQ_LCD", board)
-        self.assertIn("jz4740_lcd_signal_frame_done(board->lcd);", board)
-        self.assertIn("jz4740_lcd_get_frame_source(board->lcd, &fb_va)", board)
+        self.assertIn("jz4740_lcd_signal_frame_done(s->lcd);", host_bridge)
+        self.assertIn("jz4740_lcd_get_frame_source(s->lcd, &fb_va)", host_bridge)
         self.assertNotIn("jz4740_lcd_observe_alias_write", board)
-        self.assertIn("bbk9588_guest_ram_address_valid(", board)
-        self.assertIn("segment == 0 || segment == 0x80000000u", board)
+        self.assertIn("host_guest_ram_address_valid(", host_bridge)
+        self.assertIn(
+            "segment == 0 || segment == 0x80000000u", host_bridge
+        )
         self.assertNotIn("BBK9588_LCD_MIRROR_CONFIG", board)
         self.assertNotIn("BBK9588_FRAMEBUFFER_VA", board)
         self.assertNotIn("0x804a6b88", board.lower())
@@ -1606,7 +1628,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("uint32_t jz_lcd_ctrl;", board)
         self.assertNotIn("static bool bbk9588_jz_lcd_irq_pending", board)
         self.assertNotIn("static void bbk9588_jz_lcd_write", board)
-        self.assertIn("bbk9588_panel_set_frame_done(board->panel);", board)
+        self.assertIn("bbk9588_panel_set_frame_done(s->panel);", host_bridge)
         self.assertNotIn("graphics_status", board)
         self.assertNotIn('oc, "graphics-status"', board)
         self.assertNotIn('oc, "lcd-status"', board)
@@ -1622,6 +1644,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         board = (root / "hw" / "mips" / "bbk9588.c").read_text(
             encoding="utf-8"
         )
+        host_bridge = (
+            root / "hw" / "display" / "bbk9588_host_bridge.c"
+        ).read_text(encoding="utf-8")
         meson = (root / "hw" / "mips" / "meson.build").read_text(
             encoding="utf-8"
         )
@@ -1640,11 +1665,43 @@ class QemuSystemCommandTests(unittest.TestCase):
             board,
         )
         self.assertIn("bbk9588_panel_set_write_callback", board)
-        self.assertIn("bbk9588_panel_set_frame_done(board->panel);", board)
+        self.assertIn("bbk9588_panel_set_frame_done(s->panel);", host_bridge)
         self.assertIn("../display/bbk9588_panel.c", meson)
         self.assertNotIn('"bbk9588.lcd"', board)
         self.assertNotIn("lcd_irq_status", board)
         self.assertNotIn("lcd_status", board)
+
+    def test_bbk9588_host_bridge_owns_host_output_state(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (
+            root / "hw" / "display" / "bbk9588_host_bridge.c"
+        ).read_text(encoding="utf-8")
+        header = (
+            root / "include" / "hw" / "display" /
+            "bbk9588_host_bridge.h"
+        ).read_text(encoding="utf-8")
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        meson = (root / "hw" / "mips" / "meson.build").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            '#define TYPE_BBK9588_HOST_BRIDGE "bbk9588-host-bridge"',
+            header,
+        )
+        self.assertIn("struct Bbk9588HostBridgeState", source)
+        self.assertIn("static void host_gfx_update", source)
+        self.assertIn("static void host_audio_output", source)
+        self.assertIn("static bool host_send_metrics", source)
+        self.assertIn("bbk9588_host_bridge_connect_display", board)
+        self.assertIn("bbk9588_host_bridge_connect_audio", board)
+        self.assertIn("../display/bbk9588_host_bridge.c", meson)
+        self.assertNotIn("CharFrontend frame_chr;", board)
+        self.assertNotIn("QemuConsole *lcd_console;", board)
+        self.assertNotIn("static void bbk9588_lcd_gfx_update", board)
+        self.assertNotIn("static void bbk9588_audio_output", board)
 
     def test_qemu_bbk9588_panel_ready_frame_done_and_w1c(self) -> None:
         qemu = find_qemu()

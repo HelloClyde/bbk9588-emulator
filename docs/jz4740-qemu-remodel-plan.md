@@ -83,11 +83,14 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 主要代码位置：
 
 - `qemu/overlay/hw/mips/bbk9588.c`：machine、BootROM 策略、板级连线、MSC 无介质
-  DMA transport/trace，以及尚未迁移的 LCD panel scanout/frame chardev。
+  DMA transport/trace 和尚未迁移的板级诊断。
+- `qemu/overlay/hw/display/bbk9588_host_bridge.c`：独立无 MMIO 的 host bridge，负责
+  LCD RGB565 scanout、frame/audio/perf chardev、控制台和刷新定时器。
 - `qemu/overlay/hw/sd/jz4740_msc.c`：独立 MSC register/response FIFO、command/DMA
   pending、`IREG` 写一清零、`IMASK`/IRQ14、reset、migration 和诊断接口。
 - `qemu/overlay/hw/display/bbk9588_panel.c`：独立 BBK `0xb0043000` panel/status
-  register、ready/frame-done、W1C、reset 和 migration；host scanout 仍属 machine bridge。
+  register、ready/frame-done、W1C、reset 和 migration；host scanout 由独立 bridge
+  连接，不进入 JZ4740 LCD register device。
 - `qemu/overlay/hw/misc/jz4740_cim.c`：独立 JZ4740 `0xb3060000` idle CIM；实现
   register mask、FIFO empty、disable-done、status W0C、IRQ17、reset 和 migration，
   无 camera sensor/image/DMA backend。
@@ -108,7 +111,7 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   counter、full/half compare、三组 parent IRQ、reset、migration 和诊断状态。
 - `qemu/overlay/hw/display/jz4740_lcd.c`：独立 JZ4740 LCD register、
   descriptor DMA、SOF/EOF state、IRQ、reset 和 migration；BBK panel scanout 与
-  frame chardev 板级连接暂留 machine。
+  frame chardev 板级连接位于 `bbk9588_host_bridge.c`。
 - `qemu/overlay/hw/input/jz4740_sadc.c`：独立 JZ4740 SADC register、2-entry
   touch FIFO、conversion timer、PBAT/SADCIN、IRQ、reset 和 migration；触摸坐标与
   GPIO pen/key 接线由 machine 提供。
@@ -353,12 +356,14 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] LCD controller 已迁移到独立 `hw/display/jz4740_lcd.c`，拥有独立 state、
   MMIO、descriptor DMA、IRQ output、reset、migration 和诊断接口；IRQ 直接接入
   INTC source 30。Windows QEMU C 编译和旁路链接通过，默认 NAND 冷启动实际输出
-  240x320 主菜单画面。BBK panel scanout 和 frame chardev 仍作为板级连接留在
-  machine；固定 guest mirror 与 alias observer 已删除。
+  240x320 主菜单画面。固定 guest mirror 与 alias observer 已删除。
 - [x] BBK `0xb0043000` panel/status 窗口已迁移到独立
   `hw/display/bbk9588_panel.c`，拥有 register、ready/frame-done、W1C、reset 和
   migration。descriptor qtest 覆盖 ready `0x80`、frame-done `0x81` 和清零恢复；
   JZ4740 LCDC 与 host scanout 的职责边界保持不变。
+- [x] RGB565 scanout、frame/audio/perf chardev、QEMU console、帧缓存和刷新 timer
+  已迁移到无 guest MMIO 的独立 `hw/display/bbk9588_host_bridge.c`。私有 sidecar 从
+  528 MiB raw NAND 冷启动收到 2 个非空帧，panel/LCD frame-done qtest 通过。
 
 验收：
 
@@ -538,9 +543,10 @@ underrun/overrun 都为 `0/0`，第二轮没有遗留 DMA completion、rearm 或
 
 ## 结构重构
 
-当前 `bbk9588.c` 约 2900 行。AIC、raw NAND、EMC、MSC、LCD controller、BBK
+当前 `bbk9588.c` 约 2314 行。AIC、raw NAND、EMC、MSC、LCD controller、BBK
 panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 已迁移到
-独立文件；host scanout、frame/audio/perf chardev 和板级诊断仍由 machine 持有。
+独立文件；host scanout、frame/audio/perf chardev 也已迁移到独立 host bridge，
+machine 仍持有板级诊断和部分 transport glue。
 
 - [x] 设备寄存器常量和 helper 已按模块分区，raw NAND 已有独立
   state/MMIO/backing/reset/migration/ops。
@@ -561,7 +567,7 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
   SOF/EOF IRQ、reset、migration 和 frame-source callback；固定 guest mirror 与
   alias observer 已删除。
 - [x] 新建 `hw/display/bbk9588_panel.c`，包含独立 board register、ready/frame-done、
-  W1C、reset 和 migration；host scanout/frame chardev 保持为 machine bridge。
+  W1C、reset 和 migration。
 - [x] 新建 `hw/input/jz4740_sadc.c`，包含独立 register state、touch FIFO、
   conversion timer、PBAT/SADCIN、IRQ、reset、migration 和 board callback。
 - [x] 新建 `hw/gpio/jz4740_gpio.c`，包含独立 4-port register、pin input、flag、
@@ -576,7 +582,10 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
   interrupt status/enable、IRQ、reset 和 migration；packet transport 仍属 USB 功能缺口。
 - [x] 新建 `hw/sd/jz4740_msc.c`，包含独立 register/response FIFO、command/DMA
   pending、IRQ、reset、migration 和诊断接口；可选介质 backend 仍属 MSC 功能缺口。
-- [ ] 继续收敛 host scanout、frame/audio/perf chardev 和板级诊断等其余 machine 逻辑。
+- [x] 新建 `hw/display/bbk9588_host_bridge.c`，迁移 host scanout、frame/audio/perf
+  chardev、QEMU console、帧缓存和刷新 timer；bridge 无 guest MMIO，不混入 LCD/AIC
+  register state。
+- [ ] 继续收敛板级诊断和剩余 transport glue。
 - [ ] 每个设备使用独立 state、MemoryRegion、IRQ input/output、reset 和迁移状态。
 
 拆文件时不要顺手改变行为；先给当前 MMIO 契约加运行时测试，再做机械迁移。
@@ -652,10 +661,13 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
     两次均收到非空帧；强杀 Web 后 Job Object 自动结束对应 QEMU，再次启动同一 NAND
     同样收到非空帧。严格审计为 3963 mapped、0 anomaly。代码已完全删除 disposable
     work-copy 路径，测试自行管理临时 fixture。
-24. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
+24. [x] 将 host scanout、frame/audio/perf chardev、console 和 refresh timer 从
+    machine 迁移到独立无 MMIO host bridge；Windows 对象编译、旁路链接、panel qtest
+    和 raw NAND 冷启动 2 帧回归通过。
+25. [ ] 非阻塞研究项：继续复现 FTL sequence/valid-page/回收/提交顺序和完整故障矩阵。
     正常 10-block remap raw 重启、单-block pre-commit 回退及 raw NAND FAIL qtest 已通过；
     仍缺多-block 提交边界、垃圾回收、sequence wrap 和物理故障下的 guest 恢复。
-25. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
+26. [ ] 完成 PM、USB、剩余 DMA request/corner case 和旧诊断代码清理。
 
 ## 关键验收清单
 

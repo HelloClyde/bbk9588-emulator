@@ -29,6 +29,7 @@
 #include "hw/audio/jz4740_aic.h"
 #include "hw/block/bbk9588_nand.h"
 #include "hw/char/jz4740_uart.h"
+#include "hw/display/bbk9588_host_bridge.h"
 #include "hw/display/bbk9588_panel.h"
 #include "hw/display/jz4740_lcd.h"
 #include "hw/dma/jz4740_dmac.h"
@@ -51,8 +52,6 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "target/mips/cpu.h"
-#include "ui/console.h"
-#include "ui/surface.h"
 
 #define BBK9588_RAM_DEFAULT_SIZE   (160 * MiB)
 #define BBK9588_RAM_VADDR          0x80000000u
@@ -70,18 +69,6 @@
 #define BBK9588_LCD_BYTES          (BBK9588_LCD_STRIDE * BBK9588_LCD_HEIGHT)
 #define BBK9588_LCD_VBLANK_PERIOD_MS 33
 #define BBK9588_GUI_EVENT_OBJ_OFF  0xf0u
-#define BBK9588_FRAME_MAGIC        0x464b4242u
-#define BBK9588_PERF_MAGIC         0x504b4242u
-#define BBK9588_AUDIO_MAGIC        0x414b4242u
-#define BBK9588_FRAME_FORMAT_RGB565 0x00005635u
-#define BBK9588_AUDIO_FORMAT_S16LE 0x36314c53u
-#define BBK9588_PERF_FORMAT_GUEST_INSNS 0x00004950u
-#define BBK9588_PERF_PAYLOAD_BYTES 16u
-#define BBK9588_PERF_FORMAT_AIC  0x00434941u
-#define BBK9588_AIC_PERF_WORDS  24u
-#define BBK9588_AIC_PERF_PAYLOAD_BYTES \
-    (BBK9588_AIC_PERF_WORDS * sizeof(uint64_t))
-#define BBK9588_PERF_PERIOD_MS     1000u
 #define BBK9588_AIC_DATA_PHYS      0x10020034u
 #define BBK9588_DIAG_VA            0x89f00000u
 #define BBK9588_EVENT_SCRATCH_VA   (BBK9588_DIAG_VA + 0x0000u)
@@ -161,7 +148,6 @@ struct Bbk9588MachineState {
     MachineState parent_obj;
 
     CharFrontend input_chr;
-    CharFrontend frame_chr;
     MIPSCPU *cpu;
     qemu_irq cpu_irq;
     qemu_irq aic_irq;
@@ -170,19 +156,6 @@ struct Bbk9588MachineState {
     qemu_irq tcu_irq[JZ4740_TCU_NUM_OUTPUTS];
     QEMUTimer *intc_resample_timer;
     QEMUTimer *progress_trace_timer;
-    QEMUTimer *lcd_refresh_timer;
-    QemuConsole *lcd_console;
-    DisplaySurface *lcd_surface;
-    uint8_t lcd_framebuffer[BBK9588_LCD_BYTES];
-    uint8_t lcd_last_framebuffer[BBK9588_LCD_BYTES];
-    uint32_t lcd_frame_seq;
-    uint32_t perf_seq;
-    uint32_t audio_seq;
-    int64_t lcd_scanout_not_before_ms;
-    int64_t lcd_frame_stable_not_before_ms;
-    int64_t perf_last_send_ms;
-    bool lcd_last_frame_valid;
-    bool lcd_frame_chardev_sent_valid;
     bool cpu_irq_output_enabled;
     bool intc_output_level;
     uint32_t tcu_period_ms;
@@ -193,6 +166,7 @@ struct Bbk9588MachineState {
     uint32_t intc_last_cp0_status;
     uint32_t intc_last_cp0_cause;
     JZ4740AICState *aic;
+    Bbk9588HostBridgeState *host_bridge;
     JZ4740LCDState *lcd;
     Bbk9588PanelState *panel;
     JZ4740INTCState *intc;
@@ -258,8 +232,6 @@ static void bbk9588_queue_input_event(Bbk9588MachineState *board,
                                       uint32_t arg1, uint32_t arg2);
 static void bbk9588_key_apply_host_input(Bbk9588MachineState *board,
                                          uint32_t key_code, bool down);
-static void bbk9588_lcd_schedule_vblank(Bbk9588MachineState *board);
-
 static void bbk9588_update_irq(Bbk9588MachineState *board);
 static void bbk9588_touch_trace_update(Bbk9588MachineState *board,
                                        uint32_t reason);
@@ -419,17 +391,6 @@ static bool bbk9588_guest_ram_va_valid(uint32_t va, uint32_t size)
            phys <= BBK9588_RAM_SIZE - size;
 }
 
-static bool bbk9588_guest_ram_address_valid(uint32_t address, uint32_t size)
-{
-    uint32_t segment = address & 0xe0000000u;
-    uint32_t phys = BBK9588_KSEG_TO_PHYS(address);
-
-    return (segment == 0 || segment == 0x80000000u ||
-            segment == 0xa0000000u) &&
-           size <= BBK9588_RAM_SIZE &&
-           phys <= BBK9588_RAM_SIZE - size;
-}
-
 static void bbk9588_progress_trace_sample(Bbk9588MachineState *board,
                                           uint32_t reason)
 {
@@ -529,298 +490,6 @@ static void bbk9588_event_queue_mirror_all(Bbk9588MachineState *board)
     bbk9588_event_queue_mirror_header(board);
     for (uint32_t slot = 0; slot < BBK9588_EVENT_QUEUE_SLOTS; slot++) {
         bbk9588_event_queue_mirror_slot(board, slot);
-    }
-}
-
-static void bbk9588_lcd_frame_source_changed(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-
-    bbk9588_panel_set_frame_done(board->panel);
-    board->lcd_frame_chardev_sent_valid = false;
-    board->lcd_scanout_not_before_ms =
-        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-        board->lcd_refresh_period_ms;
-    bbk9588_lcd_schedule_vblank(board);
-}
-
-static bool bbk9588_lcd_copy_framebuffer(Bbk9588MachineState *board)
-{
-    uint32_t fb_va;
-
-    jz4740_lcd_refresh_frame_source(board->lcd);
-    if (!jz4740_lcd_get_frame_source(board->lcd, &fb_va) ||
-        !bbk9588_guest_ram_address_valid(
-            fb_va, sizeof(board->lcd_framebuffer))) {
-        return false;
-    }
-
-    bbk9588_phys_read(fb_va, board->lcd_framebuffer,
-                      sizeof(board->lcd_framebuffer));
-    return true;
-}
-
-static void bbk9588_perf_maybe_send_metrics(Bbk9588MachineState *board,
-                                            int64_t now_ms);
-
-static bool bbk9588_lcd_send_frame(Bbk9588MachineState *board)
-{
-    uint32_t header[7];
-
-    if (!qemu_chr_fe_backend_connected(&board->frame_chr)) {
-        return false;
-    }
-
-    bbk9588_perf_maybe_send_metrics(
-        board, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
-
-    board->lcd_frame_seq++;
-    header[0] = cpu_to_le32(BBK9588_FRAME_MAGIC);
-    header[1] = cpu_to_le32(board->lcd_frame_seq);
-    header[2] = cpu_to_le32(BBK9588_LCD_WIDTH);
-    header[3] = cpu_to_le32(BBK9588_LCD_HEIGHT);
-    header[4] = cpu_to_le32(BBK9588_LCD_STRIDE);
-    header[5] = cpu_to_le32(BBK9588_FRAME_FORMAT_RGB565);
-    header[6] = cpu_to_le32(BBK9588_LCD_BYTES);
-
-    if (qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)header,
-                              sizeof(header)) < 0) {
-        return false;
-    }
-    if (qemu_chr_fe_write_all(&board->frame_chr, board->lcd_framebuffer,
-                              sizeof(board->lcd_framebuffer)) < 0) {
-        return false;
-    }
-    return true;
-}
-
-static void bbk9588_audio_output(void *opaque, uint32_t sample_rate,
-                                 const int16_t *samples, size_t frames)
-{
-    Bbk9588MachineState *board = opaque;
-    uint32_t header[7];
-    size_t payload_bytes = frames * 2u * sizeof(int16_t);
-
-    if (frames == 0 || !qemu_chr_fe_backend_connected(&board->frame_chr)) {
-        return;
-    }
-    board->audio_seq++;
-    header[0] = cpu_to_le32(BBK9588_AUDIO_MAGIC);
-    header[1] = cpu_to_le32(board->audio_seq);
-    header[2] = cpu_to_le32(sample_rate);
-    header[3] = cpu_to_le32(2u);
-    header[4] = cpu_to_le32(2u * sizeof(int16_t));
-    header[5] = cpu_to_le32(BBK9588_AUDIO_FORMAT_S16LE);
-    header[6] = cpu_to_le32(payload_bytes);
-
-    if (qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)header,
-                              sizeof(header)) < 0) {
-        return;
-    }
-    qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)samples,
-                          payload_bytes);
-}
-
-static bool bbk9588_perf_send_metrics(Bbk9588MachineState *board,
-                                      int64_t now_ms)
-{
-    uint32_t header[7];
-    uint64_t payload[2];
-    uint64_t insns = 0;
-
-    if (!board->cpu || !qemu_chr_fe_backend_connected(&board->frame_chr)) {
-        return false;
-    }
-
-    insns = qatomic_read(&board->cpu->env.bbk9588_guest_insn_count);
-    board->perf_seq++;
-    header[0] = cpu_to_le32(BBK9588_PERF_MAGIC);
-    header[1] = cpu_to_le32(board->perf_seq);
-    header[2] = cpu_to_le32(1);
-    header[3] = cpu_to_le32(0);
-    header[4] = cpu_to_le32(0);
-    header[5] = cpu_to_le32(BBK9588_PERF_FORMAT_GUEST_INSNS);
-    header[6] = cpu_to_le32(BBK9588_PERF_PAYLOAD_BYTES);
-    payload[0] = cpu_to_le64(insns);
-    payload[1] = cpu_to_le64((uint64_t)now_ms);
-
-    if (qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)header,
-                              sizeof(header)) < 0) {
-        return false;
-    }
-    if (qemu_chr_fe_write_all(&board->frame_chr, (const uint8_t *)payload,
-                              sizeof(payload)) < 0) {
-        return false;
-    }
-
-    if (board->aic) {
-        JZ4740AICDiagnostics diagnostics;
-        JZ4740DMACDiagnostics dmac_diagnostics;
-        uint64_t audio_payload[BBK9588_AIC_PERF_WORDS];
-
-        jz4740_aic_get_diagnostics(board->aic, &diagnostics);
-        jz4740_dmac_get_diagnostics(board->dmac, &dmac_diagnostics);
-        board->perf_seq++;
-        header[0] = cpu_to_le32(BBK9588_PERF_MAGIC);
-        header[1] = cpu_to_le32(board->perf_seq);
-        header[2] = cpu_to_le32(1);
-        header[3] = cpu_to_le32(0);
-        header[4] = cpu_to_le32(0);
-        header[5] = cpu_to_le32(BBK9588_PERF_FORMAT_AIC);
-        header[6] = cpu_to_le32(BBK9588_AIC_PERF_PAYLOAD_BYTES);
-        audio_payload[0] = cpu_to_le64(diagnostics.sample_rate);
-        audio_payload[1] = cpu_to_le64(diagnostics.tx_fifo_level);
-        audio_payload[2] = cpu_to_le64(diagnostics.rx_fifo_level);
-        audio_payload[3] = cpu_to_le64(diagnostics.flags);
-        audio_payload[4] = cpu_to_le64(diagnostics.aicfr);
-        audio_payload[5] = cpu_to_le64(diagnostics.aiccr);
-        audio_payload[6] = cpu_to_le64(diagnostics.cdccr1);
-        audio_payload[7] = cpu_to_le64(diagnostics.cdccr2);
-        audio_payload[8] = cpu_to_le64(diagnostics.tx_dma_samples);
-        audio_payload[9] = cpu_to_le64(diagnostics.rx_dma_samples);
-        audio_payload[10] = cpu_to_le64(diagnostics.output_frames);
-        audio_payload[11] = cpu_to_le64(diagnostics.input_frames);
-        audio_payload[12] = cpu_to_le64(diagnostics.underruns);
-        audio_payload[13] = cpu_to_le64(diagnostics.overruns);
-        audio_payload[14] = cpu_to_le64(dmac_diagnostics.audio_completion_count);
-        audio_payload[15] = cpu_to_le64(dmac_diagnostics.audio_rearm_count);
-        audio_payload[16] = cpu_to_le64(dmac_diagnostics.audio_last_rearm_gap_ns);
-        audio_payload[17] = cpu_to_le64(dmac_diagnostics.audio_max_rearm_gap_ns);
-        audio_payload[18] = cpu_to_le64(dmac_diagnostics.audio_total_rearm_gap_ns);
-        audio_payload[19] = cpu_to_le64(dmac_diagnostics.audio_last_gap_underruns);
-        audio_payload[20] = cpu_to_le64(dmac_diagnostics.audio_total_gap_underruns);
-        audio_payload[21] = cpu_to_le64(dmac_diagnostics.audio_last_units);
-        audio_payload[22] = cpu_to_le64(dmac_diagnostics.audio_completion_fifo);
-        audio_payload[23] = cpu_to_le64(dmac_diagnostics.audio_rearm_fifo);
-
-        if (qemu_chr_fe_write_all(&board->frame_chr,
-                                  (const uint8_t *)header,
-                                  sizeof(header)) < 0 ||
-            qemu_chr_fe_write_all(&board->frame_chr,
-                                  (const uint8_t *)audio_payload,
-                                  sizeof(audio_payload)) < 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static void bbk9588_perf_maybe_send_metrics(Bbk9588MachineState *board,
-                                            int64_t now_ms)
-{
-    if (board->perf_last_send_ms != 0 &&
-        now_ms - board->perf_last_send_ms < BBK9588_PERF_PERIOD_MS) {
-        return;
-    }
-    if (bbk9588_perf_send_metrics(board, now_ms)) {
-        board->perf_last_send_ms = now_ms;
-    }
-}
-
-static bool bbk9588_lcd_frame_changed(Bbk9588MachineState *board)
-{
-    if (!board->lcd_last_frame_valid ||
-        memcmp(board->lcd_framebuffer, board->lcd_last_framebuffer,
-               sizeof(board->lcd_framebuffer)) != 0) {
-        memcpy(board->lcd_last_framebuffer, board->lcd_framebuffer,
-               sizeof(board->lcd_framebuffer));
-        board->lcd_last_frame_valid = true;
-        return true;
-    }
-    return false;
-}
-
-static void bbk9588_lcd_gfx_update(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-    bool changed;
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-
-    if (!bbk9588_lcd_copy_framebuffer(board)) {
-        bbk9588_perf_maybe_send_metrics(board, now);
-        return;
-    }
-    changed = bbk9588_lcd_frame_changed(board);
-    if (changed) {
-        bbk9588_panel_set_frame_done(board->panel);
-        jz4740_lcd_signal_frame_done(board->lcd);
-        board->lcd_frame_chardev_sent_valid = false;
-        board->lcd_frame_stable_not_before_ms = now;
-    }
-    bbk9588_perf_maybe_send_metrics(board, now);
-    if (qemu_chr_fe_backend_connected(&board->frame_chr) &&
-        !board->lcd_frame_chardev_sent_valid &&
-        board->lcd_frame_stable_not_before_ms <= now) {
-        board->lcd_frame_chardev_sent_valid = bbk9588_lcd_send_frame(board);
-    }
-    if (!changed) {
-        return;
-    }
-    if (!board->lcd_console) {
-        return;
-    }
-    if (!board->lcd_surface) {
-        board->lcd_surface = qemu_create_displaysurface_from(
-            BBK9588_LCD_WIDTH, BBK9588_LCD_HEIGHT, PIXMAN_r5g6b5,
-            BBK9588_LCD_STRIDE, board->lcd_framebuffer);
-        dpy_gfx_replace_surface(board->lcd_console, board->lcd_surface);
-    }
-    dpy_gfx_update(board->lcd_console, 0, 0, BBK9588_LCD_WIDTH,
-                   BBK9588_LCD_HEIGHT);
-}
-
-static void bbk9588_lcd_invalidate(void *opaque)
-{
-    bbk9588_lcd_gfx_update(opaque);
-}
-
-static const GraphicHwOps bbk9588_lcd_ops = {
-    .invalidate = bbk9588_lcd_invalidate,
-    .gfx_update = bbk9588_lcd_gfx_update,
-};
-
-static void bbk9588_lcd_refresh_schedule(Bbk9588MachineState *board)
-{
-    if (!board->lcd_refresh_timer) {
-        return;
-    }
-    timer_mod(board->lcd_refresh_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-              board->lcd_refresh_period_ms);
-}
-
-static void bbk9588_lcd_schedule_vblank(Bbk9588MachineState *board)
-{
-    if (!board->lcd_refresh_timer) {
-        return;
-    }
-    timer_mod(board->lcd_refresh_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
-}
-
-static void bbk9588_lcd_refresh_timer_cb(void *opaque)
-{
-    Bbk9588MachineState *board = opaque;
-    bool wants_frame_chardev = board->frame_chardev && board->frame_chardev[0];
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-
-    if (board->lcd_scanout_not_before_ms > now) {
-        timer_mod(board->lcd_refresh_timer, board->lcd_scanout_not_before_ms);
-        return;
-    }
-
-    bbk9588_lcd_gfx_update(board);
-    bbk9588_perf_maybe_send_metrics(board, now);
-    if (wants_frame_chardev && !board->lcd_frame_chardev_sent_valid) {
-        now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-        if (board->lcd_frame_stable_not_before_ms > now) {
-            timer_mod(board->lcd_refresh_timer,
-                      board->lcd_frame_stable_not_before_ms);
-        } else {
-            bbk9588_lcd_schedule_vblank(board);
-        }
-    } else {
-        bbk9588_lcd_refresh_schedule(board);
     }
 }
 
@@ -2107,7 +1776,25 @@ static void bbk9588_create_aic_device(MachineState *machine,
                        qdev_get_gpio_in(DEVICE(board->dmac),
                                         JZ4740_DMAC_REQUEST_AIC_RX));
     board->aic = JZ4740_AIC(dev);
-    jz4740_aic_set_output_callback(board->aic, bbk9588_audio_output, board);
+}
+
+static uint64_t bbk9588_guest_insn_count(void *opaque)
+{
+    Bbk9588MachineState *board = opaque;
+
+    return board->cpu ?
+           qatomic_read(&board->cpu->env.bbk9588_guest_insn_count) : 0;
+}
+
+static void bbk9588_create_host_bridge(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_BBK9588_HOST_BRIDGE);
+
+    qdev_realize(dev, NULL, &error_fatal);
+    board->host_bridge = BBK9588_HOST_BRIDGE(dev);
+    bbk9588_host_bridge_configure(
+        board->host_bridge, board->frame_chardev,
+        board->lcd_refresh_period_ms, bbk9588_guest_insn_count, board);
 }
 
 static void bbk9588_create_intc_device(Bbk9588MachineState *board)
@@ -2192,8 +1879,6 @@ static void bbk9588_create_lcd_device(MachineState *machine,
                        qdev_get_gpio_in(DEVICE(board->intc),
                                         JZ4740_INTC_IRQ_LCD));
     board->lcd = JZ4740_LCD(dev);
-    jz4740_lcd_set_frame_source_callback(
-        board->lcd, bbk9588_lcd_frame_source_changed, board);
     jz4740_lcd_set_trace_enabled(board->lcd,
                                   board->graphics_trace_enabled);
 }
@@ -2331,8 +2016,7 @@ static void bbk9588_cpu_reset(void *opaque)
     env->bbk9588_heap_next = 0x80960000;
     env->bbk9588_guest_insn_count_enabled = true;
     qatomic_set(&env->bbk9588_guest_insn_count, 0);
-    board->perf_seq = 0;
-    board->perf_last_send_ms = 0;
+    bbk9588_host_bridge_reset_metrics(board->host_bridge);
 
     board->input_event_read_idx = 0;
     board->input_event_write_idx = 0;
@@ -2598,6 +2282,9 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->aic) {
         object_unref(OBJECT(board->aic));
     }
+    if (board->host_bridge) {
+        object_unref(OBJECT(board->host_bridge));
+    }
     if (board->aic_irq) {
         qemu_free_irq(board->aic_irq);
     }
@@ -2666,8 +2353,6 @@ static void bbk9588_instance_init(Object *obj)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
 
-    board->perf_seq = 0;
-    board->perf_last_send_ms = 0;
     board->cpu_irq_output_enabled = true;
     board->intc_output_level = false;
     board->storage_trace_enabled = false;
@@ -2682,9 +2367,6 @@ static void bbk9588_instance_init(Object *obj)
     board->nand_id_code = BBK9588_NAND_DEFAULT_ID_CODE;
     board->bootrom_nand_page = BBK9588_BOOTROM_NAND_PAGE;
     board->bootrom_size = BBK9588_BOOTROM_FIRST_STAGE_BYTES;
-    board->lcd_scanout_not_before_ms = 0;
-    board->lcd_frame_stable_not_before_ms = 0;
-    board->lcd_frame_chardev_sent_valid = false;
     board->tcu_period_ms = 10;
     board->progress_trace_period_ms = 0;
     board->lcd_refresh_period_ms = BBK9588_LCD_VBLANK_PERIOD_MS;
@@ -2697,7 +2379,6 @@ static void bbk9588_init(MachineState *machine)
     Clock *cpuclk;
     MIPSCPU *cpu;
     Chardev *input_chr;
-    Chardev *frame_chr;
 
     if (machine->ram_size < 32 * MiB) {
         error_report("bbk9588: RAM must be at least 32 MiB");
@@ -2738,13 +2419,6 @@ static void bbk9588_init(MachineState *machine)
                                               board);
     board->progress_trace_timer = timer_new_ms(
         QEMU_CLOCK_REALTIME, bbk9588_progress_trace_timer_cb, board);
-    board->lcd_refresh_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                            bbk9588_lcd_refresh_timer_cb,
-                                            board);
-    board->lcd_console = graphic_console_init(NULL, 0, &bbk9588_lcd_ops,
-                                              board);
-    qemu_console_resize(board->lcd_console, BBK9588_LCD_WIDTH,
-                        BBK9588_LCD_HEIGHT);
 
     input_chr = board->input_chardev ? qemu_chr_find(board->input_chardev) :
                 serial_hd(1);
@@ -2754,11 +2428,7 @@ static void bbk9588_init(MachineState *machine)
                                  bbk9588_input_read, NULL, NULL, board, NULL,
                                  true);
     }
-    frame_chr = board->frame_chardev ? qemu_chr_find(board->frame_chardev) :
-                NULL;
-    if (frame_chr) {
-        qemu_chr_fe_init(&board->frame_chr, frame_chr, &error_abort);
-    }
+    bbk9588_create_host_bridge(board);
     board->extgpio_wake_enable_80 = 0;
     board->sysctrl_wake_pending = false;
     board->gpio300_wake_pulse_available = false;
@@ -2781,10 +2451,14 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_touch_sync_latch(board);
     bbk9588_touch_trace_update(board, 7u);
     bbk9588_create_aic_device(machine, board);
+    bbk9588_host_bridge_connect_display(board->host_bridge, board->lcd,
+                                        board->panel);
+    bbk9588_host_bridge_connect_audio(board->host_bridge, board->aic,
+                                      board->dmac);
 
     bbk9588_load_firmware(machine);
     bbk9588_progress_trace_schedule(board);
-    bbk9588_lcd_refresh_schedule(board);
+    bbk9588_host_bridge_start(board->host_bridge);
 }
 
 static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)

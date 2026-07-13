@@ -8,6 +8,7 @@ mips_ss.add(when: 'CONFIG_BBK9588', if_true: files(
   'bbk9588.c',
   '../block/bbk9588_nand.c',
   '../char/jz4740_uart.c',
+  '../display/bbk9588_host_bridge.c',
   '../display/bbk9588_panel.c',
   '../display/jz4740_lcd.c',
   '../dma/jz4740_dmac.c',

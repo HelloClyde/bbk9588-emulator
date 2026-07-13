@@ -12,6 +12,9 @@
   QEMU，避免孤儿进程继续占用或并发写入唯一活动 NAND。
 - NAND 文件管理器改为停机后直接更新活动 NAND，并为变化 data page 重算 U-Boot/C200
   数据区 `4+9*n` RS parity；恢复镜像改由启动器显式重新导入，不保留隐藏基础副本。
+- 将 RGB565 scanout、frame/audio/perf chardev、QEMU console、帧缓存和刷新 timer
+  从 machine 迁移到独立、无 guest MMIO 的 `bbk9588_host_bridge`；JZ4740 LCD/AIC/DMAC
+  继续只持有 guest 可见硬件状态。
 - 还原 U-Boot/C200 FTL cold-scan 的 last-valid-page、完整 6-byte tail 和 16-bit 环形
   sequence 规则，新增共享 parser、严格镜像审计和 commit-tail 掉电注入工具。修正构造
   镜像 logical tag 高半字：C200 只写低 16 位，高半字必须保持 `0xffff`；旧 checkpoint

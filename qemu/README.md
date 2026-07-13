@@ -84,7 +84,9 @@ bin/bbk9588-qemu-system-mipsel.exe
   SOF/EOF/disable 状态到 INTC bit 30 的连线，以及 RGB565 frame chardev
   输出。`0xb0043000` 仍保留为当前 C200 路径使用的 BBK status 窗口；
   该窗口已迁移到独立 `hw/display/bbk9588_panel.c`，提供 board register、
-  ready/frame-done、W1C、reset 和 migration。默认启动不再注入
+  ready/frame-done、W1C、reset 和 migration。RGB565 scanout、frame/audio/perf
+  chardev、QEMU console 和刷新 timer 位于无 guest MMIO 的独立
+  `hw/display/bbk9588_host_bridge.c`。默认启动不再注入
   graphics-done/LCD-ready magic，也不再暴露对应的 machine ready override。
 - input chardev。
 - raw NAND data/OOB 访问和独立 MSC DMA 控制器行为；C200 自己扫描 raw NAND OOB、
