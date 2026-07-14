@@ -43,59 +43,16 @@ function Join-Codepoints([int[]]$Codepoints) {
     return -join ($Codepoints | ForEach-Object { [char]$_ })
 }
 
-function Import-NandSource([string]$Source, [string]$Destination) {
+function Resolve-NandSource([string]$Source) {
     $sourcePath = [System.IO.Path]::GetFullPath($Source)
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
         throw "NAND source does not exist: $sourcePath"
     }
-
-    $temporaryDir = Join-Path (Split-Path -Parent $Destination) ".nand-import"
-    $temporaryImage = "$Destination.importing"
-    $imageSource = $sourcePath
-    try {
-        if ([System.IO.Path]::GetExtension($sourcePath) -ieq ".zip") {
-            if (Test-Path -LiteralPath $temporaryDir) {
-                Remove-Item -LiteralPath $temporaryDir -Recurse -Force
-            }
-            Expand-Archive -LiteralPath $sourcePath -DestinationPath $temporaryDir -Force
-            $images = @(Get-ChildItem -LiteralPath $temporaryDir -Filter "*.bin" -File -Recurse)
-            if ($images.Count -ne 1) {
-                throw "NAND archive must contain exactly one .bin file; found $($images.Count)"
-            }
-            $imageSource = $images[0].FullName
-        }
-
-        $length = (Get-Item -LiteralPath $imageSource).Length
-        $supportedSizes = @(536870912L, 553648128L)
-        if ($length -notin $supportedSizes) {
-            throw "Unsupported NAND size $length bytes; expected 512 MiB page data or 528 MiB raw data+OOB"
-        }
-        Copy-Item -LiteralPath $imageSource -Destination $temporaryImage -Force
-        Move-Item -LiteralPath $temporaryImage -Destination $Destination -Force
-        $legacyCheckpointDir = Join-Path (Split-Path -Parent $Destination) "qemu_nand_persistent"
-        if (Test-Path -LiteralPath $legacyCheckpointDir) {
-            Remove-Item -LiteralPath $legacyCheckpointDir -Recurse -Force
-        }
-        $stream = [System.IO.File]::OpenRead($Destination)
-        try {
-            $hasher = [System.Security.Cryptography.SHA256]::Create()
-            try {
-                $hashBytes = $hasher.ComputeHash($stream)
-                $hash = ([System.BitConverter]::ToString($hashBytes) -replace "-", "").ToLowerInvariant()
-            } finally {
-                $hasher.Dispose()
-            }
-        } finally {
-            $stream.Dispose()
-        }
-        Write-Host "Imported NAND: $Destination"
-        Write-Host "SHA256: $hash"
-    } finally {
-        Remove-Item -LiteralPath $temporaryImage -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $temporaryDir) {
-            Remove-Item -LiteralPath $temporaryDir -Recurse -Force
-        }
+    $extension = [System.IO.Path]::GetExtension($sourcePath)
+    if ($extension -ine ".bin" -and $extension -ine ".zip") {
+        throw "NAND source must be a .bin or .zip file: $sourcePath"
     }
+    return $sourcePath
 }
 
 $SystemDirName = Join-Codepoints @(0x7cfb, 0x7edf)
@@ -113,12 +70,13 @@ New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 $NandImage = Join-Path $RuntimeDir "bbk9588_nand.bin"
 $LocalNandImage = Join-Path $Root "bbk9588_nand.bin"
 $LocalNandArchives = @(Get-ChildItem -LiteralPath $Root -Filter "bbk9588_nand*.zip" -File -ErrorAction SilentlyContinue)
+$NandImportSource = ""
 if ($Nand) {
-    Import-NandSource $Nand $NandImage
+    $NandImportSource = Resolve-NandSource $Nand
 } elseif (-not (Test-Path -LiteralPath $NandImage) -and (Test-Path -LiteralPath $LocalNandImage)) {
-    Import-NandSource $LocalNandImage $NandImage
+    $NandImportSource = Resolve-NandSource $LocalNandImage
 } elseif (-not (Test-Path -LiteralPath $NandImage) -and $LocalNandArchives.Count -eq 1) {
-    Import-NandSource $LocalNandArchives[0].FullName $NandImage
+    $NandImportSource = Resolve-NandSource $LocalNandArchives[0].FullName
 }
 $FallbackNandImages = @(
     (Join-Path $Root "build\bbk9588_nand_loader0_uboot40_fat_page1c40_root512_ftloob.bin"),
@@ -128,16 +86,16 @@ $FallbackNandImages = @(
     (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root512_ftloob.bin"),
     (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root256_ftloob.bin")
 )
-if (-not $RebuildImages -and -not (Test-Path -LiteralPath $NandImage)) {
+if (-not $RebuildImages -and -not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource) {
     foreach ($candidate in $FallbackNandImages) {
         if (Test-Path -LiteralPath $candidate) {
-            Copy-Item -LiteralPath $candidate -Destination $NandImage
+            $NandImportSource = Resolve-NandSource $candidate
             break
         }
     }
 }
 
-if (-not (Test-Path -LiteralPath $NandImage) -and -not $NoNandPicker) {
+if (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource -and -not $NoNandPicker) {
     try {
         Add-Type -AssemblyName System.Windows.Forms
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -145,7 +103,7 @@ if (-not (Test-Path -LiteralPath $NandImage) -and -not $NoNandPicker) {
         $dialog.Filter = "BBK 9588 NAND (*.bin;*.zip)|*.bin;*.zip|All files (*.*)|*.*"
         $dialog.CheckFileExists = $true
         if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            Import-NandSource $dialog.FileName $NandImage
+            $NandImportSource = Resolve-NandSource $dialog.FileName
         }
     } catch {
         Write-Warning "Could not open NAND file picker: $($_.Exception.Message)"
@@ -158,7 +116,7 @@ $C200Image = Join-Path $DataDir "C200.bin"
 $LoaderImage = Join-Path $DataDir "loader_9588_4740.bin"
 $Kj409588Image = Join-Path $DataDir "kj409588.bin"
 $UBootImage = Join-Path $DataDir "u_boot_9588_4740.bin"
-if ($RebuildImages -or -not (Test-Path -LiteralPath $NandImage)) {
+if ($RebuildImages -or (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource)) {
     if (
         (Test-Path -LiteralPath $LoaderImage) -and
         (Test-Path -LiteralPath $Kj409588Image) -and
@@ -174,15 +132,18 @@ if ($RebuildImages -or -not (Test-Path -LiteralPath $NandImage)) {
             "-Workspace",
             $Root,
             "-Python",
-            $Python
+            $Python,
+            "-RuntimeDir",
+            "build\nand-rebuild"
         )
         $buildRuntimeArgs += @("-Loader", (Join-Path (Join-Path $SystemDirName $DataDirName) "loader_9588_4740.bin"))
         $buildRuntimeArgs += @("-UBoot", (Join-Path (Join-Path $SystemDirName $DataDirName) "u_boot_9588_4740.bin"))
         powershell @buildRuntimeArgs
+        $NandImportSource = Join-Path $Root "build\nand-rebuild\bbk9588_nand.bin"
     }
 }
 
-if (-not (Test-Path -LiteralPath $NandImage)) {
+if (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource) {
     throw @"
 Runtime NAND image is missing:
   $NandImage
@@ -214,6 +175,10 @@ if (-not (Test-ExtraArgOption "--image")) {
         $ImageArgs = @("--image", $C200Image)
     }
 }
+$NandImportArgs = @()
+if ($NandImportSource) {
+    $NandImportArgs = @("--nand-import-source", $NandImportSource)
+}
 
 $url = "http://${HostName}:${Port}/"
 Write-Host "Starting BBK 9588 emulator at $url"
@@ -228,5 +193,6 @@ $env:PYTHONNOUSERSITE = "1"
     --nand-image $NandImage `
     --host $HostName `
     --port $Port `
+    @NandImportArgs `
     @ImageArgs `
     @ExtraArgs

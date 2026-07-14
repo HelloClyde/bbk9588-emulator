@@ -16,7 +16,10 @@
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/notify.h"
+#include "qemu/timer.h"
 #include "system/block-backend.h"
+#include "system/runstate.h"
 
 #define NAND_MMIO_SIZE            0x20000u
 #define NAND_READ_BUFFER_SIZE     4096u
@@ -32,6 +35,7 @@
 #define NAND_STATUS_FAIL          0x01u
 #define NAND_STATUS_READY         0x40u
 #define NAND_NO_FAIL_BLOCK        UINT32_MAX
+#define NAND_FLUSH_INTERVAL_MS    1000u
 
 struct Bbk9588NandState {
     SysBusDevice parent_obj;
@@ -70,6 +74,13 @@ struct Bbk9588NandState {
     uint32_t last_page;
     uint32_t last_column;
     uint32_t last_block;
+    QEMUTimer *flush_timer;
+    BlockAIOCB *flush_acb;
+    uint64_t dirty_generation;
+    uint64_t flush_generation;
+    uint64_t flushed_generation;
+    Notifier shutdown_notifier;
+    bool shutdown_notifier_registered;
     Bbk9588NandEventCallback event_callback;
     void *event_opaque;
     Bbk9588NandDataCallback data_callback;
@@ -398,6 +409,80 @@ static void nand_append_program_data(Bbk9588NandState *s, uint64_t value,
     }
 }
 
+static void nand_schedule_flush(Bbk9588NandState *s);
+
+static void nand_flush_complete(void *opaque, int ret)
+{
+    Bbk9588NandState *s = opaque;
+
+    s->flush_acb = NULL;
+    if (ret < 0) {
+        error_report("bbk9588: could not flush NAND backing: %s",
+                     strerror(-ret));
+    } else {
+        s->flushed_generation = s->flush_generation;
+    }
+    nand_schedule_flush(s);
+}
+
+static void nand_flush_timer_cb(void *opaque)
+{
+    Bbk9588NandState *s = opaque;
+
+    if (!s->blk || !blk_is_writable(s->blk) || s->flush_acb ||
+        s->dirty_generation == s->flushed_generation) {
+        return;
+    }
+    s->flush_generation = s->dirty_generation;
+    s->flush_acb = blk_aio_flush(s->blk, nand_flush_complete, s);
+}
+
+static void nand_schedule_flush(Bbk9588NandState *s)
+{
+    if (!s->flush_timer || s->flush_acb ||
+        s->dirty_generation == s->flushed_generation ||
+        timer_pending(s->flush_timer)) {
+        return;
+    }
+    timer_mod(s->flush_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+              NAND_FLUSH_INTERVAL_MS);
+}
+
+static void nand_flush_now(Bbk9588NandState *s)
+{
+    int ret;
+
+    if (s->flush_timer) {
+        timer_del(s->flush_timer);
+    }
+    if (s->flush_acb) {
+        blk_aio_cancel(s->flush_acb);
+        s->flush_acb = NULL;
+        timer_del(s->flush_timer);
+    }
+    if (!s->blk || !blk_is_writable(s->blk) ||
+        s->dirty_generation == s->flushed_generation) {
+        return;
+    }
+    ret = blk_flush(s->blk);
+    if (ret < 0) {
+        error_report("bbk9588: could not flush NAND backing on shutdown: %s",
+                     strerror(-ret));
+    } else {
+        s->flushed_generation = s->dirty_generation;
+    }
+}
+
+static void nand_shutdown_notify(Notifier *notifier, void *data)
+{
+    Bbk9588NandState *s = container_of(notifier, Bbk9588NandState,
+                                       shutdown_notifier);
+
+    (void)data;
+    nand_flush_now(s);
+}
+
 static void nand_backend_update(Bbk9588NandState *s, uint64_t offset,
                                 uint64_t length)
 {
@@ -420,7 +505,10 @@ static void nand_backend_update(Bbk9588NandState *s, uint64_t offset,
         error_report("bbk9588: could not update NAND offset=0x%" PRIx64
                      " length=0x%" PRIx64 ": %s", write_start,
                      write_end - write_start, strerror(-ret));
+        return;
     }
+    s->dirty_generation++;
+    nand_schedule_flush(s);
 }
 
 static uint32_t nand_first_word(Bbk9588NandState *s, uint64_t offset,
@@ -491,6 +579,8 @@ static void nand_commit_program(Bbk9588NandState *s)
 
 static void nand_commit_erase(Bbk9588NandState *s)
 {
+    uint64_t offset;
+    uint64_t length;
     uint32_t row;
     uint32_t block_start;
     uint32_t stride = bbk9588_nand_page_stride(s);
@@ -511,15 +601,10 @@ static void nand_commit_erase(Bbk9588NandState *s)
                   block_start, 0, true);
         return;
     }
-    for (uint32_t page = block_start;
-         page < block_start + BBK9588_NAND_PAGES_PER_BLOCK; page++) {
-        uint64_t offset = (uint64_t)page * stride;
-        uint64_t length;
-
-        if (offset >= s->size) {
-            break;
-        }
-        length = MIN((uint64_t)stride, s->size - offset);
+    offset = (uint64_t)block_start * stride;
+    if (offset < s->size) {
+        length = MIN((uint64_t)BBK9588_NAND_PAGES_PER_BLOCK * stride,
+                     s->size - offset);
         memset(s->data + offset, 0xff, length);
         nand_backend_update(s, offset, length);
     }
@@ -781,13 +866,33 @@ static void nand_realize(DeviceState *dev, Error **errp)
     if (!nand_load_backing(s, errp)) {
         return;
     }
+    s->flush_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                  nand_flush_timer_cb, s);
+    s->shutdown_notifier.notify = nand_shutdown_notify;
+    qemu_register_shutdown_notifier(&s->shutdown_notifier);
+    s->shutdown_notifier_registered = true;
     nand_reset_hold(OBJECT(s), RESET_TYPE_COLD);
+}
+
+static void nand_unrealize(DeviceState *dev)
+{
+    Bbk9588NandState *s = BBK9588_NAND(dev);
+
+    if (s->shutdown_notifier_registered) {
+        notifier_remove(&s->shutdown_notifier);
+        s->shutdown_notifier_registered = false;
+    }
+    nand_flush_now(s);
 }
 
 static void nand_finalize(Object *obj)
 {
     Bbk9588NandState *s = BBK9588_NAND(obj);
 
+    if (s->shutdown_notifier_registered) {
+        notifier_remove(&s->shutdown_notifier);
+    }
+    timer_free(s->flush_timer);
     g_free(s->data);
     g_free(s->image_path);
 }
@@ -798,6 +903,7 @@ static void nand_class_init(ObjectClass *oc, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     dc->realize = nand_realize;
+    dc->unrealize = nand_unrealize;
     dc->vmsd = &vmstate_bbk9588_nand;
     device_class_set_props(dc, nand_properties);
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);

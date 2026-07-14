@@ -2,22 +2,71 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
+import os
 import socket
+import tempfile
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import parse_qs, quote, urlparse
 
 from emu.web.frontend_ws import WebSocketFrameReader, encode_ws_frame, websocket_accept_key
+
+MAX_JSON_BODY_BYTES = 64 * 1024
+MAX_NAND_UPLOAD_BYTES = 128 * 1024 * 1024
+NAND_UPLOAD_CHUNK_BYTES = 64 * 1024
+NAND_UPLOAD_READ_TIMEOUT_SECONDS = 30.0
+
+
+def stream_upload_to_path(
+    source: BinaryIO,
+    destination: Path,
+    expected_length: int,
+    *,
+    max_length: int = MAX_NAND_UPLOAD_BYTES,
+) -> str:
+    if expected_length < 0 or expected_length > max_length:
+        raise ValueError("invalid NAND upload size")
+    received = 0
+    digest = hashlib.sha256()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("wb") as output:
+            while received < expected_length:
+                chunk = source.read(
+                    min(NAND_UPLOAD_CHUNK_BYTES, expected_length - received)
+                )
+                if not chunk:
+                    raise EOFError(
+                        "short NAND upload: "
+                        f"expected {expected_length} bytes, received {received}"
+                    )
+                output.write(chunk)
+                digest.update(chunk)
+                received += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    if received != expected_length:
+        destination.unlink(missing_ok=True)
+        raise EOFError(
+            f"short NAND upload: expected {expected_length} bytes, received {received}"
+        )
+    return digest.hexdigest()
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
     state: object
     html: str = ""
+    nand_upload_slot = threading.BoundedSemaphore(1)
 
     def end_headers(self) -> None:
         self.send_header("Permissions-Policy", "gamepad=(self)")
@@ -51,6 +100,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _read_json_body(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0") or "0")
+        if length < 0 or length > MAX_JSON_BODY_BYTES:
+            raise ValueError("invalid JSON request size")
         raw = self.rfile.read(length) if length else b"{}"
         body = json.loads(raw.decode("utf-8") or "{}")
         if not isinstance(body, dict):
@@ -424,13 +475,31 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 self._json(self.state.nand_files_delete(body.get("path")))
             elif parsed.path == "/api/files/import":
+                if self.headers.get("Transfer-Encoding"):
+                    raise ValueError("chunked NAND uploads are not supported")
                 length = int(self.headers.get("Content-Length", "0") or "0")
-                if length < 0 or length > 128 * 1024 * 1024:
+                if length < 0 or length > MAX_NAND_UPLOAD_BYTES:
                     raise ValueError("invalid NAND upload size")
-                data = self.rfile.read(length) if length else b""
                 directory = qs.get("path", ["/"])[0]
                 name = qs.get("name", [""])[0]
-                self._json(self.state.nand_files_import(directory, name, data))
+                if not self.nand_upload_slot.acquire(blocking=False):
+                    raise RuntimeError("another NAND upload is already in progress")
+                try:
+                    self.connection.settimeout(NAND_UPLOAD_READ_TIMEOUT_SECONDS)
+                    with tempfile.TemporaryDirectory(prefix="bbk9588-upload-") as tmp:
+                        upload = Path(tmp) / "upload.bin"
+                        digest = stream_upload_to_path(self.rfile, upload, length)
+                        self._json(
+                            self.state.nand_files_import(
+                                directory,
+                                name,
+                                upload,
+                                expected_size=length,
+                                expected_sha256=digest,
+                            )
+                        )
+                finally:
+                    self.nand_upload_slot.release()
             elif parsed.path == "/api/boot":
                 self._json(self.state.boot())
             elif parsed.path == "/api/checkpoint":

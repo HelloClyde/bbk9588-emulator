@@ -88,11 +88,18 @@ LCD scanout 只采用 JZ LCD descriptor source，不再读取固定 guest mirror
 framebuffer fallback。BootROM 的 normal/backup 选择也属于 machine 启动策略，只通过
 raw NAND 的只读 backing API 取 first-stage 数据。
 
-运行层只维护一个调用方明确指定的活动 raw NAND。QEMU 使用 writethrough 直接写该
-文件；Python 不创建 persistent/disposable work copy，也不执行 host canonical FTL
-压实。测试在自己的临时目录管理 fixture，probe 未显式传 NAND 时不挂载介质。Windows
-前端用 kill-on-close Job Object 约束 QEMU 子进程，Web 被强杀时不会留下继续写 NAND
-的孤儿 QEMU。
+运行层只维护一个调用方明确指定的活动 raw NAND。QEMU 使用 writeback 直接写该文件；
+首个脏写后 1 秒通过 block AIO 异步 flush，正常关闭时同步 flush，block erase 合并为
+一次 backing write。Python 不创建 persistent/disposable work copy，也不执行 host
+canonical FTL 压实。测试在自己的临时目录管理 fixture，probe 未显式传 NAND 时不挂载
+介质。Windows 前端用 kill-on-close Job Object 约束 QEMU 子进程，Web 被强杀时不会
+留下继续写 NAND 的孤儿 QEMU。
+
+Web 运行层使用一把可重入 NAND lifecycle lock 串行化停止、文件修改、镜像
+替换、重启、reset 和镜像切换。每个活动镜像路径还持有 OS 级跨进程独占
+租约；第二个 Web 实例在启动 QEMU 或覆盖镜像前就会失败。`start-web.cmd -Nand`
+的解包和导入也在持有该租约的 Web 进程内完成，不再由启动脚本
+预先覆盖活动文件。
 
 标准 BBK9588 NAND 镜像存在两种固件原生 OOB ECC 布局：BootROM 和 first-stage boot
 copy 使用 `6+9*n`，U-Boot 常规 C200/FAT NAND 路径使用 `4+9*n`。默认 boot copy 从

@@ -106,15 +106,20 @@ bin/bbk9588-qemu-system-mipsel.exe
   测试可用 `-global bbk9588-nand.fail-program-block=N` 或
   `-global bbk9588-nand.fail-erase-block=N` 让指定 physical block 的操作返回
   ready+FAIL `0x41` 且保持 backing 不变；默认值禁用故障注入。
-- Web/QEMU 直接读写调用方传入的唯一活动 raw NAND，drive 使用 writethrough；正常停止、
+- Web/QEMU 直接读写调用方传入的唯一活动 raw NAND，drive 使用 writeback；成功写入后由
+  NAND 设备按 1 秒周期通过 block AIO 异步 flush，正常停止时再同步 flush。块擦除在内存
+  中完成后以一次完整 block backing write 提交，避免逐页同步写造成的卡顿。正常停止、
   QEMU 崩溃或 Web 重启都不触发 host FTL 压实，也不创建或删除 work copy/checkpoint。
   测试自行创建临时 NAND fixture，direct-boot probe 默认不挂载 NAND。构造 OOB logical
   tag 只写低 16 位，高 16 位保持 `0xffff`，与 C200 page program 一致。旧版本 checkpoint
   仅在升级后的首次启动原子迁移到活动 NAND，迁移后删除。Windows 前端通过
   kill-on-close Job Object 保证 Web 被强杀时同步结束 QEMU，避免孤儿进程继续写活动镜像。
 - Web 文件管理在 QEMU 停止时直接修改活动 NAND，并对变化 data page 重新生成数据区
-  OOB `4+9*n` RS parity。恢复/更换镜像通过启动器显式导入 `.bin` 或单镜像 ZIP，不保留
-  隐藏基础副本。
+  OOB `4+9*n` RS parity。候选 NAND 必须通过 FTL 映射、FAT 字节和目标内容校验才能
+  原子替换；文件导入是有上限且拒绝短读的流式临时上传。Web 内停止、修改、
+  替换、重启、reset 和切换镜像共用 NAND lifecycle lock，每个活动路径还持有跨进程
+  独占租约。恢复/更换镜像通过启动器显式导入 `.bin` 或单镜像 ZIP，不保留隐藏
+  基础副本。
 - DMAC 基础 channel 模型：`0xb3020000` 按 JZ4740
   `DSA/DTA/DTC/DRT/DCS/DCM/DDA/DMAC/DIRQP/DDR` 组织 channel
   register，MSC 读写通过 channel enable + global `DMAE` 完成并置

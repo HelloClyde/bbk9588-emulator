@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import shutil
 import struct
 import threading
 import time
@@ -19,7 +21,10 @@ from emu.qemu.nand_fs import (
     mutate_nand_files,
     normalize_nand_path,
     read_fat_file,
+    validate_nand_image,
 )
+from emu.qemu.nand_lock import NandImageLease
+from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
@@ -80,6 +85,35 @@ WS_AUDIO_HEADER = struct.Struct("<8sIIHHI")
 KNOWN_FRONTEND_KEY_CODES = {4, 5, 6, 7, 9, 10}
 FRONTEND_ORIENTATIONS = frozenset({"raw", "rot180", "cw90", "ccw90", "hflip", "vflip"})
 WEB_AUDIODEV_ID = "bbk9588-web-none"
+DEFAULT_WEB_QEMU_ICOUNT = "shift=auto,align=off,sleep=on"
+
+
+def web_qemu_timing_options(
+    accel: str,
+    extra_args: tuple[str, ...],
+    *,
+    icount: str | None,
+) -> tuple[str, tuple[str, ...]]:
+    """Keep guest timers proportional to TCG progress under heavy workloads."""
+
+    value = str(icount or "").strip()
+    if value.lower() in {"", "0", "false", "none", "off"}:
+        return accel, extra_args
+
+    accel_parts = [part.strip() for part in str(accel).split(",") if part.strip()]
+    if accel_parts and accel_parts[0].lower() == "tcg":
+        accel_parts = [
+            "thread=single" if part.lower() == "thread=multi" else part
+            for part in accel_parts
+        ]
+        accel = ",".join(accel_parts)
+
+    has_icount = any(
+        str(arg).strip().lower().startswith("-icount") for arg in extra_args
+    )
+    if has_icount:
+        return accel, extra_args
+    return accel, (*extra_args, "-icount", value)
 
 
 def web_qemu_audio_options(
@@ -234,6 +268,7 @@ def display_to_panel_point(
 class FrontendState:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.nand_lifecycle_lock = threading.RLock()
         self.lock = threading.RLock()
         self.status_lock = threading.RLock()
         self.frontend_activity_condition = threading.Condition()
@@ -326,12 +361,28 @@ class FrontendState:
         self.audio_ws_sent_bytes = 0
         self.audio_ws_connection_count = 0
         self.audio_ws_connection_peak = 0
-        self.nand_files_lock = threading.Lock()
+        self.nand_files_lock = self.nand_lifecycle_lock
+        self.nand_image_lease = NandImageLease()
         self.nand_files_cache_path = BUILD / "nand_fs_cache" / "bbk9588_fat.img"
         self.nand_files_cache_signature: tuple[str, int, int] | None = None
         self.nand_legacy_checkpoint_migrated: str | None = None
+        self.nand_import_result: dict[str, object] | None = None
 
-        self.reset()
+        try:
+            import_source = getattr(args, "nand_import_source", None)
+            if import_source is not None:
+                if args.nand_image is None:
+                    raise ValueError("--nand-import-source requires --nand-image")
+                destination = Path(args.nand_image).resolve()
+                self.nand_image_lease.acquire(destination)
+                self.nand_import_result = import_nand_source(
+                    Path(import_source),
+                    destination,
+                )
+            self.reset()
+        except Exception:
+            self.nand_image_lease.release()
+            raise
 
     def _default_nand_image(self) -> Path | None:
         if bool(getattr(self.args, "no_nand", False)):
@@ -395,12 +446,27 @@ class FrontendState:
 
     def set_nand_image(self, path: object, *, reset: bool = True) -> dict[str, object]:
         selected = self._resolve_nand_image_path(path)
-        self.args.nand_image = selected
-        if reset:
-            return self.reset()
-        with self.lock:
-            self._publish_snapshot_locked()
-            return self.snapshot()
+        with self.nand_lifecycle_lock:
+            current = self.nand_image_lease.path
+            changed = current is None or self._path_key(current) != self._path_key(selected)
+            if changed:
+                replacement = NandImageLease()
+                replacement.acquire(selected)
+                try:
+                    validate_nand_image(selected)
+                    self.stop()
+                except Exception:
+                    replacement.release()
+                    raise
+                previous = self.nand_image_lease
+                self.nand_image_lease = replacement
+                previous.release()
+            self.args.nand_image = selected
+            if reset:
+                return self.reset()
+            with self.lock:
+                self._publish_snapshot_locked()
+                return self.snapshot()
 
     def _nand_files_image(self) -> Path:
         selected = self._default_nand_image()
@@ -445,14 +511,15 @@ class FrontendState:
         with self.nand_files_lock:
             return read_fat_file(self._nand_files_fat_snapshot(), file_path)
 
-    def _mutate_nand_files(self, operation) -> dict[str, object]:
+    def _mutate_nand_files(self, operation, *, validator=None) -> dict[str, object]:
         with self.nand_files_lock:
             backend = self.qemu_backend
             if backend is not None:
                 self.stop()
             image = self._nand_files_image()
+            self.nand_image_lease.acquire(image)
             try:
-                mutate_nand_files(image, operation)
+                mutate_nand_files(image, operation, validator=validator)
                 self._invalidate_nand_files_cache()
             except Exception:
                 if backend is not None:
@@ -468,7 +535,11 @@ class FrontendState:
         def operation(fs) -> None:
             fs.makedir(target, recreate=False)
 
-        result = self._mutate_nand_files(operation)
+        def validator(fs) -> None:
+            if not fs.isdir(target):
+                raise ValueError(f"created NAND directory is missing: {target}")
+
+        result = self._mutate_nand_files(operation, validator=validator)
         result["nand_file_path"] = target
         return result
 
@@ -476,17 +547,42 @@ class FrontendState:
         self,
         directory: object,
         name: object,
-        data: bytes,
+        source_path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
     ) -> dict[str, object]:
-        if len(data) > 128 * 1024 * 1024:
+        source = source_path.resolve()
+        if expected_size < 0 or expected_size > 128 * 1024 * 1024:
             raise ValueError("NAND file upload exceeds 128 MiB")
+        if source.stat().st_size != expected_size:
+            raise ValueError("temporary NAND upload size changed before import")
+        source_digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                source_digest.update(chunk)
+        if source_digest.hexdigest() != expected_sha256:
+            raise ValueError("temporary NAND upload checksum changed before import")
         target = join_nand_path(directory, name)
 
         def operation(fs) -> None:
-            fs.writebytes(target, data)
+            with source.open("rb") as input_stream, fs.openbin(target, "w") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
 
-        result = self._mutate_nand_files(operation)
-        result.update({"nand_file_path": target, "nand_file_size": len(data)})
+        def validator(fs) -> None:
+            if not fs.isfile(target):
+                raise ValueError(f"imported NAND file is missing: {target}")
+            if fs.getsize(target) != expected_size:
+                raise ValueError(f"imported NAND file has the wrong size: {target}")
+            digest = hashlib.sha256()
+            with fs.openbin(target, "r") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise ValueError(f"imported NAND file checksum mismatch: {target}")
+
+        result = self._mutate_nand_files(operation, validator=validator)
+        result.update({"nand_file_path": target, "nand_file_size": expected_size})
         return result
 
     def nand_files_rename(self, file_path: object, name: object) -> dict[str, object]:
@@ -501,7 +597,13 @@ class FrontendState:
             else:
                 raise FileNotFoundError(f"NAND path does not exist: {source}")
 
-        result = self._mutate_nand_files(operation)
+        def validator(fs) -> None:
+            if fs.exists(source):
+                raise ValueError(f"renamed NAND source still exists: {source}")
+            if not fs.exists(target):
+                raise ValueError(f"renamed NAND target is missing: {target}")
+
+        result = self._mutate_nand_files(operation, validator=validator)
         result.update({"nand_file_path": target, "nand_file_previous_path": source})
         return result
 
@@ -516,7 +618,11 @@ class FrontendState:
             else:
                 raise FileNotFoundError(f"NAND path does not exist: {target}")
 
-        result = self._mutate_nand_files(operation)
+        def validator(fs) -> None:
+            if fs.exists(target):
+                raise ValueError(f"deleted NAND path still exists: {target}")
+
+        result = self._mutate_nand_files(operation, validator=validator)
         result["nand_file_deleted"] = target
         return result
 
@@ -592,6 +698,10 @@ class FrontendState:
             self.pending_keys.clear()
 
     def reset(self) -> dict[str, object]:
+        with self.nand_lifecycle_lock:
+            return self._reset_nand_locked()
+
+    def _reset_nand_locked(self) -> dict[str, object]:
         old_backend = self.qemu_backend
         if old_backend is not None:
             callback_setter = getattr(old_backend, "set_frame_ready_callback", None)
@@ -607,17 +717,26 @@ class FrontendState:
 
         nand_image = self._default_nand_image()
         if nand_image is not None:
+            self.nand_image_lease.acquire(nand_image)
             migrated = migrate_legacy_nand_checkpoint(nand_image)
             if migrated is not None:
                 self.nand_legacy_checkpoint_migrated = str(migrated)
+        else:
+            self.nand_image_lease.release()
 
         with self.lock:
             BUILD.mkdir(parents=True, exist_ok=True)
             self.cancel_run.clear()
             self._reset_runtime_fields_locked()
+            extra_args = tuple(getattr(self.args, "qemu_extra_arg", []) or ())
+            accel, extra_args = web_qemu_timing_options(
+                getattr(self.args, "qemu_accel", "tcg,thread=multi,tb-size=256"),
+                extra_args,
+                icount=getattr(self.args, "qemu_icount", DEFAULT_WEB_QEMU_ICOUNT),
+            )
             machine_options, extra_args = web_qemu_audio_options(
                 tuple(getattr(self.args, "qemu_machine_option", []) or ()),
-                tuple(getattr(self.args, "qemu_extra_arg", []) or ()),
+                extra_args,
                 host_audio=bool(getattr(self.args, "qemu_host_audio", False)),
             )
             config = build_bbk_qemu_config(
@@ -628,7 +747,7 @@ class FrontendState:
                 ram_mb=int(getattr(self.args, "ram_mb", 160)),
                 machine=getattr(self.args, "qemu_machine", DEFAULT_QEMU_MACHINE),
                 cpu=getattr(self.args, "qemu_cpu", "24Kf"),
-                accel=getattr(self.args, "qemu_accel", "tcg,thread=multi,tb-size=256"),
+                accel=accel,
                 display="none",
                 serial="mon:stdio",
                 monitor="none",
@@ -1112,35 +1231,44 @@ class FrontendState:
         return {"error": "QEMU process backend does not support Python checkpoints", "path": str(path)}
 
     def run_start(self, name: str, total_steps: int, chunk_steps: int) -> dict[str, object]:
-        with self.lock:
-            try:
-                backend = self._ensure_qemu_started_locked()
-                self.running = bool(self._backend_snapshot(backend, refresh=False).get("running"))
-                self.job_name = name or "qemu"
-                self.job_total_steps = max(0, int(total_steps))
-                self.job_done_steps = 0
-                self.job_chunk_steps = max(0, int(chunk_steps))
-                self.job_last_slice_steps = 0
-                self.job_last_slice_timed_out = False
-                self.job_started_at = self.job_started_at or time.time()
-                self.job_finished_at = None
-                self._start_qemu_tick_worker_locked()
-            except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"
-                self.running = False
-            self._publish_snapshot_locked()
-            return self.snapshot()
+        with self.nand_lifecycle_lock:
+            with self.lock:
+                try:
+                    backend = self._ensure_qemu_started_locked()
+                    self.running = bool(self._backend_snapshot(backend, refresh=False).get("running"))
+                    self.job_name = name or "qemu"
+                    self.job_total_steps = max(0, int(total_steps))
+                    self.job_done_steps = 0
+                    self.job_chunk_steps = max(0, int(chunk_steps))
+                    self.job_last_slice_steps = 0
+                    self.job_last_slice_timed_out = False
+                    self.job_started_at = self.job_started_at or time.time()
+                    self.job_finished_at = None
+                    self._start_qemu_tick_worker_locked()
+                except Exception as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.running = False
+                self._publish_snapshot_locked()
+                return self.snapshot()
 
     def stop(self) -> dict[str, object]:
-        self.cancel_run.set()
-        with self.lock:
-            backend = self.qemu_backend
-            if backend is not None:
-                backend.stop()
-            self.running = False
-            self.job_finished_at = time.time()
-            self._publish_snapshot_locked()
-            return self.snapshot()
+        with self.nand_lifecycle_lock:
+            self.cancel_run.set()
+            with self.lock:
+                backend = self.qemu_backend
+                if backend is not None:
+                    backend.stop()
+                self.running = False
+                self.job_finished_at = time.time()
+                self._publish_snapshot_locked()
+                return self.snapshot()
+
+    def close(self) -> None:
+        with self.nand_lifecycle_lock:
+            try:
+                self.stop()
+            finally:
+                self.nand_image_lease.release()
 
     @staticmethod
     def _coerce_optional_bool(value: object) -> bool | None:

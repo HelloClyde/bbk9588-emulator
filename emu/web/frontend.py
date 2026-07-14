@@ -16,6 +16,7 @@ if __package__ in (None, ""):
 from emu.qemu.system import DEFAULT_QEMU_EXECUTABLE, DEFAULT_QEMU_MACHINE
 from emu.web.frontend_server import FrontendHandler as Handler
 from emu.web.frontend_state import (
+    DEFAULT_WEB_QEMU_ICOUNT,
     FrontendState,
     display_to_panel_point,
     display_to_raw_point,
@@ -1881,6 +1882,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--nand-image", type=Path, help="Raw NAND image backing the frontend emulator.")
     ap.add_argument(
+        "--nand-import-source",
+        type=Path,
+        help="Validated .bin or single-image ZIP to atomically import before starting QEMU.",
+    )
+    ap.add_argument(
         "--no-nand",
         action="store_true",
         help="Do not attach NAND in direct-boot diagnostic runs.",
@@ -1906,6 +1912,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--qemu-machine", default=DEFAULT_QEMU_MACHINE, help="QEMU machine.")
     ap.add_argument("--qemu-cpu", default="24Kf", help="QEMU CPU model.")
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256", help="QEMU accelerator options.")
+    ap.add_argument(
+        "--qemu-icount",
+        default=DEFAULT_WEB_QEMU_ICOUNT,
+        help="QEMU instruction clock options used to keep guest timers stable under load.",
+    )
+    ap.add_argument(
+        "--no-qemu-icount",
+        dest="qemu_icount",
+        action="store_const",
+        const=None,
+        help="Disable the Web frontend's instruction-clock timing mode.",
+    )
     ap.add_argument("--qemu-gdb", default="none", help="QEMU GDB stub target; use 'auto' to allocate a local port.")
     ap.add_argument("--qemu-timeout", type=float, default=5.0, help="Default bounded-run timeout used by QEMU probes.")
     ap.add_argument(
@@ -1953,7 +1971,7 @@ def main(argv: list[str] | None = None) -> int:
             profiler.disable()
     finally:
         try:
-            state.stop()
+            state.close()
         except Exception:
             pass
         httpd.server_close()

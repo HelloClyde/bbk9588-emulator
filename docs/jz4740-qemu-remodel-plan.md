@@ -289,11 +289,22 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   不删除调用者传入的 NAND。
 - [x] NAND 文件管理器在 QEMU 停止后直接操作同一活动 NAND，并完成导入、导出、改名、
   删除后原地冷启动回归；不得再通过 canonical checkpoint 隐式重排 FTL physical block。
+- [x] Web 的停止、修改、替换、重启、reset 和镜像切换已统一进入 NAND lifecycle
+  lock；活动路径持有 OS 级跨进程独占租约，第二实例不能共用同一 NAND。
+  `start-web.cmd -Nand` 也先取得该租约，再执行导入和替换。
+- [x] Web 文件导入已改为最大 128 MiB 的分块临时上传，拒绝 chunked、超限和短读；
+  上传临时文件在写入 FAT 前和候选 NAND 中均校验大小与 SHA256。
+- [x] 离线写入先构造同目录候选 NAND，检查 FTL 映射元数据不变、FAT 逻辑镜像与
+  请求结果一致，并从候选镜像重新读取目标文件验证大小和 SHA256。全部通过后
+  才 `os.replace()`；任一校验失败时原 NAND 字节不变。
 
 验收：
 
 - [x] QEMU 不认识 FAT boot sector、目录项、文件名或资源对象，主菜单仍可进入。
 - [x] raw NAND program/erase 不再保护构造镜像中的 FAT page range。
+- [x] 运行时 NAND drive 已从逐次 `writethrough` 改为 `writeback`；首个脏写后 1 秒通过
+  block AIO 异步 flush，正常关闭时同步 flush。block erase 的 64 个 page backing write
+  已合并为一次完整 block write，避免固件 FTL 回收时放大主循环卡顿。
 - [x] 删除 MSC OOB FTL 翻译后，固件仍能扫描 OOB、读取资源并执行 raw NAND 写入。
 - [x] RS clean、1~4-error correction、5-error uncorrectable、status/IRQ 和 BootROM
   backup 行为已有手册参数下的已知向量、纯 C、qtest 与运行时交叉回归。
@@ -339,6 +350,10 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   检查；默认 NAND 约 46 秒自动校准进入主菜单，主菜单时钟正常递增，方向键产生新帧，
   Web 保持一个 frontend 和一个 QEMU 实例。雷霆战机实际战斗 12 秒新增 233 帧，
   采样约 20.48 fps、1.56 MIPS，随后可正常退出回主菜单。
+- [x] 2026-07-14 Web 默认启用 QEMU 自适应 icount，并在该模式下使用 single-thread
+  TCG。飞天影音的 MPEG-4/MP3 视频在解码负载下连续 40 秒从 93 帧增长到 968 帧，
+  audio DMA completion/rearm 从 219/219 增长到 469/469，underrun 保持 0；不再因
+  guest tick 越过播放器判等目标而永久忙等。TCU counter/flag/IRQ 硬件语义未改。
 - [ ] 去掉 wake proxy 后，待机、按键唤醒和所有应用计时仍稳定。
 
 ### 4. LCD/SLCD 输出：部分完成

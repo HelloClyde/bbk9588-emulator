@@ -159,6 +159,124 @@ def extract_logical_fat_image(nand_path: Path, output_path: Path) -> int:
 
 
 def inject_logical_fat_image(nand_path: Path, fat_path: Path) -> None:
+    inject_logical_fat_image_validated(nand_path, fat_path)
+
+
+def _ftl_record_signature(result) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            record.physical,
+            record.kind,
+            record.sequence,
+            record.logical,
+            record.tail,
+            record.last_valid_page,
+            record.marker,
+        )
+        for record in result.records
+    )
+
+
+def _validate_ftl_scan(result, *, label: str) -> None:
+    if 0 not in result.mapping:
+        raise ValueError(f"{label} NAND has no logical FTL block zero")
+    anomalies = [
+        record
+        for record in result.records
+        if record.kind in {"torn", "invalid"}
+    ]
+    if anomalies:
+        first = anomalies[0]
+        raise ValueError(
+            f"{label} NAND has {first.kind} FTL block 0x{first.physical:x}: "
+            f"{first.reason or 'invalid FTL state'}"
+        )
+
+
+def _files_equal(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as left_stream, right.open("rb") as right_stream:
+        while True:
+            left_chunk = left_stream.read(1024 * 1024)
+            right_chunk = right_stream.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def _validate_nand_candidate(
+    reference: Path,
+    candidate: Path,
+    expected_fat: Path,
+    validator: Callable[[PyFatFS], object] | None,
+) -> None:
+    reference_scan = scan_ftl_image(reference)
+    candidate_scan = scan_ftl_image(candidate)
+    _validate_ftl_scan(reference_scan, label="source")
+    _validate_ftl_scan(candidate_scan, label="candidate")
+    if reference_scan.block_count != candidate_scan.block_count:
+        raise ValueError("candidate NAND geometry changed during FAT injection")
+    if _ftl_record_signature(reference_scan) != _ftl_record_signature(candidate_scan):
+        raise ValueError("candidate NAND changed FTL mapping metadata")
+
+    verify_fat = expected_fat.with_name(f".{expected_fat.name}.verify")
+    try:
+        extract_logical_fat_image(candidate, verify_fat)
+        if not _files_equal(expected_fat, verify_fat):
+            raise ValueError("candidate NAND FAT data does not match the requested mutation")
+        fs = _open_fat(verify_fat, read_only=True)
+        try:
+            if not fs.isdir("/"):
+                raise ValueError("candidate NAND FAT root directory is unavailable")
+            if validator is not None:
+                validator(fs)
+        finally:
+            fs.close()
+    finally:
+        verify_fat.unlink(missing_ok=True)
+
+
+def validate_nand_image(nand_path: Path) -> dict[str, int]:
+    """Validate the firmware FTL map and mountable logical FAT volume."""
+
+    nand = nand_path.resolve()
+    result = scan_ftl_image(nand)
+    _validate_ftl_scan(result, label="selected")
+    with tempfile.TemporaryDirectory(prefix="bbk9588-nand-validate-") as tmp:
+        fat_path = Path(tmp) / "nand-fat.img"
+        fat_size = extract_logical_fat_image(nand, fat_path)
+        fs = _open_fat(fat_path, read_only=True)
+        try:
+            if not fs.isdir("/"):
+                raise ValueError("selected NAND FAT root directory is unavailable")
+            fs.listdir("/")
+        finally:
+            fs.close()
+    return {
+        "block_count": result.block_count,
+        "mapped_logical_blocks": len(result.mapping),
+        "fat_size": fat_size,
+    }
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def inject_logical_fat_image_validated(
+    nand_path: Path,
+    fat_path: Path,
+    *,
+    validator: Callable[[PyFatFS], object] | None = None,
+) -> None:
     nand = nand_path.resolve()
     fat = fat_path.resolve()
     mapping = _nand_block_map(nand)
@@ -198,7 +316,9 @@ def inject_logical_fat_image(nand_path: Path, fat_path: Path) -> None:
                 raise IOError(f"FAT injection left {remaining} bytes unwritten")
             output.flush()
             os.fsync(output.fileno())
+        _validate_nand_candidate(nand, temporary, fat, validator)
         os.replace(temporary, nand)
+        _fsync_parent_directory(nand.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -270,6 +390,8 @@ def read_nand_file(nand_path: Path, file_path: object) -> tuple[str, bytes]:
 def mutate_nand_files(
     nand_path: Path,
     operation: Callable[[PyFatFS], object],
+    *,
+    validator: Callable[[PyFatFS], object] | None = None,
 ) -> object:
     with tempfile.TemporaryDirectory(prefix="bbk9588-fat-write-") as tmp:
         fat_path = Path(tmp) / "nand-fat.img"
@@ -280,5 +402,12 @@ def mutate_nand_files(
                 result = operation(fs)
         finally:
             fs.close()
-        inject_logical_fat_image(nand_path, fat_path)
+        with fat_path.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        inject_logical_fat_image_validated(
+            nand_path,
+            fat_path,
+            validator=validator,
+        )
         return result

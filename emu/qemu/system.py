@@ -7757,7 +7757,7 @@ def build_qemu_command(config: QemuSystemConfig) -> list[str]:
         nand_path = str(config.nand_image.resolve()).replace("\\", "/")
         command.extend([
             "-drive",
-            f"if=mtd,index=0,format=raw,cache=writethrough,file={nand_path}",
+            f"if=mtd,index=0,format=raw,cache=writeback,file={nand_path}",
         ])
     for plugin in config.plugins:
         plugin_path = str(plugin.resolve()).replace("\\", "/")

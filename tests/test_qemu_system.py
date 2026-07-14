@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import os
 import socket
@@ -32,6 +33,8 @@ from emu.qemu.nand_fs import (
     normalize_nand_path,
     read_nand_file,
 )
+from emu.qemu.nand_lock import NandImageInUseError, NandImageLease
+from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
     DEFAULT_BBK9588_FIRMWARE_PATCHES,
     DEFAULT_C200_BASE,
@@ -62,13 +65,16 @@ from emu.qemu.system import (
     migrate_legacy_nand_checkpoint,
     qemu_subprocess_env,
 )
+from emu.web.frontend_server import stream_upload_to_path
 from emu.web.frontend_state import (
+    DEFAULT_WEB_QEMU_ICOUNT,
     FRONTEND_INPUT_CALIBRATION_TARGETS,
     WS_AUDIO_HEADER,
     WS_AUDIO_MAGIC,
     FrontendState,
     display_to_touch_point,
     web_qemu_audio_options,
+    web_qemu_timing_options,
 )
 from tests.qemu_audio_wav import (
     analyze_pcm_wav,
@@ -121,6 +127,50 @@ def _place_test_nand_page(
     image[offset + page_size + 6 : offset + page_size + len(oob)] = oob[6:]
     if valid:
         image[offset + page_size + 2 : offset + page_size + 5] = b"\x00\x00\x00"
+
+
+def _make_nand_file_manager_fixture(root: Path) -> tuple[Path, Path]:
+    fat_image = root / "fat.img"
+    nand_image = root / "nand.bin"
+    volume_offset = 0x20 * 512
+    volume_size = 32 * 1024 * 1024
+    fat_image.write_bytes(b"\0" * (volume_offset + volume_size))
+    formatter = PyFat(encoding="gbk", offset=volume_offset)
+    formatter.mkfs(
+        str(fat_image),
+        fat_type=PyFat.FAT_TYPE_FAT16,
+        size=volume_size,
+    )
+    formatter.close()
+    with fat_image.open("r+b") as stream:
+        stream.seek(volume_offset + 28)
+        stream.write((0x20).to_bytes(4, "little"))
+    fs = PyFatFS(
+        str(fat_image),
+        encoding="gbk",
+        offset=volume_offset,
+        preserve_case=True,
+    )
+    fs.makedir("/应用")
+    fs.close()
+
+    fat_size = fat_image.stat().st_size
+    logical_blocks = (fat_size + LOGICAL_BLOCK_SIZE - 1) // LOGICAL_BLOCK_SIZE
+    nand_image.write_bytes(b"\xff" * ((logical_blocks + 1) * RAW_BLOCK_SIZE))
+    with fat_image.open("rb") as source, nand_image.open("r+b") as nand:
+        for logical in range(logical_blocks):
+            physical = logical + 1
+            block = source.read(LOGICAL_BLOCK_SIZE)
+            block += b"\0" * (LOGICAL_BLOCK_SIZE - len(block))
+            for page in range(PAGES_PER_BLOCK):
+                start = page * PAGE_SIZE
+                nand.seek(physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE)
+                nand.write(block[start : start + PAGE_SIZE])
+            oob = physical * RAW_BLOCK_SIZE + PAGE_SIZE
+            nand.seek(oob + 58)
+            nand.write((1).to_bytes(2, "little"))
+            nand.write(logical.to_bytes(4, "little"))
+    return fat_image, nand_image
 
 
 class _QTestClient:
@@ -510,7 +560,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertFalse(any("u_boot_9588_4740.bin" in arg for arg in command), command)
         self.assertFalse(any(arg.startswith("loader,file=") for arg in command), command)
         drive = command[command.index("-drive") + 1]
-        self.assertIn("cache=writethrough", drive)
+        self.assertIn("cache=writeback", drive)
         self.assertIn(nand.resolve().as_posix(), drive)
         self.assertNotIn("qemu_nand_runs", drive)
 
@@ -1129,7 +1179,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertTrue(machine_arg.startswith("bbk9588,"), machine_arg)
         self.assertIn("-drive", command)
         self.assertIn(
-            f"if=mtd,index=0,format=raw,cache=writethrough,file={nand_qemu}",
+            f"if=mtd,index=0,format=raw,cache=writeback,file={nand_qemu}",
             command,
         )
 
@@ -2366,6 +2416,11 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("s->program_len - column", program)
         self.assertIn("s->data[data_offset + i] &=", program)
         self.assertIn("memset(s->data + offset, 0xff, length);", erase)
+        self.assertIn(
+            "(uint64_t)BBK9588_NAND_PAGES_PER_BLOCK * stride", erase
+        )
+        self.assertEqual(erase.count("nand_backend_update(s, offset, length);"), 1)
+        self.assertNotIn("for (uint32_t page = block_start", erase)
         self.assertNotIn("column = 0;", program)
         self.assertNotIn("BBK9588_NAND_READ_SOURCE_INITIAL", source)
         self.assertNotIn("initial_data", source)
@@ -2376,6 +2431,18 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("bbk9588_nand_page_is_fat_protected", source)
         self.assertNotIn("bbk9588-nand-program-protect", source)
         self.assertNotIn("bbk9588-nand-erase-protect", source)
+
+    def test_bbk9588_nand_uses_periodic_async_and_shutdown_flushes(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "qemu/overlay/hw/block/bbk9588_nand.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("#define NAND_FLUSH_INTERVAL_MS    1000u", source)
+        self.assertIn("blk_aio_flush(s->blk, nand_flush_complete, s)", source)
+        self.assertIn("timer_new_ms(QEMU_CLOCK_REALTIME", source)
+        self.assertIn("qemu_register_shutdown_notifier", source)
+        self.assertIn("ret = blk_flush(s->blk);", source)
 
     def test_qemu_bbk9588_nand_program_and_erase_failure_status(self) -> None:
         qemu = find_qemu()
@@ -2437,6 +2504,8 @@ class QemuSystemCommandTests(unittest.TestCase):
                 client.writeb(nand_command, 0x70)
                 self.assertEqual(client.readb(nand_data), 0x40)
                 self.assertEqual(read_first_byte(0), 0xA5)
+                time.sleep(1.2)
+                self.assertIsNone(client.process.poll())
 
             persisted = image.read_bytes()
             self.assertEqual(persisted[0], 0xA5)
@@ -3991,46 +4060,7 @@ class QemuSystemCommandTests(unittest.TestCase):
     def test_nand_file_manager_round_trips_fat16_operations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            fat_image = root / "fat.img"
-            nand_image = root / "nand.bin"
-            volume_offset = 0x20 * 512
-            volume_size = 32 * 1024 * 1024
-            fat_image.write_bytes(b"\0" * (volume_offset + volume_size))
-            formatter = PyFat(encoding="gbk", offset=volume_offset)
-            formatter.mkfs(
-                str(fat_image),
-                fat_type=PyFat.FAT_TYPE_FAT16,
-                size=volume_size,
-            )
-            formatter.close()
-            with fat_image.open("r+b") as stream:
-                stream.seek(volume_offset + 28)
-                stream.write((0x20).to_bytes(4, "little"))
-            fs = PyFatFS(
-                str(fat_image),
-                encoding="gbk",
-                offset=volume_offset,
-                preserve_case=True,
-            )
-            fs.makedir("/应用")
-            fs.close()
-
-            fat_size = fat_image.stat().st_size
-            logical_blocks = (fat_size + LOGICAL_BLOCK_SIZE - 1) // LOGICAL_BLOCK_SIZE
-            nand_image.write_bytes(b"\xff" * ((logical_blocks + 1) * RAW_BLOCK_SIZE))
-            with fat_image.open("rb") as source, nand_image.open("r+b") as nand:
-                for logical in range(logical_blocks):
-                    physical = logical + 1
-                    block = source.read(LOGICAL_BLOCK_SIZE)
-                    block += b"\0" * (LOGICAL_BLOCK_SIZE - len(block))
-                    for page in range(PAGES_PER_BLOCK):
-                        start = page * PAGE_SIZE
-                        nand.seek(physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE)
-                        nand.write(block[start : start + PAGE_SIZE])
-                    oob = physical * RAW_BLOCK_SIZE + PAGE_SIZE
-                    nand.seek(oob + 58)
-                    nand.write((1).to_bytes(2, "little"))
-                    nand.write(logical.to_bytes(4, "little"))
+            _fat_image, nand_image = _make_nand_file_manager_fixture(root)
 
             root_entries = list_nand_directory(nand_image)
             self.assertEqual([entry["name"] for entry in root_entries["entries"]], ["应用"])
@@ -4068,6 +4098,181 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertEqual(normalize_nand_path("A:\\应用\\游戏"), "/应用/游戏")
             with self.assertRaises(ValueError):
                 normalize_nand_path("/应用/../系统")
+
+    def test_nand_candidate_validation_failure_preserves_original_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _fat_image, nand_image = _make_nand_file_manager_fixture(root)
+            before = hashlib.sha256(nand_image.read_bytes()).hexdigest()
+
+            def install(fs: PyFatFS) -> None:
+                fs.writebytes("/应用/demo.bda", b"BDA-TEST")
+
+            def reject_candidate(_fs: PyFatFS) -> None:
+                raise ValueError("target validation failed")
+
+            with self.assertRaisesRegex(ValueError, "target validation failed"):
+                mutate_nand_files(
+                    nand_image,
+                    install,
+                    validator=reject_candidate,
+                )
+
+            after = hashlib.sha256(nand_image.read_bytes()).hexdigest()
+            self.assertEqual(after, before)
+            self.assertEqual(list_nand_directory(nand_image, "/应用")["entries"], [])
+            self.assertEqual(list(root.glob(".*.files.tmp")), [])
+
+    def test_nand_source_validation_failure_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _fat_image, valid = _make_nand_file_manager_fixture(root)
+            destination = root / "runtime" / "bbk9588_nand.bin"
+            destination.parent.mkdir()
+            destination.write_bytes(valid.read_bytes())
+            imported = import_nand_source(valid, destination)
+            before = hashlib.sha256(destination.read_bytes()).hexdigest()
+            self.assertEqual(imported["sha256"], before)
+            self.assertEqual(list_nand_directory(destination)["entries"][0]["name"], "应用")
+            invalid = root / "invalid.bin"
+            invalid.write_bytes(b"not a raw NAND image")
+
+            with self.assertRaisesRegex(ValueError, "unsupported NAND geometry"):
+                import_nand_source(invalid, destination)
+
+            self.assertEqual(
+                hashlib.sha256(destination.read_bytes()).hexdigest(),
+                before,
+            )
+            self.assertEqual(list(destination.parent.glob(".*.importing")), [])
+
+    def test_stream_upload_rejects_short_and_oversized_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upload = root / "upload.bin"
+            payload = b"BDA" * 4096
+
+            digest = stream_upload_to_path(io.BytesIO(payload), upload, len(payload))
+
+            self.assertEqual(upload.read_bytes(), payload)
+            self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+
+            short = root / "short.bin"
+            with self.assertRaisesRegex(EOFError, "short NAND upload"):
+                stream_upload_to_path(io.BytesIO(payload), short, len(payload) + 1)
+            self.assertFalse(short.exists())
+
+            oversized = root / "oversized.bin"
+            with self.assertRaisesRegex(ValueError, "invalid NAND upload size"):
+                stream_upload_to_path(
+                    io.BytesIO(payload),
+                    oversized,
+                    len(payload),
+                    max_length=len(payload) - 1,
+                )
+            self.assertFalse(oversized.exists())
+
+    def test_nand_image_lease_rejects_another_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "bbk9588_nand.bin"
+            ready = root / "locked"
+            image.write_bytes(b"\xff")
+            script = "\n".join(
+                (
+                    "import sys, time",
+                    "from pathlib import Path",
+                    "from emu.qemu.nand_lock import NandImageLease",
+                    "lease = NandImageLease()",
+                    "lease.acquire(Path(sys.argv[1]))",
+                    "Path(sys.argv[2]).write_text('locked', encoding='ascii')",
+                    "time.sleep(30)",
+                )
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(image), str(ready)],
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            lease = NandImageLease()
+            try:
+                deadline = time.monotonic() + 10.0
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if not ready.exists():
+                    self.fail(
+                        "NAND lock holder did not start "
+                        f"(returncode={process.poll()})"
+                    )
+
+                with self.assertRaisesRegex(NandImageInUseError, "already in use"):
+                    lease.acquire(image)
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+            lease.acquire(image)
+            self.assertEqual(lease.path, image.resolve())
+            lease.release()
+
+    def test_nand_lifecycle_lock_serializes_mutation_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "bbk9588_nand.bin"
+            image.write_bytes(b"\xff")
+            state = FrontendState.__new__(FrontendState)
+            state.nand_lifecycle_lock = threading.RLock()
+            state.nand_files_lock = state.nand_lifecycle_lock
+            state.nand_image_lease = NandImageLease()
+            state.qemu_backend = None
+            state._nand_files_image = lambda: image  # type: ignore[method-assign]
+            state._invalidate_nand_files_cache = lambda: None  # type: ignore[method-assign]
+            state.snapshot = lambda: {}  # type: ignore[method-assign]
+
+            mutation_entered = threading.Event()
+            allow_mutation = threading.Event()
+            reset_entered = threading.Event()
+            failures: list[BaseException] = []
+
+            def fake_mutation(_image, _operation, *, validator=None) -> None:
+                mutation_entered.set()
+                if not allow_mutation.wait(timeout=5):
+                    raise TimeoutError("mutation test timed out")
+
+            def fake_reset() -> dict[str, object]:
+                reset_entered.set()
+                return {}
+
+            state._reset_nand_locked = fake_reset  # type: ignore[method-assign]
+
+            def run_mutation() -> None:
+                try:
+                    state._mutate_nand_files(lambda _fs: None)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            def run_reset() -> None:
+                try:
+                    state.reset()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with mock.patch("emu.web.frontend_state.mutate_nand_files", fake_mutation):
+                mutation_thread = threading.Thread(target=run_mutation)
+                reset_thread = threading.Thread(target=run_reset)
+                mutation_thread.start()
+                self.assertTrue(mutation_entered.wait(timeout=2))
+                reset_thread.start()
+                self.assertFalse(reset_entered.wait(timeout=0.2))
+                allow_mutation.set()
+                mutation_thread.join(timeout=5)
+                reset_thread.join(timeout=5)
+
+            state.nand_image_lease.release()
+            self.assertFalse(mutation_thread.is_alive())
+            self.assertFalse(reset_thread.is_alive())
+            self.assertTrue(reset_entered.is_set())
+            self.assertEqual(failures, [])
 
     def test_backend_status_exposes_direct_active_nand(self) -> None:
         image = Path("runtime") / "bbk9588_nand.bin"
@@ -6528,6 +6733,32 @@ class QemuSystemCommandTests(unittest.TestCase):
             ),
         )
 
+    def test_web_qemu_timing_defaults_to_icount_and_single_thread_tcg(self) -> None:
+        accel, extra_args = web_qemu_timing_options(
+            "tcg,thread=multi,tb-size=256",
+            (),
+            icount=DEFAULT_WEB_QEMU_ICOUNT,
+        )
+
+        self.assertEqual(accel, "tcg,thread=single,tb-size=256")
+        self.assertEqual(extra_args, ("-icount", DEFAULT_WEB_QEMU_ICOUNT))
+        self.assertEqual(
+            web_qemu_timing_options(
+                "tcg,thread=multi,tb-size=256",
+                ("-icount", "shift=7"),
+                icount=DEFAULT_WEB_QEMU_ICOUNT,
+            ),
+            ("tcg,thread=single,tb-size=256", ("-icount", "shift=7")),
+        )
+        self.assertEqual(
+            web_qemu_timing_options(
+                "tcg,thread=multi,tb-size=256",
+                (),
+                icount=None,
+            ),
+            ("tcg,thread=multi,tb-size=256", ()),
+        )
+
     def test_frontend_performance_metrics_compute_web_and_png_rates(self) -> None:
         state = self._frontend_state_without_qemu(
             argparse.Namespace(
@@ -6873,12 +7104,18 @@ class QemuSystemCommandTests(unittest.TestCase):
             Path("runtime") / "bbk9588_nand.bin",
         )
 
-    def test_explicit_nand_import_discards_only_legacy_checkpoint_state(self) -> None:
+    def test_explicit_nand_import_runs_inside_frontend_nand_lease(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "packaging" / "start-web.ps1"
         ).read_text(encoding="utf-8")
+        importer = (
+            Path(__file__).resolve().parents[1] / "emu" / "qemu" / "nand_source.py"
+        ).read_text(encoding="utf-8")
 
-        self.assertIn('"qemu_nand_persistent"', script)
+        self.assertIn('"--nand-import-source"', script)
+        self.assertNotIn("function Import-NandSource", script)
+        self.assertNotIn("Move-Item -LiteralPath $temporaryImage", script)
+        self.assertIn('"qemu_nand_persistent"', importer)
         self.assertNotIn("qemu_nand_runs", script)
 
     def test_frontend_qemu_backend_status_and_stop(self) -> None:

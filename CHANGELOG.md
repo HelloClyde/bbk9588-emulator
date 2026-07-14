@@ -5,7 +5,10 @@
 
 ## [Unreleased]
 
-- Web/QEMU 改为 writethrough 直接读写唯一活动 raw NAND，删除 persistent/disposable
+- Web 默认启用 QEMU 自适应 icount，并在启用时使用单线程 TCG，使 TCU 虚拟时间与
+  guest 指令进度保持同步；修复视频解码负载下播放器错过目标 tick 后永久忙等、
+  画面停住且 CPU 单核满载的问题。可用 `--no-qemu-icount` 关闭以做时序对比。
+- Web/QEMU 改为 writeback 直接读写唯一活动 raw NAND，删除 persistent/disposable
   work copy、canonical checkpoint、正常停止压实流程和相关状态/CLI；测试改为显式管理
   临时 fixture，probe 默认不挂载 NAND。旧 checkpoint 首次启动会原子迁入活动镜像。
 - Windows QEMU 子进程加入 kill-on-close Job Object；Web 被强制终止时由内核同步结束
