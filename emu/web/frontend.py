@@ -38,7 +38,7 @@ HTML = r"""<!doctype html>
     .app-header { height: 56px; display: flex; align-items: center; gap: 10px; padding: 0 18px; border-bottom: 1px solid #343941; background: #191b1f; }
     .workspace { height: calc(100vh - 56px); min-height: 0; display: grid; grid-template-columns: minmax(280px, 340px) minmax(390px, 1fr) minmax(280px, 340px); grid-template-areas: "controls stage status"; overflow: hidden; }
     .control-sidebar { grid-area: controls; padding: 16px; border-right: 1px solid #343941; background: #1b1e22; overflow: auto; }
-    .emulator-stage { grid-area: stage; min-width: 0; padding: 16px 20px 22px; display: flex; flex-direction: column; align-items: center; gap: 12px; overflow: auto; }
+    .emulator-stage { grid-area: stage; min-width: 0; min-height: 0; padding: 16px 20px 18px; display: flex; flex-direction: column; align-items: center; gap: 12px; overflow: hidden; }
     .status-sidebar { grid-area: status; min-height: 0; padding: 16px; border-left: 1px solid #343941; background: #202327; display: flex; flex-direction: column; overflow: hidden; }
     h1 { font-size: 18px; margin: 0; font-weight: 650; }
     h2 { font-size: 13px; margin: 0 0 10px; color: #b8c0cc; font-weight: 600; }
@@ -48,14 +48,38 @@ HTML = r"""<!doctype html>
     button.warn { background: #9b3b3b; }
     button:disabled { opacity: .55; cursor: default; }
     .icon-button { width: 40px; height: 36px; display: inline-grid; place-items: center; padding: 0; font-size: 22px; line-height: 1; }
-    .screen-toolbar { width: min(560px, 100%); display: flex; justify-content: center; align-items: center; gap: 8px; }
+    .power-button { position: relative; color: #d5dae1; }
+    .power-button::before { content: ""; width: 17px; height: 17px; border: 2px solid currentColor; border-radius: 50%; }
+    .power-button::after { content: ""; width: 2px; height: 11px; position: absolute; top: 7px; left: 19px; background: currentColor; box-shadow: 0 0 0 2px #343941; }
+    .power-button.active { background: #9b3b3b; }
+    .power-button.active::after { box-shadow: 0 0 0 2px #9b3b3b; }
+    .audio-button { color: #d5dae1; }
+    .audio-icon { position: relative; display: block; width: 24px; height: 20px; }
+    .audio-speaker { position: absolute; left: 1px; top: 5px; width: 12px; height: 10px; background: currentColor; clip-path: polygon(0 30%, 32% 30%, 100% 0, 100% 100%, 32% 70%, 0 70%); }
+    .audio-wave { position: absolute; border-right: 2px solid currentColor; border-radius: 0 50% 50% 0; }
+    .audio-wave-one { right: 5px; top: 5px; width: 5px; height: 10px; }
+    .audio-wave-two { right: 0; top: 2px; width: 8px; height: 16px; }
+    .audio-slash { display: none; position: absolute; left: 16px; top: 1px; width: 2px; height: 18px; border-radius: 1px; background: currentColor; transform: rotate(-42deg); }
+    .audio-button.is-muted .audio-wave { display: none; }
+    .audio-button.is-muted .audio-slash { display: block; }
+    .settings-button { color: #d5dae1; font-size: 20px; }
+    .screen-toolbar { width: min(560px, 100%); position: relative; z-index: 2; flex: 0 0 auto; display: flex; justify-content: center; align-items: center; gap: 8px; }
     .orientation-label { min-width: 54px; text-align: center; color: #c9d1d9; font-size: 12px; font-variant-numeric: tabular-nums; }
-    .screen-wrap { width: 100%; min-height: 0; display: flex; justify-content: center; align-items: center; background: #08090b; border: 1px solid #343941; border-radius: 8px; padding: 12px; }
-    #screen { display: block; width: min(360px, 100%); height: auto; max-height: 62vh; image-rendering: pixelated; background: #000; cursor: crosshair; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-    #screen.landscape { width: min(560px, 100%); }
+    .screen-wrap { width: 100%; min-height: 0; position: relative; flex: 1 1 auto; display: flex; justify-content: center; align-items: center; overflow: hidden; background: #08090b; border: 1px solid #343941; border-radius: 8px; padding: 12px; }
+    #screen { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; image-rendering: pixelated; background: #000; cursor: crosshair; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+    .screen-stop-overlay { position: absolute; inset: 12px; z-index: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 9px; padding: 24px; background: rgba(8, 9, 11, .92); text-align: center; }
+    .screen-stop-overlay[hidden] { display: none; }
+    .screen-stop-icon { width: 32px; height: 32px; position: relative; color: #b8c0cc; }
+    .screen-stop-icon::before { content: ""; position: absolute; inset: 5px 3px 1px; border: 2px solid currentColor; border-radius: 50%; }
+    .screen-stop-icon::after { content: ""; position: absolute; top: 0; left: 14px; width: 4px; height: 17px; border-left: 2px solid currentColor; background: rgba(8, 9, 11, .92); }
+    .screen-stop-title { font-size: 17px; font-weight: 650; }
+    .screen-stop-message { max-width: 320px; color: #aeb7c4; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    .screen-stop-overlay.error .screen-stop-icon, .screen-stop-overlay.error .screen-stop-title { color: #ff9f9f; }
+    .screen-stop-overlay button { margin-top: 5px; }
     .fullscreen-exit { display: none; position: absolute; top: 12px; right: 12px; z-index: 2; background: rgba(32, 35, 39, .86); }
     .screen-wrap:fullscreen, .screen-wrap:-webkit-full-screen { width: 100vw; height: 100vh; padding: 16px; border: 0; border-radius: 0; background: #000; position: relative; }
     .screen-wrap:fullscreen #screen, .screen-wrap:-webkit-full-screen #screen { width: auto; height: auto; max-width: none; max-height: none; }
+    .screen-wrap:fullscreen .screen-stop-overlay, .screen-wrap:-webkit-full-screen .screen-stop-overlay { inset: 16px; }
     .screen-wrap:fullscreen .fullscreen-exit, .screen-wrap:-webkit-full-screen .fullscreen-exit { display: grid; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .panel { border: 1px solid #343941; border-radius: 8px; padding: 12px; background: #1b1e22; margin-bottom: 14px; }
@@ -76,7 +100,18 @@ HTML = r"""<!doctype html>
     .key-right { grid-column: 4; grid-row: 2; }
     .key-cancel { grid-column: 1; grid-row: 1 / 3; }
     .key-ok { grid-column: 5; grid-row: 1 / 3; }
-    .keymap-panel { width: 100%; border-top: 1px solid #343941; padding-top: 12px; }
+    .settings-dialog { width: min(620px, calc(100vw - 24px)); max-width: none; max-height: calc(100dvh - 24px); padding: 0; border: 1px solid #414751; border-radius: 8px; background: #1b1e22; color: #e8eaed; box-shadow: 0 18px 50px rgba(0, 0, 0, .55); }
+    .settings-dialog::backdrop { background: rgba(0, 0, 0, .66); }
+    .settings-dialog-shell { max-height: calc(100dvh - 26px); display: flex; flex-direction: column; overflow: hidden; }
+    .settings-dialog-header { min-height: 52px; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 10px 16px; border-bottom: 1px solid #343941; }
+    .settings-dialog-header h2 { margin: 0; color: #e8eaed; font-size: 15px; }
+    .settings-close { width: 32px; height: 32px; padding: 0; background: #343941; font-size: 22px; line-height: 1; }
+    .settings-tabs { display: flex; gap: 4px; padding: 10px 14px 0; }
+    .settings-tab { background: transparent; color: #aeb7c4; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; padding: 8px 12px; }
+    .settings-tab.active { color: white; border-bottom-color: #5794ff; background: #25292f; }
+    .settings-dialog-body { min-height: 0; padding: 14px; overflow-y: auto; overscroll-behavior: contain; }
+    .settings-pane[hidden] { display: none; }
+    .keymap-panel { width: 100%; }
     .keymap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .keymap-header h2 { margin: 0; }
     .keymap-header .icon-button { width: 32px; height: 30px; font-size: 18px; }
@@ -114,6 +149,8 @@ HTML = r"""<!doctype html>
     .file-actions button.delete { background: #693333; }
     .file-empty { padding: 20px 4px; color: #8f99a7; font-size: 12px; text-align: center; }
     .file-manager-status { min-height: 18px; margin-top: 8px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
+    .operation-status { width: 100%; min-height: 18px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
+    .operation-status.error { color: #ff9f9f; }
     .mobile-drawer-button, .drawer-header, .drawer-backdrop { display: none; }
     .drawer-header { min-height: 38px; align-items: center; justify-content: space-between; margin-bottom: 12px; color: #cbd3dd; font-size: 13px; font-weight: 600; }
     .drawer-close { width: 32px; height: 32px; padding: 0; background: #343941; font-size: 22px; line-height: 1; }
@@ -131,9 +168,7 @@ HTML = r"""<!doctype html>
       .emulator-stage { width: 100%; height: 100%; padding: 8px 10px 12px; gap: 8px; overflow: hidden; }
       .screen-toolbar { flex: 0 0 auto; }
       .screen-wrap { flex: 1 1 auto; min-height: 0; padding: 6px; }
-      #screen { max-height: 100%; }
       .device-controls { flex: 0 0 auto; gap: 0; }
-      .keymap-panel { display: none; }
       .control-sidebar, .status-sidebar {
         width: min(86vw, 340px); height: calc(100dvh - 50px); position: fixed; top: 50px; bottom: 0; z-index: 30;
         padding: 12px; border: 0; box-shadow: 0 0 24px rgba(0, 0, 0, .45); transition: transform 180ms ease;
@@ -145,8 +180,12 @@ HTML = r"""<!doctype html>
       .drawer-backdrop { position: fixed; inset: 50px 0 0; z-index: 25; width: 100%; height: auto; padding: 0; border: 0; border-radius: 0; background: rgba(0, 0, 0, .55); }
       .drawer-backdrop:not([hidden]) { display: block; }
     }
+    @media (max-width: 560px) {
+      .binding-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     @media (max-width: 380px) {
       .device-keypad { grid-template-columns: repeat(5, 48px); gap: 6px; }
+      .binding-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -168,22 +207,38 @@ HTML = r"""<!doctype html>
       <section class="panel">
         <h2>模拟器</h2>
         <div class="row">
-          <button id="stop" class="secondary">停止</button>
-          <button id="reset" class="warn">重置</button>
-          <label class="check"><input id="frontendInputCalibration" type="checkbox">前端输入校准</label>
+          <button id="stop" class="secondary">安全关机</button>
+          <button id="reset" class="secondary">重新启动</button>
+          <button id="forceStop" class="warn">强制停止</button>
         </div>
+        <div id="operationStatus" class="operation-status" role="status" aria-live="polite"></div>
       </section>
     </aside>
     <main class="emulator-stage">
       <div class="screen-toolbar" role="toolbar" aria-label="屏幕控制">
+        <button id="openSettings" class="secondary icon-button settings-button" title="设置" aria-label="打开设置" aria-haspopup="dialog" aria-controls="settingsDialog">⚙</button>
         <button id="rotateLeft" class="secondary icon-button" title="向左旋转 90°" aria-label="向左旋转 90°">↶</button>
         <span id="orientationLabel" class="orientation-label">180°</span>
         <button id="rotateRight" class="secondary icon-button" title="向右旋转 90°" aria-label="向右旋转 90°">↷</button>
-        <button id="toggleAudio" class="secondary icon-button" title="关闭声音" aria-label="关闭声音">🔊</button>
+        <button id="toggleAudio" class="secondary icon-button audio-button" title="关闭声音" aria-label="关闭声音">
+          <span class="audio-icon" aria-hidden="true">
+            <span class="audio-speaker"></span>
+            <span class="audio-wave audio-wave-one"></span>
+            <span class="audio-wave audio-wave-two"></span>
+            <span class="audio-slash"></span>
+          </span>
+        </button>
         <button id="toggleFullscreen" class="secondary icon-button" title="全屏" aria-label="全屏">⛶</button>
+        <button id="powerKey" class="secondary icon-button power-button" data-key="11" data-name="power" title="电源" aria-label="电源"></button>
       </div>
       <div id="screenWrap" class="screen-wrap">
         <canvas id="screen" width="240" height="320"></canvas>
+        <div id="screenStopOverlay" class="screen-stop-overlay" role="status" aria-live="polite" hidden>
+          <div class="screen-stop-icon" aria-hidden="true"></div>
+          <div id="screenStopTitle" class="screen-stop-title">设备已关机</div>
+          <div id="screenStopMessage" class="screen-stop-message"></div>
+          <button id="restartFromOverlay">重新启动</button>
+        </div>
         <button id="exitFullscreen" class="secondary icon-button fullscreen-exit" title="退出全屏" aria-label="退出全屏">×</button>
       </div>
       <div class="device-controls">
@@ -192,24 +247,9 @@ HTML = r"""<!doctype html>
           <button class="device-key key-left" data-key="6" data-name="left" aria-label="左"><span class="key-symbol">←</span><kbd data-key-hint="6">A</kbd></button>
           <button class="device-key key-down" data-key="5" data-name="down" aria-label="下"><span class="key-symbol">↓</span><kbd data-key-hint="5">S</kbd></button>
           <button class="device-key key-right" data-key="7" data-name="right" aria-label="右"><span class="key-symbol">→</span><kbd data-key-hint="7">D</kbd></button>
-          <button class="device-key key-cancel" data-key="9" data-name="cancel" aria-label="退出"><span class="key-symbol">退出</span><kbd data-key-hint="9">Esc</kbd></button>
-          <button class="device-key key-ok" data-key="10" data-name="ok" aria-label="确定"><span class="key-symbol">确定</span><kbd data-key-hint="10">Space</kbd></button>
+          <button class="device-key key-cancel" data-key="9" data-name="cancel" aria-label="退出"><span class="key-symbol">退出</span><kbd data-key-hint="9">K</kbd></button>
+          <button class="device-key key-ok" data-key="10" data-name="ok" aria-label="确定"><span class="key-symbol">确定</span><kbd data-key-hint="10">J</kbd></button>
         </div>
-        <section class="keymap-panel">
-          <div class="keymap-header">
-            <h2>输入映射</h2>
-            <button id="resetKeyBindings" class="secondary icon-button" title="恢复默认映射" aria-label="恢复默认映射">↺</button>
-          </div>
-          <div class="binding-grid">
-            <div class="binding-control"><span>上</span><button data-binding-code="4">W / 手柄↑</button></div>
-            <div class="binding-control"><span>下</span><button data-binding-code="5">S / 手柄↓</button></div>
-            <div class="binding-control"><span>左</span><button data-binding-code="6">A / 手柄←</button></div>
-            <div class="binding-control"><span>右</span><button data-binding-code="7">D / 手柄→</button></div>
-            <div class="binding-control"><span>确定</span><button data-binding-code="10">Space / 手柄 B0</button></div>
-            <div class="binding-control"><span>退出</span><button data-binding-code="9">Esc / 手柄 B1</button></div>
-          </div>
-          <div id="gamepadStatus" class="gamepad-status" role="status">未检测到手柄；请按任意手柄键</div>
-        </section>
       </div>
     </main>
     <aside id="statusDrawer" class="status-sidebar" aria-label="状态与文件">
@@ -237,6 +277,38 @@ HTML = r"""<!doctype html>
     </aside>
   </div>
   <button id="drawerBackdrop" class="drawer-backdrop" title="关闭抽屉" aria-label="关闭抽屉" hidden></button>
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+    <div class="settings-dialog-shell">
+      <header class="settings-dialog-header">
+        <h2 id="settingsTitle">设置</h2>
+        <button id="closeSettings" class="settings-close" title="关闭" aria-label="关闭设置">×</button>
+      </header>
+      <div class="settings-tabs" role="tablist" aria-label="设置分类">
+        <button id="keymapSettingsTab" class="settings-tab active" role="tab" aria-selected="true" aria-controls="keymapSettingsPane">按键映射</button>
+        <button id="touchSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="touchSettingsPane">触摸</button>
+      </div>
+      <div class="settings-dialog-body">
+        <section id="keymapSettingsPane" class="settings-pane keymap-panel" role="tabpanel" aria-labelledby="keymapSettingsTab">
+          <div class="keymap-header">
+            <h2>输入映射</h2>
+            <button id="resetKeyBindings" class="secondary icon-button" title="恢复默认映射" aria-label="恢复默认映射">↺</button>
+          </div>
+          <div class="binding-grid">
+            <div class="binding-control"><span>上</span><button data-binding-code="4">W / 手柄↑</button></div>
+            <div class="binding-control"><span>下</span><button data-binding-code="5">S / 手柄↓</button></div>
+            <div class="binding-control"><span>左</span><button data-binding-code="6">A / 手柄←</button></div>
+            <div class="binding-control"><span>右</span><button data-binding-code="7">D / 手柄→</button></div>
+            <div class="binding-control"><span>确定</span><button data-binding-code="10">J / 手柄 B0</button></div>
+            <div class="binding-control"><span>退出</span><button data-binding-code="9">K / 手柄 B1</button></div>
+          </div>
+          <div id="gamepadStatus" class="gamepad-status" role="status">未检测到手柄；请按任意手柄键</div>
+        </section>
+        <section id="touchSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="touchSettingsTab" hidden>
+          <label class="check"><input id="frontendInputCalibration" type="checkbox">前端输入校准</label>
+        </section>
+      </div>
+    </div>
+  </dialog>
 <script>
 const screen = document.getElementById('screen');
 const screenCtx = screen.getContext('2d', { alpha: false });
@@ -244,12 +316,29 @@ screenCtx.imageSmoothingEnabled = false;
 const statusEl = document.getElementById('status');
 const frontendInputCalibrationEl = document.getElementById('frontendInputCalibration');
 const imageStatusEl = document.getElementById('imageStatus');
+const openSettingsEl = document.getElementById('openSettings');
+const settingsDialogEl = document.getElementById('settingsDialog');
+const closeSettingsEl = document.getElementById('closeSettings');
+const keymapSettingsTabEl = document.getElementById('keymapSettingsTab');
+const touchSettingsTabEl = document.getElementById('touchSettingsTab');
+const keymapSettingsPaneEl = document.getElementById('keymapSettingsPane');
+const touchSettingsPaneEl = document.getElementById('touchSettingsPane');
 const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
 const toggleAudioEl = document.getElementById('toggleAudio');
 const toggleFullscreenEl = document.getElementById('toggleFullscreen');
 const exitFullscreenEl = document.getElementById('exitFullscreen');
 const screenWrapEl = document.getElementById('screenWrap');
+const screenStopOverlayEl = document.getElementById('screenStopOverlay');
+const screenStopTitleEl = document.getElementById('screenStopTitle');
+const screenStopMessageEl = document.getElementById('screenStopMessage');
+const restartFromOverlayEl = document.getElementById('restartFromOverlay');
+const stopEl = document.getElementById('stop');
+const resetEl = document.getElementById('reset');
+const forceStopEl = document.getElementById('forceStop');
+const operationStatusEl = document.getElementById('operationStatus');
+const powerKeyEl = document.getElementById('powerKey');
+const deviceKeyEls = [...document.querySelectorAll('.device-key')];
 const orientationLabelEl = document.getElementById('orientationLabel');
 const resetKeyBindingsEl = document.getElementById('resetKeyBindings');
 const gamepadStatusEl = document.getElementById('gamepadStatus');
@@ -269,6 +358,7 @@ const fileImportInputEl = document.getElementById('fileImportInput');
 let poller = null;
 let framePoller = null;
 let framePollInFlight = false;
+let lifecycleRequestPending = false;
 let ws = null;
 let wsOpenPromise = null;
 let wsWatchdog = null;
@@ -303,6 +393,7 @@ let rgb565Lut = null;
 let rawImageData = null;
 let bindingCaptureCode = null;
 let currentSidebarTab = 'status';
+let currentSettingsTab = 'keymap';
 let activeDrawer = null;
 let currentNandDirectory = '/';
 let nandFilesBusy = false;
@@ -317,13 +408,16 @@ const audioTargetLeadSeconds = 0.06;
 const audioMaximumLeadSeconds = 0.3;
 const keyBindingStorageKey = 'bbk9588.keyBindings.v1';
 const gamepadBindingStorageKey = 'bbk9588.gamepadBindings.v1';
+const inputSessionId = window.crypto?.randomUUID?.() ||
+  `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+const keyLeaseHeartbeatMs = 250;
 const defaultKeyBindings = Object.freeze({
   4:'KeyW',
   5:'KeyS',
   6:'KeyA',
   7:'KeyD',
-  9:'Escape',
-  10:'Space',
+  9:'KeyK',
+  10:'KeyJ',
 });
 const defaultGamepadBindings = Object.freeze({
   4:'button:12',
@@ -333,6 +427,13 @@ const defaultGamepadBindings = Object.freeze({
   9:'button:1',
   10:'button:0',
 });
+const legacyDefaultKeyBindings = Object.freeze({9:'Escape', 10:'Space'});
+const legacyDefaultGamepadBindings = Object.freeze({
+  4:'axis:1:-',
+  5:'axis:1:+',
+  6:'axis:0:-',
+  7:'axis:0:+',
+});
 const rotationOrientations = ['raw', 'cw90', 'rot180', 'ccw90'];
 const orientationLabels = {raw:'0°', cw90:'90°', rot180:'180°', ccw90:'270°', hflip:'水平', vflip:'垂直'};
 let keyBindings = loadKeyBindings();
@@ -340,7 +441,16 @@ let gamepadBindings = loadGamepadBindings();
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const body = await res.text();
+    try {
+      const detail = JSON.parse(body);
+      throw new Error(detail.error || body);
+    } catch (err) {
+      if (err instanceof SyntaxError) throw new Error(body);
+      throw err;
+    }
+  }
   return await res.json();
 }
 function commandFetchFallback(msg) {
@@ -595,6 +705,33 @@ function setSidebarTab(tab) {
   filesTabEl.hidden = !filesActive;
   if (filesActive) loadNandFiles(currentNandDirectory).catch(showFileManagerError);
 }
+function setSettingsTab(tab) {
+  currentSettingsTab = tab === 'touch' ? 'touch' : 'keymap';
+  const touchActive = currentSettingsTab === 'touch';
+  keymapSettingsTabEl.classList.toggle('active', !touchActive);
+  touchSettingsTabEl.classList.toggle('active', touchActive);
+  keymapSettingsTabEl.setAttribute('aria-selected', String(!touchActive));
+  touchSettingsTabEl.setAttribute('aria-selected', String(touchActive));
+  keymapSettingsPaneEl.hidden = touchActive;
+  touchSettingsPaneEl.hidden = !touchActive;
+  if (touchActive && bindingCaptureCode !== null) {
+    bindingCaptureCode = null;
+    updateKeyBindingUi();
+  }
+}
+function openSettingsDialog() {
+  closeDrawers();
+  releaseButtonInputs('settings-open');
+  releaseKeyboardInputs('settings-open');
+  releaseGamepadInputs('settings-open');
+  setSettingsTab(currentSettingsTab);
+  if (!settingsDialogEl.open) settingsDialogEl.showModal();
+}
+function closeSettingsDialog() {
+  bindingCaptureCode = null;
+  updateKeyBindingUi();
+  if (settingsDialogEl.open) settingsDialogEl.close();
+}
 function formatFileSize(value) {
   const size = Math.max(0, Number(value || 0));
   if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
@@ -765,13 +902,11 @@ function updateFullscreenScreenSize() {
   const active = currentFullscreenElement() === screenWrapEl;
   toggleFullscreenEl.title = active ? '退出全屏' : '全屏';
   toggleFullscreenEl.setAttribute('aria-label', active ? '退出全屏' : '全屏');
-  if (!active) {
-    screen.style.removeProperty('width');
-    screen.style.removeProperty('height');
-    return;
-  }
-  const availableWidth = Math.max(1, window.innerWidth - 32);
-  const availableHeight = Math.max(1, window.innerHeight - 32);
+  const wrapStyle = getComputedStyle(screenWrapEl);
+  const horizontalPadding = parseFloat(wrapStyle.paddingLeft) + parseFloat(wrapStyle.paddingRight);
+  const verticalPadding = parseFloat(wrapStyle.paddingTop) + parseFloat(wrapStyle.paddingBottom);
+  const availableWidth = Math.max(1, screenWrapEl.clientWidth - horizontalPadding);
+  const availableHeight = Math.max(1, screenWrapEl.clientHeight - verticalPadding);
   const scale = Math.min(availableWidth / screen.width, availableHeight / screen.height);
   screen.style.width = `${Math.max(1, Math.floor(screen.width * scale))}px`;
   screen.style.height = `${Math.max(1, Math.floor(screen.height * scale))}px`;
@@ -836,6 +971,7 @@ function renderStatus(s) {
   const qemuAudio = qemuPerf.audio || {};
   const audioTransport = s.audio_transport || {};
   const frontendPerf = s.frontend_performance || {};
+  renderLifecycle(s);
   const rows = [
     ['running', s.running],
     ['since reset', formatElapsed(s.reset_elapsed_seconds ?? s.emulator_elapsed_seconds)],
@@ -865,6 +1001,8 @@ function renderStatus(s) {
     ['frame sent', s.frame_push?.ws_sent_count ?? 0],
     ['push lag', `${s.frame_push?.source_lag_ms ?? ''} ms`],
     ['frame skipped', s.frame_push?.replace_count ?? 0],
+    ['shutdown', s.safe_shutdown?.state || 'idle'],
+    ['shutdown error', s.safe_shutdown?.error || ''],
     ['stop', s.stop_reason || ''],
     ['pc', s.pc],
     ['qemu region', s.qemu_pc_region || s.qemu_pc_classification?.region || s.qemu_pc_classification?.name || ''],
@@ -890,6 +1028,39 @@ function renderStatus(s) {
     statusNodes.push(labelEl, valueEl);
   }
   statusEl.replaceChildren(...statusNodes);
+}
+function lifecyclePresentation(s) {
+  const detail = s.stop_detail;
+  if (s.running || !detail?.code) return null;
+  if (detail.code === 'guest-shutdown') {
+    return {title:'设备已关机', message:'系统固件已通过 RTC 电源管理完成关机。', action:'重新启动', error:false};
+  }
+  if (detail.code === 'user-stop') {
+    return {title:'模拟器已停止', message:'模拟器已由用户停止。', action:'启动', error:false};
+  }
+  if (detail.code === 'guest-reset') {
+    return {title:'设备请求重启', message:'系统固件请求了重启；QEMU 按当前的不自动重启设置退出。', action:'重新启动', error:false};
+  }
+  if (detail.code === 'process-exit') {
+    return {title:'模拟器已退出', message:'QEMU 已正常退出，但未收到明确的设备关机原因。', action:'重新启动', error:false};
+  }
+  const suffix = detail.returncode == null ? '' : `（退出码 ${detail.returncode}）`;
+  const error = detail.error ? ` ${detail.error}` : '';
+  return {title:'模拟器异常退出', message:`QEMU 未正常运行${suffix}。${error}`, action:'重新启动', error:true};
+}
+function renderLifecycle(s) {
+  const presentation = lifecyclePresentation(s);
+  screenStopOverlayEl.hidden = !presentation;
+  stopEl.disabled = !s.running || lifecycleRequestPending;
+  resetEl.disabled = lifecycleRequestPending;
+  forceStopEl.disabled = !s.running || lifecycleRequestPending;
+  powerKeyEl.disabled = !s.running || lifecycleRequestPending;
+  for (const button of deviceKeyEls) button.disabled = !s.running || lifecycleRequestPending;
+  if (!presentation) return;
+  screenStopOverlayEl.classList.toggle('error', presentation.error);
+  screenStopTitleEl.textContent = presentation.title;
+  screenStopMessageEl.textContent = presentation.message;
+  restartFromOverlayEl.textContent = presentation.action;
 }
 async function refresh() { renderStatus(await api('/api/status')); }
 async function refreshFrameFallback() {
@@ -1071,8 +1242,8 @@ function connectWs() {
 }
 
 function updateAudioButton() {
-  toggleAudioEl.textContent = audioEnabled ? '🔊' : '🔇';
   const running = audioContext?.state === 'running' && !audioClockStalled;
+  toggleAudioEl.classList.toggle('is-muted', !audioEnabled);
   toggleAudioEl.title = !audioEnabled ? '开启声音' : running ? '关闭声音' : '启动声音';
   toggleAudioEl.setAttribute('aria-label', toggleAudioEl.title);
   toggleAudioEl.classList.toggle('warn', audioEnabled && !running);
@@ -1241,37 +1412,57 @@ function stopPolling() {
 function stopFramePolling() {
   if (framePoller) { clearInterval(framePoller); framePoller = null; }
 }
-function requestStop() {
-  wsSend({op:'stop'});
-  setTimeout(async () => {
-    try {
-      const status = await api('/api/status');
-      if (!status.running) {
-        renderStatus(status);
-        return;
-      }
-      renderStatus(await api('/api/command', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({op:'stop'})
-      }));
-    } catch (err) {
-      console.error(err);
-    }
-  }, 1200);
+function setOperationStatus(message = '', error = false) {
+  operationStatusEl.textContent = message;
+  operationStatusEl.classList.toggle('error', error);
 }
-document.getElementById('reset').onclick = async () => {
-  stopPolling();
+async function runLifecycleCommand(op, pendingLabel) {
+  if (lifecycleRequestPending) return;
+  lifecycleRequestPending = true;
+  setOperationStatus(pendingLabel);
+  stopEl.disabled = true;
+  resetEl.disabled = true;
+  forceStopEl.disabled = true;
+  powerKeyEl.disabled = true;
+  try {
+    const status = await api('/api/command', jsonRequest({op}));
+    renderStatus(status);
+    setOperationStatus(status.lifecycle_notice || '');
+  } catch (err) {
+    console.error(err);
+    setOperationStatus(err?.message || String(err), true);
+  } finally {
+    lifecycleRequestPending = false;
+    ensurePolling();
+    try { renderStatus(await api('/api/status')); } catch (err) { console.error(err); }
+  }
+}
+function requestStop() { return runLifecycleCommand('stop', '正在等待固件安全关机'); }
+async function restartEmulator() {
   stopScheduledAudio();
-  wsSend({op:'reset'});
-};
-document.getElementById('stop').onclick = async () => {
-  stopPolling();
-  requestStop();
+  return runLifecycleCommand('reset', '正在安全关机并重新启动');
+}
+resetEl.onclick = restartEmulator;
+restartFromOverlayEl.onclick = restartEmulator;
+stopEl.onclick = requestStop;
+forceStopEl.onclick = () => {
+  if (!window.confirm('强制停止可能中断 NAND 写入并损坏文件系统，确定继续？')) return;
+  runLifecycleCommand('force-stop', '正在强制停止');
 };
 frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
+openSettingsEl.onclick = openSettingsDialog;
+closeSettingsEl.onclick = closeSettingsDialog;
+keymapSettingsTabEl.onclick = () => setSettingsTab('keymap');
+touchSettingsTabEl.onclick = () => setSettingsTab('touch');
+settingsDialogEl.addEventListener('cancel', ev => {
+  ev.preventDefault();
+  closeSettingsDialog();
+});
+settingsDialogEl.addEventListener('click', ev => {
+  if (ev.target === settingsDialogEl) closeSettingsDialog();
+});
 openControlsDrawerEl.onclick = () => openDrawer('controls');
 openStatusDrawerEl.onclick = () => openDrawer('status');
 drawerBackdropEl.onclick = closeDrawers;
@@ -1343,6 +1534,10 @@ toggleFullscreenEl.disabled = !(
 document.addEventListener('fullscreenchange', updateFullscreenScreenSize);
 document.addEventListener('webkitfullscreenchange', updateFullscreenScreenSize);
 window.addEventListener('resize', updateFullscreenScreenSize);
+if ('ResizeObserver' in window) {
+  const screenResizeObserver = new ResizeObserver(updateFullscreenScreenSize);
+  screenResizeObserver.observe(screenWrapEl);
+}
 
 function loadKeyBindings() {
   const bindings = {...defaultKeyBindings};
@@ -1351,9 +1546,22 @@ function loadKeyBindings() {
     for (const code of Object.keys(bindings)) {
       if (typeof saved[code] === 'string' && saved[code]) bindings[code] = saved[code];
     }
+    let migrated = false;
+    for (const [code, legacyBinding] of Object.entries(legacyDefaultKeyBindings)) {
+      const replacement = defaultKeyBindings[code];
+      const replacementInUse = Object.entries(bindings).some(
+        ([otherCode, binding]) => otherCode !== code && binding === replacement
+      );
+      if (bindings[code] === legacyBinding && !replacementInUse) {
+        bindings[code] = replacement;
+        saved[code] = replacement;
+        migrated = true;
+      }
+    }
     if (new Set(Object.values(bindings)).size !== Object.keys(bindings).length) {
       return {...defaultKeyBindings};
     }
+    if (migrated) localStorage.setItem(keyBindingStorageKey, JSON.stringify(saved));
   } catch (err) {
     console.error(err);
   }
@@ -1366,9 +1574,22 @@ function loadGamepadBindings() {
     for (const code of Object.keys(bindings)) {
       if (typeof saved[code] === 'string' && saved[code]) bindings[code] = saved[code];
     }
+    let migrated = false;
+    for (const [code, legacyBinding] of Object.entries(legacyDefaultGamepadBindings)) {
+      const replacement = defaultGamepadBindings[code];
+      const replacementInUse = Object.entries(bindings).some(
+        ([otherCode, binding]) => otherCode !== code && binding === replacement
+      );
+      if (bindings[code] === legacyBinding && !replacementInUse) {
+        bindings[code] = replacement;
+        saved[code] = replacement;
+        migrated = true;
+      }
+    }
     if (new Set(Object.values(bindings)).size !== Object.keys(bindings).length) {
       return {...defaultGamepadBindings};
     }
+    if (migrated) localStorage.setItem(gamepadBindingStorageKey, JSON.stringify(saved));
   } catch (err) {
     console.error(err);
   }
@@ -1401,7 +1622,15 @@ function gamepadBindingLabel(binding) {
     return dpadLabels[index] || `手柄 B${index}`;
   }
   const axis = /^axis:(\d+):([+-])$/.exec(binding || '');
-  if (axis) return `手柄轴${axis[1]}${axis[2]}`;
+  if (axis) {
+    const leftStickLabels = {
+      '0:-':'左摇杆←',
+      '0:+':'左摇杆→',
+      '1:-':'左摇杆↑',
+      '1:+':'左摇杆↓',
+    };
+    return leftStickLabels[`${axis[1]}:${axis[2]}`] || `手柄轴${axis[1]}${axis[2]}`;
+  }
   return binding || '未设置';
 }
 function updateKeyBindingUi() {
@@ -1458,8 +1687,9 @@ const activeKeyboardKeys = new Map();
 const activeGamepadInputs = new Map();
 const gamepadPreviousStates = new Map();
 const captureSuppressedGamepadInputs = new Set();
-const gamepadPressThreshold = 0.65;
+const gamepadPressThreshold = 0.55;
 const gamepadReleaseThreshold = 0.35;
+const gamepadCaptureThreshold = 0.5;
 let gamepadInputFocused = document.hasFocus();
 let gamepadStatusText = '';
 function updateGamepadStatus(text, error = false) {
@@ -1483,6 +1713,8 @@ function sendKeyButton(btn, down, phase = '') {
     name:btn.dataset.name || '',
     down,
     phase,
+    source:'button',
+    input_session:inputSessionId,
     advance:false,
     reply:false,
   });
@@ -1558,6 +1790,7 @@ window.addEventListener('keydown', ev => {
     assignCapturedBinding(keyBindings, ev.code);
     return;
   }
+  if (settingsDialogEl.open) return;
   if (ev.code === 'Escape' && currentFullscreenElement() === screenWrapEl) return;
   if (isEditableTarget(ev.target)) return;
   const code = keyCodeFromKeyboard(ev);
@@ -1565,29 +1798,41 @@ window.addEventListener('keydown', ev => {
   ev.preventDefault();
   activeKeyboardKeys.set(ev.code, code);
   updateDeviceKeyActive(code);
-  wsSend({op:'key', code, down:true, source:'keyboard', advance:false, reply:false});
+  wsSend({op:'key', code, down:true, source:'keyboard', input_session:inputSessionId, advance:false, reply:false});
 });
 window.addEventListener('keyup', ev => {
   const code = activeKeyboardKeys.get(ev.code);
   if (code === undefined) return;
   ev.preventDefault();
   activeKeyboardKeys.delete(ev.code);
-  wsSend({op:'key', code, down:false, source:'keyboard', advance:false, reply:false});
+  wsSend({op:'key', code, down:false, source:'keyboard', input_session:inputSessionId, advance:false, reply:false});
   updateDeviceKeyActive(code);
 });
 function releaseKeyboardInputs(source = 'keyboard-blur') {
   const releasedCodes = new Set(activeKeyboardKeys.values());
   for (const code of activeKeyboardKeys.values()) {
-    wsSend({op:'key', code, down:false, source, advance:false, reply:false});
+    wsSend({op:'key', code, down:false, source, input_session:inputSessionId, advance:false, reply:false});
   }
   activeKeyboardKeys.clear();
   releasedCodes.forEach(updateDeviceKeyActive);
+}
+function releaseButtonInputs(phase = 'button-blur') {
+  for (const [code, state] of Array.from(buttonKeyStates.entries())) {
+    if (state.releaseTimer) clearTimeout(state.releaseTimer);
+    sendKeyButton(state.btn, false, phase);
+    buttonKeyStates.delete(code);
+  }
+  activeButtonPointers.clear();
 }
 function gamepadSnapshot(gamepad) {
   return {
     buttons:Array.from(gamepad.buttons, button => Boolean(button.pressed || button.value >= 0.5)),
     axes:Array.from(gamepad.axes, value => Number(value) || 0),
   };
+}
+function gamepadHasActivity(gamepad) {
+  return gamepad.buttons.some(button => button.pressed || button.value >= 0.5) ||
+    gamepad.axes.some(value => Math.abs(Number(value) || 0) >= gamepadPressThreshold);
 }
 function capturedGamepadBinding(gamepad, previous) {
   for (let index = 0; index < gamepad.buttons.length; index += 1) {
@@ -1597,7 +1842,7 @@ function capturedGamepadBinding(gamepad, previous) {
   for (let index = 0; index < gamepad.axes.length; index += 1) {
     const value = Number(gamepad.axes[index]) || 0;
     const previousValue = Number(previous?.axes?.[index]) || 0;
-    if (Math.abs(value) >= 0.75 && Math.abs(previousValue) < gamepadReleaseThreshold) {
+    if (Math.abs(value) >= gamepadCaptureThreshold && Math.abs(previousValue) < gamepadCaptureThreshold) {
       return `axis:${index}:${value < 0 ? '-' : '+'}`;
     }
   }
@@ -1616,7 +1861,7 @@ function gamepadBindingActive(gamepad, binding, wasActive) {
   return axis[2] === '+' ? value >= threshold : value <= -threshold;
 }
 function sendGamepadKey(code, down, phase) {
-  wsSend({op:'key', code, down, source:'gamepad', phase, advance:false, reply:false});
+  wsSend({op:'key', code, down, source:'gamepad', phase, input_session:inputSessionId, advance:false, reply:false});
 }
 function beginGamepadInput(sourceId, code) {
   const existing = activeGamepadInputs.get(sourceId);
@@ -1656,6 +1901,24 @@ function releaseGamepadInputs(phase = 'disconnect') {
     endGamepadInput(sourceId, phase, true);
   }
 }
+function refreshActiveKeyLeases() {
+  const activeCodes = new Set(activeKeyboardKeys.values());
+  for (const code of buttonKeyStates.keys()) activeCodes.add(code);
+  for (const state of activeGamepadInputs.values()) activeCodes.add(state.code);
+  for (const code of activeCodes) {
+    wsSend({
+      op:'key',
+      code,
+      down:true,
+      source:'heartbeat',
+      phase:'heartbeat',
+      input_session:inputSessionId,
+      advance:false,
+      reply:false,
+    });
+  }
+}
+setInterval(refreshActiveKeyLeases, keyLeaseHeartbeatMs);
 function readGamepads() {
   if (typeof navigator.getGamepads !== 'function') {
     updateGamepadStatus('当前浏览器未提供 Gamepad API', true);
@@ -1670,13 +1933,15 @@ function readGamepads() {
 }
 function pollGamepads() {
   const visible = document.visibilityState === 'visible';
-  const gamepads = visible && gamepadInputFocused ? readGamepads() : [];
+  const detectedGamepads = visible ? readGamepads() : [];
+  if (detectedGamepads.some(gamepadHasActivity)) gamepadInputFocused = true;
+  const gamepads = gamepadInputFocused ? detectedGamepads : [];
   const connected = new Set();
   const seenSources = new Set();
-  if (visible && gamepadInputFocused && gamepads.length === 0 && bindingCaptureCode !== null) {
+  if (visible && detectedGamepads.length === 0 && bindingCaptureCode !== null) {
     updateGamepadStatus('未检测到手柄；请先按一次手柄按键');
-  } else if (gamepads.length > 0) {
-    const name = String(gamepads[0].id || `手柄 ${gamepads[0].index + 1}`);
+  } else if (detectedGamepads.length > 0) {
+    const name = String(detectedGamepads[0].id || `手柄 ${detectedGamepads[0].index + 1}`);
     updateGamepadStatus(`已连接：${name}`);
   }
   for (const gamepad of gamepads) {
@@ -1689,6 +1954,10 @@ function pollGamepads() {
         assignCapturedBinding(gamepadBindings, captured);
         updateGamepadStatus(`已映射：${gamepadBindingLabel(captured)}`);
       }
+    }
+    if (settingsDialogEl.open) {
+      gamepadPreviousStates.set(gamepad.index, gamepadSnapshot(gamepad));
+      continue;
     }
     for (const [guestCodeText, binding] of Object.entries(gamepadBindings)) {
       const code = Number(guestCodeText);
@@ -1721,6 +1990,7 @@ function pollGamepads() {
 }
 window.addEventListener('blur', () => {
   gamepadInputFocused = false;
+  releaseButtonInputs();
   releaseKeyboardInputs();
   releaseGamepadInputs('gamepad-blur');
 });
@@ -1747,6 +2017,11 @@ window.addEventListener('gamepadconnected', ev => {
 window.addEventListener('gamepaddisconnected', () => {
   releaseGamepadInputs('gamepad-disconnect');
   updateGamepadStatus('手柄已断开；请按任意手柄键重新连接');
+});
+window.addEventListener('pagehide', () => {
+  releaseButtonInputs('button-pagehide');
+  releaseKeyboardInputs('keyboard-pagehide');
+  releaseGamepadInputs('gamepad-pagehide');
 });
 requestAnimationFrame(pollGamepads);
 screen.addEventListener('pointerdown', ev => {

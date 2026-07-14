@@ -14,6 +14,7 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "chardev/char.h"
 #include "exec/cpu-common.h"
@@ -67,6 +68,7 @@
 #define BBK9588_BOOTROM_ENTRY_VADDR 0x80000004u
 #define BBK9588_LCD_WIDTH          240
 #define BBK9588_LCD_HEIGHT         320
+#define BBK9588_HOST_KEY_POWER     11u
 #define BBK9588_LCD_STRIDE         (BBK9588_LCD_WIDTH * 2)
 #define BBK9588_LCD_BYTES          (BBK9588_LCD_STRIDE * BBK9588_LCD_HEIGHT)
 #define BBK9588_LCD_VBLANK_PERIOD_MS 33
@@ -78,8 +80,6 @@
 #define BBK9588_NAND_TARGET_PAGE 0x256au
 #define BBK9588_NAND_TARGET_EVENT_ERASE 1u
 #define BBK9588_NAND_TARGET_EVENT_PROGRAM 2u
-#define BBK9588_SYSCTRL_WAKE_PROXY_IRQ JZ4740_INTC_IRQ_TCU1
-
 /*
  * C200 firmware accesses SoC devices through KSEG1 uncached addresses such as
  * 0xb0001000. QEMU MemoryRegions are mapped in physical address space, so the
@@ -128,10 +128,6 @@ struct Bbk9588MachineState {
     JZ4740TCUState *tcu;
     JZ4740UARTState *uart;
     JZ4740UDCState *udc;
-    uint32_t extgpio_wake_enable_80;
-    bool sysctrl_wake_pending;
-    bool gpio300_wake_pulse_available;
-    uint32_t sysctrl_wake_count;
     Bbk9588NandState *nand_dev;
     bool storage_trace_enabled;
     bool graphics_trace;
@@ -141,6 +137,8 @@ struct Bbk9588MachineState {
     char *frame_chardev;
     char *nand_image;
     bool bootrom_nand_enabled;
+    bool hibernate_poweroff_enabled;
+    bool hibernate_wakeup_enabled;
     uint32_t nand_id_code;
     uint32_t firmware_phys;
     uint32_t reset_pc;
@@ -181,8 +179,7 @@ static void bbk9588_sync_tcu_irq_sources(Bbk9588MachineState *board)
         jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU0));
     jz4740_intc_set_irq(
         board->intc, JZ4740_INTC_IRQ_TCU1,
-        jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU1) ||
-        board->sysctrl_wake_pending);
+        jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU1));
     jz4740_intc_set_irq(
         board->intc, JZ4740_INTC_IRQ_TCU2,
         jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU2));
@@ -193,25 +190,10 @@ static void bbk9588_sync_level_irq_sources(Bbk9588MachineState *board)
     bbk9588_sync_tcu_irq_sources(board);
 }
 
-static bool bbk9588_sysctrl_wake_enabled(Bbk9588MachineState *board)
-{
-    return jz4740_cpm_wake_enabled(board->cpm) ||
-           board->extgpio_wake_enable_80 != 0;
-}
-
-static void bbk9588_sysctrl_sync_wake(Bbk9588MachineState *board)
-{
-    if (!bbk9588_sysctrl_wake_enabled(board)) {
-        board->sysctrl_wake_pending = false;
-    }
-}
-
 static void bbk9588_drive_cpu_irq(Bbk9588MachineState *board)
 {
-    bool level = board->intc_output_level || board->sysctrl_wake_pending;
-    bool ip2_level;
-
-    ip2_level = level && board->cpu_irq_output_enabled;
+    bool ip2_level = board->intc_output_level &&
+                     board->cpu_irq_output_enabled;
 
     /* Expose the BBK INTC output as the MIPS CPU IP2 level interrupt. */
     if (board->cpu) {
@@ -228,7 +210,7 @@ static void bbk9588_drive_cpu_irq(Bbk9588MachineState *board)
     }
     bbk9588_touch_diag_record(board, 0x51);
     if (board->intc_resample_timer) {
-        if (level && board->cpu_irq_output_enabled) {
+        if (ip2_level) {
             timer_mod(board->intc_resample_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
         } else {
@@ -249,7 +231,6 @@ static void bbk9588_intc_refresh(void *opaque)
 {
     Bbk9588MachineState *board = opaque;
 
-    bbk9588_sysctrl_sync_wake(board);
     bbk9588_sync_level_irq_sources(board);
 }
 
@@ -340,6 +321,10 @@ static bool bbk9588_key_gpio_bits(uint32_t key_code, unsigned *port,
     case 4:
         *port = JZ4740_GPIO_PORT_D;
         *mask = 0x00200000u;
+        return true;
+    case BBK9588_HOST_KEY_POWER:
+        *port = JZ4740_GPIO_PORT_D;
+        *mask = 0x20000000u;
         return true;
     default:
         return false;
@@ -464,19 +449,6 @@ static void bbk9588_nand_event(void *opaque,
     }
 }
 
-static void bbk9588_emc_board_write(void *opaque, hwaddr offset,
-                                    uint32_t value)
-{
-    Bbk9588MachineState *board = opaque;
-
-    if (!board || offset != 0x80u) {
-        return;
-    }
-    board->extgpio_wake_enable_80 = value & 0x00040000u;
-    bbk9588_sysctrl_sync_wake(board);
-    bbk9588_update_irq(board);
-}
-
 static void bbk9588_create_nand_device(Bbk9588MachineState *board)
 {
     DeviceState *dev = qdev_new(TYPE_BBK9588_NAND);
@@ -512,8 +484,6 @@ static void bbk9588_create_emc_device(Bbk9588MachineState *board)
                                         JZ4740_INTC_IRQ_EMC));
     board->emc = JZ4740_EMC(dev);
     jz4740_emc_attach_nand(board->emc, board->nand_dev);
-    jz4740_emc_set_board_write_callback(
-        board->emc, bbk9588_emc_board_write, board);
 }
 
 
@@ -852,9 +822,6 @@ static void bbk9588_touch_diag_record(Bbk9588MachineState *board,
     Bbk9588DiagBoardSnapshot snapshot = {
         .intc_last_cp0_status = board->intc_last_cp0_status,
         .intc_last_cp0_cause = board->intc_last_cp0_cause,
-        .extgpio_wake_enable = board->extgpio_wake_enable_80,
-        .sysctrl_wake_count = board->sysctrl_wake_count,
-        .sysctrl_wake_pending = board->sysctrl_wake_pending,
     };
 
     bbk9588_diag_touch_record(board->diag, reason, &snapshot);
@@ -886,16 +853,6 @@ static uint32_t bbk9588_gpio_sample_input(void *opaque, unsigned port,
 {
     Bbk9588MachineState *board = opaque;
 
-    if (port == JZ4740_GPIO_PORT_D) {
-        if (board->gpio300_wake_pulse_available) {
-            level |= 0x20000000u;
-            board->gpio300_wake_pulse_available = false;
-            board->sysctrl_wake_pending = false;
-            bbk9588_update_irq(board);
-        } else {
-            level &= ~0x20000000u;
-        }
-    }
     if (port == JZ4740_GPIO_PORT_C &&
         bbk9588_nand_consume_busy_read(board->nand_dev)) {
         level &= ~0x40000000;
@@ -1115,7 +1072,7 @@ static void bbk9588_create_gpio_device(Bbk9588MachineState *board)
 
     qdev_prop_set_uint32(dev, "input-reset-b", 0x78040000u);
     qdev_prop_set_uint32(dev, "input-reset-c", 0x48000000u);
-    qdev_prop_set_uint32(dev, "input-reset-d", 0x00200000u);
+    qdev_prop_set_uint32(dev, "input-reset-d", 0x20200000u);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0010000u));
     for (unsigned port = 0; port < JZ4740_GPIO_NUM_PORTS; port++) {
@@ -1129,17 +1086,31 @@ static void bbk9588_create_gpio_device(Bbk9588MachineState *board)
     jz4740_gpio_set_trace_callback(board->gpio, bbk9588_gpio_trace, board);
 }
 
+static void bbk9588_rtc_power_down(void *opaque)
+{
+    Bbk9588MachineState *board = opaque;
+
+    if (board->hibernate_poweroff_enabled) {
+        info_report("bbk9588: RTC HCR.PD requested guest shutdown");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    }
+}
+
 static void bbk9588_create_rtc_device(Bbk9588MachineState *board)
 {
     DeviceState *dev = qdev_new(TYPE_JZ4740_RTC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "hibernate-wakeup",
+                      board->hibernate_wakeup_enabled);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0003000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
                                         JZ4740_INTC_IRQ_RTC));
     board->rtc = JZ4740_RTC(dev);
+    jz4740_rtc_set_power_down_callback(board->rtc,
+                                       bbk9588_rtc_power_down, board);
 }
 
 static void bbk9588_create_tcu_device(Bbk9588MachineState *board)
@@ -1381,6 +1352,36 @@ static bool bbk9588_get_bootrom_nand(Object *obj, Error **errp)
     return board->bootrom_nand_enabled;
 }
 
+static bool bbk9588_get_hibernate_poweroff(Object *obj, Error **errp)
+{
+    Bbk9588MachineState *board = BBK9588_MACHINE(obj);
+
+    return board->hibernate_poweroff_enabled;
+}
+
+static void bbk9588_set_hibernate_poweroff(Object *obj, bool value,
+                                           Error **errp)
+{
+    Bbk9588MachineState *board = BBK9588_MACHINE(obj);
+
+    board->hibernate_poweroff_enabled = value;
+}
+
+static bool bbk9588_get_hibernate_wakeup(Object *obj, Error **errp)
+{
+    Bbk9588MachineState *board = BBK9588_MACHINE(obj);
+
+    return board->hibernate_wakeup_enabled;
+}
+
+static void bbk9588_set_hibernate_wakeup(Object *obj, bool value,
+                                         Error **errp)
+{
+    Bbk9588MachineState *board = BBK9588_MACHINE(obj);
+
+    board->hibernate_wakeup_enabled = value;
+}
+
 static void bbk9588_set_bootrom_nand(Object *obj, bool value, Error **errp)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
@@ -1562,6 +1563,8 @@ static void bbk9588_instance_init(Object *obj)
     board->touch_trace = false;
     board->progress_trace = false;
     board->bootrom_nand_enabled = false;
+    board->hibernate_poweroff_enabled = true;
+    board->hibernate_wakeup_enabled = false;
     board->nand_id_code = BBK9588_NAND_DEFAULT_ID_CODE;
     board->bootrom_nand_page = BBK9588_BOOTROM_NAND_PAGE;
     board->bootrom_size = BBK9588_BOOTROM_FIRST_STAGE_BYTES;
@@ -1614,10 +1617,6 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_create_diag_device(board);
     bbk9588_create_host_input(board);
     bbk9588_create_host_bridge(board);
-    board->extgpio_wake_enable_80 = 0;
-    board->sysctrl_wake_pending = false;
-    board->gpio300_wake_pulse_available = false;
-    board->sysctrl_wake_count = 0;
     bbk9588_create_intc_device(board);
     bbk9588_create_uart_device(board);
     bbk9588_create_udc_device(board);
@@ -1697,6 +1696,18 @@ static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)
                                    bbk9588_set_bootrom_nand);
     object_class_property_set_description(oc, "bootrom-nand",
                                           "Load the boot image from the NAND BootROM area when -kernel is absent");
+    object_class_property_add_bool(oc, "hibernate-poweroff",
+                                   bbk9588_get_hibernate_poweroff,
+                                   bbk9588_set_hibernate_poweroff);
+    object_class_property_set_description(
+        oc, "hibernate-poweroff",
+        "Exit QEMU when the guest asserts RTC HCR.PD");
+    object_class_property_add_bool(oc, "hibernate-wakeup",
+                                   bbk9588_get_hibernate_wakeup,
+                                   bbk9588_set_hibernate_wakeup);
+    object_class_property_set_description(
+        oc, "hibernate-wakeup",
+        "Start after a PD29 wakeup-pin hibernate reset instead of RTC power-on reset");
     bbk9588_add_u32_property(
         oc, "sadc-battery-raw",
         offsetof(Bbk9588MachineState, sadc_battery_raw),

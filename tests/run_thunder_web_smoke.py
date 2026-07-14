@@ -1136,7 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
                                 failures.append("Thunder second battle did not start")
 
         if ws is not None:
-            ws.send_json({"op": "stop"})
+            ws.send_json({"op": "force-stop"})
             pump_for(ws, 1.0)
         logs = http_json(ns.host, port, "GET", "/api/logs?limit=160")
     except Exception as exc:

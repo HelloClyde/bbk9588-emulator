@@ -82,7 +82,12 @@ WS_AUDIO_MAGIC = b"BBKAUD1\0"
 WS_AUDIO_FORMAT_S16LE = 1
 WS_AUDIO_HEADER = struct.Struct("<8sIIHHI")
 
-KNOWN_FRONTEND_KEY_CODES = {4, 5, 6, 7, 9, 10}
+FRONTEND_POWER_KEY_CODE = 11
+KNOWN_FRONTEND_KEY_CODES = {4, 5, 6, 7, 9, 10, FRONTEND_POWER_KEY_CODE}
+FRONTEND_KEY_LEASE_SECONDS = 1.0
+SAFE_SHUTDOWN_POWER_HOLD_SECONDS = 3.0
+SAFE_SHUTDOWN_TIMEOUT_SECONDS = 20.0
+SAFE_SHUTDOWN_POLL_SECONDS = 0.05
 FRONTEND_ORIENTATIONS = frozenset({"raw", "rot180", "cw90", "ccw90", "hflip", "vflip"})
 WEB_AUDIODEV_ID = "bbk9588-web-none"
 DEFAULT_WEB_QEMU_ICOUNT = "shift=auto,align=off,sleep=on"
@@ -285,6 +290,11 @@ class FrontendState:
         self.last_frame: dict[str, object] | None = None
         self.running = False
         self.reset_at = time.time()
+        self.safe_shutdown_state = "idle"
+        self.safe_shutdown_started_at: float | None = None
+        self.safe_shutdown_finished_at: float | None = None
+        self.safe_shutdown_error: str | None = None
+        self.lifecycle_notice: str | None = None
 
         self.job_name: str | None = None
         self.job_total_steps = 0
@@ -300,6 +310,9 @@ class FrontendState:
         self.last_input_event: dict[str, object] | None = None
         self.pending_touches: deque[tuple[int, int, bool]] = deque(maxlen=32)
         self.pending_keys: deque[tuple[int, bool]] = deque(maxlen=32)
+        self.frontend_key_leases: dict[tuple[str, int], float] = {}
+        self.frontend_active_key_codes: set[int] = set()
+        self.frontend_key_lease_expiration_count = 0
 
         self.frontend_input_calibration_stage = 0
         self.frontend_input_calibration_last_stage_step = -1
@@ -629,6 +642,11 @@ class FrontendState:
     def _reset_runtime_fields_locked(self) -> None:
         self.last_error = None
         self.crash_snapshot = None
+        self.safe_shutdown_state = "idle"
+        self.safe_shutdown_started_at = None
+        self.safe_shutdown_finished_at = None
+        self.safe_shutdown_error = None
+        self.lifecycle_notice = None
         self.last_frame = {
             "backend": "qemu",
             "available": False,
@@ -648,6 +666,9 @@ class FrontendState:
         self.input_worker_pending = False
         self.input_wake_count = 0
         self.last_input_event = None
+        self.frontend_key_leases.clear()
+        self.frontend_active_key_codes.clear()
+        self.frontend_key_lease_expiration_count = 0
         self.frontend_input_calibration_stage = 0
         self.frontend_input_calibration_last_stage_step = -1
         self.qemu_frontend_input_calibration_last_action_at = 0.0
@@ -701,8 +722,154 @@ class FrontendState:
         with self.nand_lifecycle_lock:
             return self._reset_nand_locked()
 
+    def _set_safe_shutdown_state(
+        self,
+        state: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        with self.lock:
+            now = time.time()
+            if state == "requesting":
+                self.safe_shutdown_started_at = now
+                self.safe_shutdown_finished_at = None
+                self.lifecycle_notice = None
+            elif state in {"complete", "failed", "forced"}:
+                self.safe_shutdown_finished_at = now
+            self.safe_shutdown_state = state
+            self.safe_shutdown_error = error
+            self._publish_snapshot_locked()
+
+    def _request_guest_shutdown_locked(
+        self,
+        *,
+        hold_seconds: float = SAFE_SHUTDOWN_POWER_HOLD_SECONDS,
+        timeout: float = SAFE_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        backend = self.qemu_backend
+        if backend is None:
+            return {}
+        initial = self._backend_snapshot(backend, refresh=False)
+        if not initial.get("running"):
+            return initial
+
+        hold_seconds = max(0.0, float(hold_seconds))
+        timeout = max(hold_seconds, float(timeout))
+        deadline = time.monotonic() + timeout
+        self._set_safe_shutdown_state("requesting")
+
+        with self.lock:
+            for token in [
+                token
+                for token in self.frontend_key_leases
+                if token[1] == FRONTEND_POWER_KEY_CODE
+            ]:
+                self.frontend_key_leases.pop(token, None)
+            self.frontend_active_key_codes.discard(FRONTEND_POWER_KEY_CODE)
+            result, _event = self._record_frontend_key_transition_locked(
+                backend,
+                FRONTEND_POWER_KEY_CODE,
+                True,
+                source="safe-shutdown",
+            )
+        if not result.get("applied"):
+            error = str(result.get("error") or "QEMU did not accept the power key")
+            self._set_safe_shutdown_state("failed", error=error)
+            raise RuntimeError(f"safe shutdown failed: {error}")
+
+        released = False
+        try:
+            hold_deadline = min(deadline, time.monotonic() + hold_seconds)
+            while time.monotonic() < hold_deadline:
+                snapshot = self._backend_snapshot(backend, refresh=False)
+                if not snapshot.get("running"):
+                    break
+                time.sleep(SAFE_SHUTDOWN_POLL_SECONDS)
+            snapshot = self._backend_snapshot(backend, refresh=False)
+            if snapshot.get("running"):
+                with self.lock:
+                    self._record_frontend_key_transition_locked(
+                        backend,
+                        FRONTEND_POWER_KEY_CODE,
+                        False,
+                        source="safe-shutdown",
+                    )
+                released = True
+                self._set_safe_shutdown_state("waiting")
+
+            while time.monotonic() < deadline:
+                snapshot = self._backend_snapshot(backend, refresh=False)
+                if not snapshot.get("running"):
+                    if snapshot.get("exit_reason") == "guest-shutdown":
+                        break
+                    # Give the QMP reader a short window to consume SHUTDOWN.
+                    time.sleep(SAFE_SHUTDOWN_POLL_SECONDS)
+                    continue
+                time.sleep(SAFE_SHUTDOWN_POLL_SECONDS)
+
+            snapshot = self._backend_snapshot(backend, refresh=False)
+            if snapshot.get("running"):
+                raise TimeoutError(
+                    f"firmware did not complete guest shutdown within {timeout:.1f}s"
+                )
+            if snapshot.get("exit_reason") != "guest-shutdown":
+                raise RuntimeError(
+                    "QEMU exited without the firmware guest-shutdown signal "
+                    f"(reason={snapshot.get('exit_reason')!r}, "
+                    f"returncode={snapshot.get('returncode')!r})"
+                )
+        except Exception as exc:
+            if not released and self._backend_snapshot(backend, refresh=False).get("running"):
+                try:
+                    with self.lock:
+                        self._record_frontend_key_transition_locked(
+                            backend,
+                            FRONTEND_POWER_KEY_CODE,
+                            False,
+                            source="safe-shutdown-error",
+                        )
+                except Exception:
+                    pass
+            error = f"{type(exc).__name__}: {exc}"
+            self._set_safe_shutdown_state("failed", error=error)
+            raise RuntimeError(f"safe shutdown failed: {error}") from exc
+
+        self._set_safe_shutdown_state("complete")
+        return snapshot
+
+    def _stop_backend_for_reset_locked(
+        self,
+        backend: QemuProcessBackend,
+        *,
+        shutdown_timeout: float = SAFE_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> tuple[str, str] | None:
+        snapshot = self._backend_snapshot(backend, refresh=False)
+        if not snapshot.get("running"):
+            return None
+
+        frame_count = snapshot.get("frame_chardev_count")
+        if isinstance(frame_count, (int, float)) and frame_count <= 0:
+            backend.stop()
+            return (
+                "固件尚未完成启动，已由 QEMU 正常停止并刷新 NAND 后重新启动。",
+                "firmware startup had not produced a frame; guest shutdown was unavailable",
+            )
+
+        try:
+            self._request_guest_shutdown_locked(timeout=shutdown_timeout)
+        except RuntimeError as exc:
+            backend.stop()
+            return (
+                "固件未完成关机，已由 QEMU 正常停止并刷新 NAND 后重新启动。",
+                str(exc),
+            )
+        return None
+
     def _reset_nand_locked(self) -> dict[str, object]:
         old_backend = self.qemu_backend
+        restart_fallback: tuple[str, str] | None = None
+        if old_backend is not None and self._backend_snapshot(old_backend, refresh=False).get("running"):
+            restart_fallback = self._stop_backend_for_reset_locked(old_backend)
         if old_backend is not None:
             callback_setter = getattr(old_backend, "set_frame_ready_callback", None)
             if callback_setter is not None:
@@ -710,7 +877,6 @@ class FrontendState:
             audio_callback_setter = getattr(old_backend, "set_audio_ready_callback", None)
             if audio_callback_setter is not None:
                 audio_callback_setter(None)
-            old_backend.stop()
         self.cancel_run.set()
         if self.qemu_worker is not None and self.qemu_worker.is_alive() and self.qemu_worker is not threading.current_thread():
             self.qemu_worker.join(timeout=2.0)
@@ -728,6 +894,11 @@ class FrontendState:
             BUILD.mkdir(parents=True, exist_ok=True)
             self.cancel_run.clear()
             self._reset_runtime_fields_locked()
+            if restart_fallback is not None:
+                self.safe_shutdown_state = "host-fallback"
+                self.safe_shutdown_finished_at = time.time()
+                self.safe_shutdown_error = restart_fallback[1]
+                self.lifecycle_notice = restart_fallback[0]
             extra_args = tuple(getattr(self.args, "qemu_extra_arg", []) or ())
             accel, extra_args = web_qemu_timing_options(
                 getattr(self.args, "qemu_accel", "tcg,thread=multi,tb-size=256"),
@@ -754,6 +925,7 @@ class FrontendState:
                 gdb=getattr(self.args, "qemu_gdb", "none"),
                 timeout_seconds=float(getattr(self.args, "qemu_timeout", 5.0)),
                 nand_image=nand_image,
+                hibernate_wakeup=getattr(self.args, "boot_mode", "nand") == "nand",
                 bbk_machine_options=machine_options,
                 extra_args=extra_args,
                 firmware_patches=getattr(self.args, "qemu_firmware_patch", None),
@@ -785,6 +957,10 @@ class FrontendState:
                             break
                         qemu = self._backend_snapshot(backend, refresh=False)
                         if not qemu.get("running"):
+                            self.running = False
+                            if self.job_finished_at is None:
+                                self.job_finished_at = time.time()
+                            self._publish_snapshot_locked()
                             break
                         self._apply_frontend_input_calibration_locked(backend)
                 except Exception as exc:
@@ -1253,6 +1429,28 @@ class FrontendState:
 
     def stop(self) -> dict[str, object]:
         with self.nand_lifecycle_lock:
+            backend = self.qemu_backend
+            if backend is not None and self._backend_snapshot(backend, refresh=False).get("running"):
+                self._request_guest_shutdown_locked()
+            self.cancel_run.set()
+            if (
+                self.qemu_worker is not None
+                and self.qemu_worker.is_alive()
+                and self.qemu_worker is not threading.current_thread()
+            ):
+                self.qemu_worker.join(timeout=2.0)
+            with self.lock:
+                self.running = False
+                self.job_finished_at = time.time()
+                self._publish_snapshot_locked()
+                return self.snapshot()
+
+    def force_stop(self) -> dict[str, object]:
+        with self.nand_lifecycle_lock:
+            self._set_safe_shutdown_state(
+                "forced",
+                error="QEMU was stopped without waiting for firmware shutdown",
+            )
             self.cancel_run.set()
             with self.lock:
                 backend = self.qemu_backend
@@ -1266,7 +1464,10 @@ class FrontendState:
     def close(self) -> None:
         with self.nand_lifecycle_lock:
             try:
-                self.stop()
+                try:
+                    self.stop()
+                except Exception:
+                    self.force_stop()
             finally:
                 self.nand_image_lease.release()
 
@@ -1296,6 +1497,59 @@ class FrontendState:
             )
         return int(msg.get("x", 0)), int(msg.get("y", 0))
 
+    def _record_frontend_key_transition_locked(
+        self,
+        backend: QemuProcessBackend,
+        code: int,
+        down: bool,
+        *,
+        source: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        result = backend.apply_gui_key_event(code, down)
+        event: dict[str, object] = {
+            "kind": "key",
+            "code": code,
+            "down": down,
+            "accepted": bool(result.get("applied")),
+            "result": result,
+            "at": time.time(),
+            "source": source,
+        }
+        self.last_input_event = event
+        self.input_wake_count += 1
+        with self.input_lock:
+            self.pending_keys.clear()
+        return result, event
+
+    def _expire_frontend_key_leases_locked(self, now: float | None = None) -> None:
+        if not self.frontend_key_leases:
+            return
+        current = time.monotonic() if now is None else float(now)
+        expired = [
+            token
+            for token, deadline in self.frontend_key_leases.items()
+            if deadline <= current
+        ]
+        if not expired:
+            return
+        previously_active = set(self.frontend_active_key_codes)
+        for token in expired:
+            self.frontend_key_leases.pop(token, None)
+        self.frontend_active_key_codes = {
+            code for _session, code in self.frontend_key_leases
+        }
+        self.frontend_key_lease_expiration_count += len(expired)
+        backend = self.qemu_backend
+        if backend is None or not backend.running():
+            return
+        for code in sorted(previously_active - self.frontend_active_key_codes):
+            self._record_frontend_key_transition_locked(
+                backend,
+                code,
+                False,
+                source="frontend-key-lease-expired",
+            )
+
     def key(
         self,
         code: int,
@@ -1303,34 +1557,64 @@ class FrontendState:
         advance: bool | None = None,
         *,
         include_snapshot: bool = True,
+        input_session: object = None,
+        source: object = None,
     ) -> dict[str, object]:
         code = int(code)
         if code not in KNOWN_FRONTEND_KEY_CODES:
             return {"error": f"unknown key code {code}", "known": sorted(KNOWN_FRONTEND_KEY_CODES)}
         with self.lock:
             backend = self._ensure_qemu_started_locked()
-            result = backend.apply_gui_key_event(code, bool(down))
-            event = {
-                "kind": "key",
-                "code": code,
-                "down": bool(down),
-                "accepted": bool(result.get("applied")),
-                "result": result,
-                "at": time.time(),
-            }
-            self.last_input_event = event
-            self.input_wake_count += 1
-            with self.input_lock:
-                self.pending_keys.clear()
+            now = time.monotonic()
+            self._expire_frontend_key_leases_locked(now)
+            requested_down = bool(down)
+            session = str(input_session or "").strip()[:128]
+            coalesced = False
+            effective_down = requested_down
+            if session:
+                was_active = code in self.frontend_active_key_codes
+                token = (session, code)
+                if requested_down:
+                    self.frontend_key_leases[token] = now + FRONTEND_KEY_LEASE_SECONDS
+                else:
+                    self.frontend_key_leases.pop(token, None)
+                self.frontend_active_key_codes = {
+                    active_code for _active_session, active_code in self.frontend_key_leases
+                }
+                effective_down = code in self.frontend_active_key_codes
+                coalesced = was_active == effective_down
+            else:
+                for token in [token for token in self.frontend_key_leases if token[1] == code]:
+                    self.frontend_key_leases.pop(token, None)
+                self.frontend_active_key_codes.discard(code)
+
+            if coalesced:
+                result: dict[str, object] = {
+                    "event": "qemu-gui-key",
+                    "code": code,
+                    "down": effective_down,
+                    "applied": True,
+                    "coalesced": True,
+                    "source": "frontend-key-lease",
+                }
+                accepted = True
+            else:
+                result, event = self._record_frontend_key_transition_locked(
+                    backend,
+                    code,
+                    effective_down,
+                    source=str(source or "message"),
+                )
+                accepted = bool(event["accepted"])
             if not include_snapshot:
                 self._notify_frontend_activity()
                 return {
-                    "input_accepted": event["accepted"],
+                    "input_accepted": accepted,
                     "qemu_input_result": result,
                 }
             self._publish_snapshot_locked()
             snapshot = self.snapshot()
-            snapshot["input_accepted"] = event["accepted"]
+            snapshot["input_accepted"] = accepted
             snapshot["qemu_input_result"] = result
             if advance is not None:
                 snapshot["warning"] = "advance is ignored by the QEMU process backend"
@@ -1425,6 +1709,8 @@ class FrontendState:
             return self.run_start(str(msg.get("name", "run")), int(msg.get("steps", 0)), int(msg.get("chunk", 100000)))
         if op == "stop":
             return self.stop()
+        if op in {"force-stop", "force_stop"}:
+            return self.force_stop()
         if op == "step":
             return self.step(int(msg.get("steps", 250000)))
         if op in {"set-orientation", "set_orientation", "orientation"}:
@@ -1476,6 +1762,20 @@ class FrontendState:
                 except UnicodeDecodeError:
                     pass
             return out
+        if op in {"qemu-read-physical-memory", "qemu_read_physical_memory"}:
+            if self.qemu_backend is None:
+                return {"error": "QEMU backend is not initialized"}
+            addr = int(str(msg.get("addr", 0)), 0)
+            size = max(0, min(int(msg.get("size", 0x80)), 0x1000))
+            try:
+                data = self.qemu_backend.read_physical_memory(addr, size)
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "addr": f"0x{addr & 0xFFFFFFFF:08x}",
+                "size": len(data),
+                "hex": data.hex(),
+            }
         if op in {"qemu-watch-write", "qemu_watch_write"}:
             if not self._gdb_diagnostics_enabled():
                 return self._gdb_diagnostics_disabled_error(op)
@@ -1534,6 +1834,8 @@ class FrontendState:
                 self._coerce_optional_bool(msg.get("down")) is not False,
                 self._coerce_optional_bool(msg.get("advance")),
                 include_snapshot=include_snapshot,
+                input_session=msg.get("input_session"),
+                source=msg.get("source"),
             )
             if include_snapshot and self._coerce_optional_bool(msg.get("run")) is True:
                 run_status = self.run_start("qemu-input", 0, 0)
@@ -1695,6 +1997,7 @@ class FrontendState:
             return len(self.pending_keys)
 
     def _build_snapshot_locked(self, *, detail: str = "compact") -> dict[str, object]:
+        self._expire_frontend_key_leases_locked()
         backend = self.qemu_backend
         if backend is not None and detail in {"full", "traces"}:
             self._apply_frontend_input_calibration_locked(backend)
@@ -1705,6 +2008,7 @@ class FrontendState:
         qemu_pc_classification = qemu.get("pc_classification") if isinstance(qemu.get("pc_classification"), dict) else classify_guest_pc(qemu_pc)
         qemu_pc_region = qemu_pc_classification.get("region") if isinstance(qemu_pc_classification, dict) else None
         active = bool(qemu.get("running"))
+        stop_detail = self._stop_detail(active, qemu)
         now = time.time()
         reset_elapsed = max(0.0, now - self.reset_at)
         frontend_performance = self._frontend_performance_snapshot_locked(now, reset_elapsed)
@@ -1761,11 +2065,22 @@ class FrontendState:
             ),
             "pending_touches": self._pending_touch_count_locked(),
             "pending_keys": self._pending_key_count_locked(),
+            "frontend_active_keys": sorted(self.frontend_active_key_codes),
+            "frontend_key_leases": len(self.frontend_key_leases),
+            "frontend_key_lease_expirations": self.frontend_key_lease_expiration_count,
+            "safe_shutdown": {
+                "state": self.safe_shutdown_state,
+                "started_at": self.safe_shutdown_started_at,
+                "finished_at": self.safe_shutdown_finished_at,
+                "error": self.safe_shutdown_error,
+            },
+            "lifecycle_notice": getattr(self, "lifecycle_notice", None),
             "job": job,
             "input_worker_pending": False,
             "input_wake_count": self.input_wake_count,
             "last_input_event": self.last_input_event,
-            "stop_reason": self.last_error or qemu.get("last_error"),
+            "stop_reason": None if stop_detail is None else stop_detail.get("code"),
+            "stop_detail": stop_detail,
             "crash_snapshot": self.crash_snapshot,
             "insn_count": 0,
             "pc": qemu_pc,
@@ -1855,6 +2170,28 @@ class FrontendState:
                 "Remaining work belongs in the QEMU SoC model, not in Python firmware hooks.",
             ]
         return snapshot
+
+    def _stop_detail(
+        self,
+        active: bool,
+        qemu: dict[str, object],
+    ) -> dict[str, object] | None:
+        if active:
+            return None
+        reason = qemu.get("exit_reason")
+        error = self.last_error or qemu.get("last_error")
+        if reason is None and error is not None:
+            reason = "start-error" if qemu.get("returncode") is None else "process-error"
+        if reason is None:
+            return None
+        expected = reason in {"guest-shutdown", "guest-reset", "user-stop", "process-exit"}
+        return {
+            "code": str(reason),
+            "returncode": qemu.get("returncode"),
+            "occurred_at": qemu.get("finished_at") or self.job_finished_at,
+            "expected": expected,
+            "error": None if expected else error,
+        }
 
     def _publish_snapshot_locked(self) -> None:
         with self.status_lock:

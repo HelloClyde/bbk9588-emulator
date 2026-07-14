@@ -158,9 +158,13 @@ bin/bbk9588-qemu-system-mipsel.exe
 - RTC 基础寄存器模型：`0xb0003000` 已按 JZ4740
   `RTCCR/RTCSR/RTCSAR/RTCGR/HCR/HWFCR/HRCR/HWCR/HWRSR/HSPR`
   提供秒计数、闹钟、hibernate wake/status 和 scratch pattern；`HCR.PD`
-  置位后除 `RTCCR.1HZ/1HZIE` 外 RTC/hibernate 写入保持冻结；`1HZIE/AIE`
+  置位后除 `RTCCR.1HZ/1HZIE` 外 RTC/hibernate 写入保持冻结，并默认通过板级
+  callback 请求 QEMU guest shutdown。`hibernate-poweroff=off` 仅供 qtest/寄存器
+  探针在关机后继续检查状态；`1HZIE/AIE`
   通过 INTC bit 15 输出，`HWCR.EALM` alarm 命中会置 `HWRSR.ALM` 并退出
   hibernate 状态。
+- GPIO D29 按 9588 active-low 电源键建模，空闲/释放电平为高。普通按键待机唤醒
+  通过 GPIO flag、GPIO parent、INTC IP2 和 MIPS WAIT 完成，不再借用 TCU1 wake proxy。
 - 兼容性诊断寄存器和 machine property。
 
 overlay 还包含少量 `target/mips` 侧 instrumentation/helper，用于当前 machine model

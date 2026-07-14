@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -2616,6 +2618,15 @@ def _build_rtc_hibernate_probe_code() -> bytes:
 
 
 def _run_rtc_hibernate_probe(config) -> dict[str, object]:
+    machine_options = tuple(
+        option
+        for option in config.bbk_machine_options
+        if option.split("=", 1)[0] != "hibernate-poweroff"
+    )
+    config = replace(
+        config,
+        bbk_machine_options=(*machine_options, "hibernate-poweroff=off"),
+    )
     backend = QemuProcessBackend(config)
     row: dict[str, object] = {
         "event": "qemu-rtc-hibernate-probe",
@@ -4245,10 +4256,16 @@ def _run_poweroff_path_probe(config, *, max_events: int = 32) -> dict[str, objec
                         break
                     if pc in inserted:
                         _gdb_remove_breakpoint(backend.gdb_sock, pc)
-                        event["step_stop"] = backend._step_paused_locked()
-                        event["after_step_pc"] = _format_u32(
-                            backend._read_register_paused_locked(37) & 0xFFFFFFFF
-                        )
+                        try:
+                            event["step_stop"] = backend._step_paused_locked()
+                            event["after_step_pc"] = _format_u32(
+                                backend._read_register_paused_locked(37) & 0xFFFFFFFF
+                            )
+                        except Exception as exc:
+                            event["step_error"] = f"{type(exc).__name__}: {exc}"
+                        if pc == 0x80005620:
+                            row["hit_hcr_power_down"] = True
+                            break
                         _gdb_insert_breakpoint(backend.gdb_sock, pc)
             finally:
                 if timed_out and backend.gdb_sock is not None:
@@ -4267,9 +4284,17 @@ def _run_poweroff_path_probe(config, *, max_events: int = 32) -> dict[str, objec
                     backend._resume_after_gdb_locked()
                 except Exception as exc:
                     row["resume_error"] = f"{type(exc).__name__}: {exc}"
-        row["ok"] = bool(row.get("hit_terminal_loop"))
+        if row.get("hit_hcr_power_down") and backend.proc is not None:
+            try:
+                row["guest_shutdown_returncode"] = backend.proc.wait(timeout=3)
+                row["guest_shutdown"] = True
+            except subprocess.TimeoutExpired:
+                row["guest_shutdown"] = False
+        row["ok"] = bool(row.get("hit_hcr_power_down")) and bool(
+            row.get("guest_shutdown")
+        )
         if not row["ok"]:
-            row["error"] = "poweroff terminal loop was not reached"
+            row["error"] = "RTC HCR.PD did not terminate QEMU through guest shutdown"
         row["backend_snapshot"] = backend.snapshot()
         return row
     except Exception as exc:

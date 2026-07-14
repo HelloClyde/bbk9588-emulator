@@ -31,11 +31,11 @@ patch。当前版本已经具备可用的启动、显示、输入和存储路径
 | --- | --- |
 | BootROM/NAND first-stage | 固定 2 KiB NAND 的 RS 校验、1~4 symbol 纠错和 normal/backup 回退已完成；完整 boot-select 与 NOR fallback 仍缺失 |
 | raw NAND/EMC | EMC 和 raw NAND 已拆为独立 QOM device，Hamming/RS、bad-marker cold-scan、确定性 program/erase FAIL、C200 FTL 正常 remap raw 冷启动及单 block pre-commit 回退已验证；Web/QEMU 已改为唯一活动 raw NAND，完整物理故障矩阵仍是非阻塞研究项 |
-| INTC/TCU/WAIT | INTC、TCU 已拆为独立 QOM device；板级 wake proxy 仍需核实 |
+| INTC/TCU/WAIT | INTC、TCU 已拆为独立 QOM device；TCU1 wake proxy 已删除，待机按键通过 GPIO/INTC/IP2 唤醒真实 WAIT |
 | LCD | controller、descriptor DMA、IRQ 和 BBK panel/status 窗口已拆为独立 QOM device；固定 guest mirror 与 alias scanout 已删除，完整 panel command 细节留作非阻塞研究项 |
 | SADC/Touch/GPIO | SADC、GPIO 已拆为独立 QOM device，当前交互路径基本完成；板级接线真机确认仍未完成 |
 | AIC/I2S/audio codec | 独立 AIC、internal codec、audio DMA、host/Web output 已实现并经用户实际验收；外部板级 route trace 属于非阻塞研究项 |
-| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立，MSC/DMAC/AIC transport 已进入无 MMIO board bridge；MSC 已与 raw NAND 解耦，USB packet transport、独立可选介质、完整 PM 和剩余 DMA request 仍是缺口 |
+| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立，MSC/DMAC/AIC transport 已进入无 MMIO board bridge；MSC 已与 raw NAND 解耦，真实 WAIT/按键唤醒和 RTC HCR.PD 关机已完成，USB packet transport、独立可选介质、低电压/reset cause/clock gating 和剩余 DMA request 仍是缺口 |
 | Python/Web 收敛 | 默认路径已完成，旧诊断代码仍可继续删除 |
 | QEMU 文件结构 | 部分完成，主要 SoC 设备、host output/input、DMA bridge 和全部 diagnostic recorder 已独立；板级 wake、touch GPIO/SADC 接线等 glue 仍在 `bbk9588.c` |
 
@@ -318,13 +318,13 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] INTC 实现 `ICSR/ICMR/ICMSR/ICMCR/ICPR`、reset mask 和手册 source 编号。
 - [x] INTC 已迁移到独立 `hw/intc/jz4740_intc.c`，拥有独立 state、MMIO、32 路 IRQ
   input、IP2 汇总 output、reset、migration 和诊断接口；`bbk9588.c` 只保留 source
-  连线以及板级 sysctrl wake 合并。
+  连线以及 CPU IP2 output。
 - [x] LCD、GPIO、UDC、TCU、DMA、RTC、MSC、SADC、UART 等 source 统一汇入 INTC。
 - [x] TCU 实现 8 channel 的 enable/stop、full/half compare、counter、flag、mask、
   set/clear 和三组 parent IRQ。
 - [x] TCU 已迁移到独立 `hw/timer/jz4740_tcu.c`，拥有独立 state、MMIO、QEMU
   virtual-clock timer、三路 parent IRQ、事件唤醒 output、reset、migration 和诊断接口；
-  machine 只保留 INTC 接线及 TCU1/wake proxy 合并。
+  machine 只保留 INTC 接线。
 - [x] TCU 周期由寄存器和时钟选择推导；`tcu-period-ms` 只保留为诊断/性能采样属性。
 - [x] 默认 `bbk9588` firmware patch 列表为空，不再应用 `c200-cp0-*` 或
   `c200-wait-noop`。
@@ -333,8 +333,9 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 
 仍需完成：
 
-- [ ] `BBK9588_SYSCTRL_WAKE_PROXY_IRQ` 仍借用 TCU1 parent 表达板级 wake，需要根据
-  真机 PM/GPIO 接线确认后替换为真实 source 或明确为板级逻辑。
+- [x] 删除借用 TCU1 parent 的 `BBK9588_SYSCTRL_WAKE_PROXY_IRQ` 及其未生效状态；按键
+  唤醒只经过 GPIO flag、GPIO parent、INTC 和 CPU IP2。板级电源键 GPIO D29 按真机
+  active-low 接线建模为空闲高电平，不再由一次性 read pulse 伪造释放。
 - [ ] 给所有已建模外设增加“raise -> mask -> ICPR -> clear -> lower”的运行时测试，
   目前很多测试仍是源码契约检查。
 - [ ] 继续核对 TCU 时钟门控、PWM、watchdog/OST 差异和极短 compare 的精度。
@@ -354,7 +355,9 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   TCG。飞天影音的 MPEG-4/MP3 视频在解码负载下连续 40 秒从 93 帧增长到 968 帧，
   audio DMA completion/rearm 从 219/219 增长到 469/469，underrun 保持 0；不再因
   guest tick 越过播放器判等目标而永久忙等。TCU counter/flag/IRQ 硬件语义未改。
-- [ ] 去掉 wake proxy 后，待机、按键唤醒和所有应用计时仍稳定。
+- [x] 2026-07-14 去掉 wake proxy 后，自动探针以 `CPM LCR.SLEEP + MIPS WAIT` 进入
+  待机，并验证 GPIO1 按键经 INTC/IP2 唤醒后继续执行；TCU/应用计时仍使用原有真实
+  register/virtual-clock 路径。
 
 ### 4. LCD/SLCD 输出：部分完成
 
@@ -472,6 +475,14 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] RTC 已迁移到独立 `hw/rtc/jz4740_rtc.c`，MMIO 映射到 `0xb0003000`，IRQ 直接
   接入 INTC source 15；Windows QEMU 编译、sidecar 链接和默认 NAND 主菜单时间、
   按键、触摸回归通过。
+- [x] RTC `HCR.PD` 从单纯冻结寄存器改为板级 power-down callback；默认触发 QEMU
+  guest shutdown。固件轮询的 active-low 电源键 GPIO D29 空闲为高，因此关机路径
+  不再卡在 `0x8005ba54`，也不会在 terminal loop 消耗单核 100%。
+- [x] Web 生命周期通过 QMP `SHUTDOWN.reason` 区分 guest shutdown、guest reset、用户
+  停止和异常退出；Windows TCP 尾事件另有 RTC HCR.PD 板级标记兜底。前端停机遮罩
+  展示明确原因和重启入口，不再只显示 `running=false`。
+- [x] Web 屏幕工具栏提供真机电源键，按下和长按通过 input chardev 驱动 active-low
+  GPIO D29；它不等同于 host stop，关机仍由固件和 RTC HCR.PD 流程完成。
 - [x] battery sample 由 SADC PBAT conversion 给出，并可通过 machine property 配置 raw 值。
 - [x] graphics/UART/RTC 的固定 ready override machine properties 已移除。
 
@@ -480,8 +491,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [ ] MSC 尚未实现独立可选 SD/MMC block backend、card detect 和真实响应/error 语义。
 - [ ] DMAC 尚未覆盖所有外设 request、传输宽度、stride、错误和 descriptor corner case；
   audio request 作为 P0 优先补齐，其余 request 放到 P3。
-- [ ] PM/clock gating 只有独立 CPM register、WAIT wake 和 RTC hibernate 基础行为，尚未
-  完整建模 suspend、reset cause、module clock gating 和低电压关机。
+- [ ] PM 已有独立 CPM register、真实 `LCR.SLEEP + WAIT`/GPIO wake 和 RTC HCR.PD
+  关机；尚未完整建模 reset cause、module clock gating、RTC alarm 冷启动和低电压关机。
 - [ ] USB device attach/data transfer 未实现；当前 UDC 只满足 no-host idle 路径。
 
 验收：
@@ -490,7 +501,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] 运行期资源读取、文件写入和块回收不依赖 QEMU OOB map。
 - [x] 写后 raw NAND 冷启动不再依赖 host canonical checkpoint；QEMU 直接复用同一活动
   raw 文件。细粒度物理掉电语义仍是非阻塞研究项。
-- [ ] USB attach、低电压提示和 suspend/resume 都有可重复的运行时测试。
+- [x] suspend/WAIT、GPIO 按键 resume 和 RTC HCR.PD guest shutdown 有可重复运行时测试。
+- [ ] USB attach、低电压提示和 RTC alarm 冷启动仍缺少可重复运行时测试。
 
 ### 7. AIC/I2S/audio codec：P0，部分完成
 
@@ -574,7 +586,7 @@ panel/status、CIM、SADC、GPIO、RTC、INTC、CPM、DMAC、TCU、UART 和 UDC 
 独立文件；host scanout、frame/audio/perf chardev 也已迁移到独立 host bridge，
 host input chardev/parser 已迁移到独立 input bridge，storage/input recorder 已迁移到
 独立 diagnostic device，MSC/DMAC/AIC transport 已迁移到独立 DMA bridge。machine
-仍持有 IRQ/wake、touch GPIO/SADC 和 BootROM 等真正的板级策略。
+  仍持有 IRQ wiring、RTC power-down、touch GPIO/SADC 和 BootROM 等真正的板级策略。
 
 - [x] 设备寄存器常量和 helper 已按模块分区，raw NAND 已有独立
   state/MMIO/backing/reset/migration/ops。
@@ -584,7 +596,7 @@ host input chardev/parser 已迁移到独立 input bridge，storage/input record
   IRQ 汇总、reset、migration 和诊断状态。
 - [x] 新建 `hw/misc/jz4740_cpm.c`，从通用 MMIO window 迁移 CPCCR/LCR/CPPCR、
   CLKGR/SCR 和各外设 divider；保留未知寄存器存储、访问宽度约束、reset/migration，
-  并通过回调将板级 wake 配置变化通知 machine。
+  并通过回调通知 machine 刷新板级状态。
 - [x] 新建 `hw/misc/jz4740_cim.c`，替换最后一个匿名 generic MMIO window；包含
   idle camera register、FIFO empty、disable-done、IRQ、reset 和 migration。
 - [x] 新建 `hw/timer/jz4740_tcu.c`，包含 8-channel counter、full/half compare、
@@ -752,7 +764,9 @@ host input chardev/parser 已迁移到独立 input bridge，storage/input record
 - [x] 时间：主菜单时间来自 RTC host clock 路径。
 - [x] 音频：真实 AIC FIFO、DMA request 和 host/Web audio 输出已由用户实际验收；
   外部板级 route trace 不作为当前发布阻塞项。
-- [ ] 电源：低电压、hibernate、wake 有端到端测试。
+- [x] 电源：`LCR.SLEEP + WAIT`、GPIO/INTC/IP2 wake、`HCR.PD` guest shutdown 及 Web
+  关机原因提示有端到端测试。
+- [ ] 电源：低电压和 RTC alarm 冷启动尚无端到端测试。
 - [x] 发布：release 工具只打包运行必需文件，不再携带旧 QEMU patch 安装路径。
 - [ ] 结构：主要 JZ4740 设备已从 `bbk9588.c` 拆分。
 

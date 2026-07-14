@@ -193,6 +193,45 @@ def _validate_ftl_scan(result, *, label: str) -> None:
         )
 
 
+def _validate_boot_ecc(
+    nand_path: Path,
+    result,
+    *,
+    label: str,
+) -> int:
+    """Check logical block zero metadata and the FAT boot-sector page."""
+
+    checked_pages = 0
+    logical = 0
+    record = result.mapping[logical]
+    pages = {0, DEFAULT_VOLUME_LBA * 512 // PAGE_SIZE}
+    if (
+        record.last_valid_page is not None
+        and 0 <= record.last_valid_page < PAGES_PER_BLOCK
+    ):
+        pages.add(record.last_valid_page)
+    with nand_path.open("rb") as stream:
+        for page_in_block in pages:
+            physical_page = record.physical * PAGES_PER_BLOCK + page_in_block
+            stream.seek(physical_page * PAGE_STRIDE)
+            page_data = stream.read(PAGE_SIZE)
+            page_oob = stream.read(SPARE_SIZE)
+            if len(page_data) != PAGE_SIZE or len(page_oob) != SPARE_SIZE:
+                raise IOError(
+                    f"short NAND page while checking ECC at physical page "
+                    f"0x{physical_page:x}"
+                )
+            expected = jz4740_page_oob_ecc(page_data, offset=4)
+            if page_oob[4 : len(expected)] != expected[4:]:
+                raise ValueError(
+                    f"{label} NAND has invalid RS ECC at physical page "
+                    f"0x{physical_page:x} (logical block 0x{logical:x}); "
+                    "repair the image with tools/stamp_nand_ecc.py"
+                )
+            checked_pages += 1
+    return checked_pages
+
+
 def _files_equal(left: Path, right: Path) -> bool:
     if left.stat().st_size != right.stat().st_size:
         return False
@@ -216,6 +255,16 @@ def _validate_nand_candidate(
     candidate_scan = scan_ftl_image(candidate)
     _validate_ftl_scan(reference_scan, label="source")
     _validate_ftl_scan(candidate_scan, label="candidate")
+    _validate_boot_ecc(
+        reference,
+        reference_scan,
+        label="source",
+    )
+    _validate_boot_ecc(
+        candidate,
+        candidate_scan,
+        label="candidate",
+    )
     if reference_scan.block_count != candidate_scan.block_count:
         raise ValueError("candidate NAND geometry changed during FAT injection")
     if _ftl_record_signature(reference_scan) != _ftl_record_signature(candidate_scan):
@@ -244,6 +293,11 @@ def validate_nand_image(nand_path: Path) -> dict[str, int]:
     nand = nand_path.resolve()
     result = scan_ftl_image(nand)
     _validate_ftl_scan(result, label="selected")
+    ecc_pages_checked = _validate_boot_ecc(
+        nand,
+        result,
+        label="selected",
+    )
     with tempfile.TemporaryDirectory(prefix="bbk9588-nand-validate-") as tmp:
         fat_path = Path(tmp) / "nand-fat.img"
         fat_size = extract_logical_fat_image(nand, fat_path)
@@ -258,6 +312,7 @@ def validate_nand_image(nand_path: Path) -> dict[str, int]:
         "block_count": result.block_count,
         "mapped_logical_blocks": len(result.mapping),
         "fat_size": fat_size,
+        "ecc_pages_checked": ecc_pages_checked,
     }
 
 

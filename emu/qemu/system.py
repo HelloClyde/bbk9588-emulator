@@ -39,6 +39,7 @@ QEMU_BBK_AUDIO_MAGIC = 0x414B4242
 QEMU_BBK_FRAME_FORMAT_RGB565 = 0x00005635
 QEMU_BBK_AUDIO_FORMAT_S16LE = 0x36314C53
 QEMU_BBK_PERF_FORMAT_GUEST_INSNS = 0x00004950
+QEMU_BBK_GUEST_SHUTDOWN_MARKER = "bbk9588: RTC HCR.PD requested guest shutdown"
 QEMU_BBK_PERF_FORMAT_AIC = 0x00434941
 QEMU_BBK_FRAME_HEADER = struct.Struct("<IIIIIII")
 QEMU_BBK_PERF_PAYLOAD = struct.Struct("<QQ")
@@ -585,6 +586,8 @@ class QemuSystemConfig:
     extra_args: tuple[str, ...] = ()
     timeout_seconds: float = 5.0
     firmware_patches: tuple[str, ...] = DEFAULT_QEMU_FIRMWARE_PATCHES
+    startup_power_key: bool = False
+    startup_power_hold_seconds: float = 0.75
 
 
 @dataclass(frozen=True)
@@ -625,8 +628,14 @@ class QemuProcessBackend:
         self.stderr_log_path: Path | None = None
         self.returncode: int | None = None
         self.last_error: str | None = None
+        self.stop_requested = False
+        self.exit_reason: str | None = None
         self.hmp_port: int | None = None
         self.hmp_sock: socket.socket | None = None
+        self.qmp_port: int | None = None
+        self.qmp_sock: socket.socket | None = None
+        self.qmp_last_event: dict[str, object] | None = None
+        self.last_qmp_error: str | None = None
         self.gdb_port: int | None = None
         self.gdb_sock: socket.socket | None = None
         self.bbk_input_port: int | None = None
@@ -695,6 +704,7 @@ class QemuProcessBackend:
         self._lock = threading.RLock()
         self._last_snapshot: dict[str, object] = {}
         self._reader_threads: list[threading.Thread] = []
+        self._qmp_reader_thread: threading.Thread | None = None
         self._frame_reader_thread: threading.Thread | None = None
         self._process_job_handle: object | None = None
         self.last_process_job_error: str | None = None
@@ -789,6 +799,16 @@ class QemuProcessBackend:
             if launch_config.gdb == "auto":
                 self.gdb_port = _find_free_tcp_port()
                 launch_config = replace(launch_config, gdb=f"tcp:127.0.0.1:{self.gdb_port}")
+            if not any(str(arg).strip().lower() == "-qmp" for arg in launch_config.extra_args):
+                self.qmp_port = _find_free_tcp_port()
+                launch_config = replace(
+                    launch_config,
+                    extra_args=(
+                        *launch_config.extra_args,
+                        "-qmp",
+                        f"tcp:127.0.0.1:{self.qmp_port},server=on,wait=off",
+                    ),
+                )
             if launch_config.machine.lower() == "bbk9588" and launch_config.bbk_input == "none":
                 self.bbk_input_port = _find_free_tcp_port()
                 launch_config = replace(
@@ -809,6 +829,18 @@ class QemuProcessBackend:
                         "server=on,wait=off,nodelay=on"
                     ),
                 )
+            if (
+                launch_config.machine.lower() == "bbk9588"
+                and self.hmp_port is not None
+                and not any(str(arg).strip().lower() == "-s" for arg in launch_config.extra_args)
+            ):
+                # Keep the guest behind a startup barrier until its input and frame
+                # chardev clients are attached, otherwise a fast boot can lose the
+                # only LCD update before the web frontend starts reading frames.
+                launch_config = replace(
+                    launch_config,
+                    extra_args=(*launch_config.extra_args, "-S"),
+                )
             raw_command = build_qemu_command(launch_config)
             resolved = find_qemu(raw_command[0])
             if resolved is None:
@@ -822,6 +854,10 @@ class QemuProcessBackend:
             self.stderr_log_path = log_dir / f"qemu_stderr_{int(time.time() * 1000)}.log"
             self.returncode = None
             self.last_error = None
+            self.stop_requested = False
+            self.exit_reason = None
+            self.qmp_last_event = None
+            self.last_qmp_error = None
             self.register_sample = None
             self.register_sample_at = 0.0
             self.memory_read_count = 0
@@ -902,6 +938,18 @@ class QemuProcessBackend:
             ]
             for thread in self._reader_threads:
                 thread.start()
+            if self.qmp_port is not None:
+                try:
+                    self.qmp_sock = _connect_qmp(self.qmp_port, timeout=1.5)
+                    self._qmp_reader_thread = threading.Thread(
+                        target=self._qmp_reader,
+                        name="bbk9588-qmp-events",
+                        daemon=True,
+                    )
+                    self._qmp_reader_thread.start()
+                except Exception as exc:
+                    self.qmp_sock = None
+                    self.last_qmp_error = f"{type(exc).__name__}: {exc}"
             if self.hmp_port is not None:
                 try:
                     self.hmp_sock = _connect_hmp(self.hmp_port, timeout=1.5)
@@ -911,14 +959,12 @@ class QemuProcessBackend:
             if self.gdb_port is not None:
                 try:
                     self.gdb_sock = _connect_gdb(self.gdb_port, timeout=1.5)
-                    try:
-                        _gdb_read_packet(self.gdb_sock, timeout=0.5)
-                        _gdb_continue(self.gdb_sock)
-                    except socket.timeout:
-                        pass
-                    except Exception as exc:
-                        self.last_gdb_error = f"initial resume {type(exc).__name__}: {exc}"
                 except Exception as exc:
+                    if self.gdb_sock is not None:
+                        try:
+                            self.gdb_sock.close()
+                        except OSError:
+                            pass
                     self.gdb_sock = None
                     self.last_gdb_error = f"{type(exc).__name__}: {exc}"
             if self.bbk_input_port is not None:
@@ -936,6 +982,64 @@ class QemuProcessBackend:
                 except Exception as exc:
                     self.bbk_frame_sock = None
                     self.last_frame_chardev_error = f"{type(exc).__name__}: {exc}"
+            startup_power_pressed = False
+            if self.config.startup_power_key:
+                result = self.apply_gui_key_event(11, True)
+                startup_power_pressed = bool(result.get("applied"))
+                if not startup_power_pressed:
+                    self.last_bbk_input_error = str(
+                        result.get("error") or "startup power key was not accepted"
+                    )
+            try:
+                hmp_status = (
+                    _hmp_command(self.hmp_sock, "info status")
+                    if self.hmp_sock is not None
+                    else ""
+                )
+                if "paused" in hmp_status.lower() or (
+                    not hmp_status and self.gdb_sock is not None
+                ):
+                    if self.gdb_sock is not None:
+                        stop_reply = _gdb_packet(self.gdb_sock, "?")
+                        if not stop_reply.startswith(("S", "T", "W", "X")):
+                            raise RuntimeError(
+                                f"unexpected initial GDB stop reply: {stop_reply!r}"
+                            )
+                        _gdb_continue(self.gdb_sock)
+                    elif self.hmp_sock is not None:
+                        _hmp_command(self.hmp_sock, "cont")
+            except Exception as exc:
+                self.last_gdb_error = f"initial resume {type(exc).__name__}: {exc}"
+                if self.gdb_sock is not None:
+                    try:
+                        self.gdb_sock.close()
+                    except OSError:
+                        pass
+                    self.gdb_sock = None
+                if self.hmp_sock is not None:
+                    try:
+                        _hmp_command(self.hmp_sock, "cont")
+                    except Exception as hmp_exc:
+                        self.last_error = f"HMP resume {type(hmp_exc).__name__}: {hmp_exc}"
+            if startup_power_pressed:
+                threading.Thread(
+                    target=self._release_startup_power_key,
+                    name="bbk9588-startup-power-key",
+                    daemon=True,
+                ).start()
+
+    def _release_startup_power_key(self) -> None:
+        deadline = time.monotonic() + max(
+            0.0, float(self.config.startup_power_hold_seconds)
+        )
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self.proc is None or self.proc.poll() is not None:
+                    return
+                if self.latest_frame_chardev is not None:
+                    break
+            time.sleep(0.05)
+        self.apply_gui_key_event(11, False)
 
     def _reader(self, name: str, stream) -> None:
         if stream is None:
@@ -951,11 +1055,67 @@ class QemuProcessBackend:
                     except OSError:
                         pass
                 with self._lock:
-                    tail.append(line.rstrip("\r\n"))
+                    text = line.rstrip("\r\n")
+                    tail.append(text)
                     del tail[:-200]
+                    if (
+                        name == "stderr"
+                        and QEMU_BBK_GUEST_SHUTDOWN_MARKER in text
+                        and not self.stop_requested
+                    ):
+                        self.exit_reason = "guest-shutdown"
         except Exception as exc:
             with self._lock:
                 self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def _handle_qmp_message_locked(self, message: dict[str, object]) -> None:
+        event = message.get("event")
+        if not isinstance(event, str):
+            return
+        data = message.get("data")
+        event_data = data if isinstance(data, dict) else {}
+        self.qmp_last_event = {
+            "event": event,
+            "data": dict(event_data),
+            "timestamp": message.get("timestamp"),
+        }
+        if event != "SHUTDOWN" or self.stop_requested:
+            return
+        reason = event_data.get("reason")
+        self.exit_reason = str(reason) if reason else "process-exit"
+
+    def _qmp_reader(self) -> None:
+        sock = self.qmp_sock
+        if sock is None:
+            return
+        buffer = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    message = json.loads(line.decode("utf-8"))
+                    if isinstance(message, dict):
+                        with self._lock:
+                            self._handle_qmp_message_locked(message)
+        except (OSError, ValueError) as exc:
+            with self._lock:
+                if self.proc is not None and self.proc.poll() is None:
+                    self.last_qmp_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            with self._lock:
+                if self.qmp_sock is sock:
+                    self.qmp_sock = None
 
     @staticmethod
     def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -1181,6 +1341,8 @@ class QemuProcessBackend:
         quit_sent = False
         with self._lock:
             proc = self.proc
+            if proc is not None and proc.poll() is None:
+                self.stop_requested = True
             if (
                 proc is not None
                 and proc.poll() is None
@@ -1210,34 +1372,32 @@ class QemuProcessBackend:
                     proc.kill()
                     proc.wait(timeout=timeout)
         with self._lock:
-            self.returncode = proc.returncode
+            self._record_process_exit_locked(proc.returncode)
+
+    def _record_process_exit_locked(self, returncode: int | None) -> None:
+        if returncode is None:
+            return
+        self.returncode = int(returncode)
+        if self.finished_at is None:
             self.finished_at = time.time()
-            if self.hmp_sock is not None:
+        if self.exit_reason is None:
+            if self.stop_requested:
+                self.exit_reason = "user-stop"
+            elif self.returncode != 0:
+                self.exit_reason = "process-error"
+            else:
+                self.exit_reason = "process-exit"
+        # QMP must drain the final SHUTDOWN event before its reader sees EOF.
+        for name in ("hmp_sock", "gdb_sock", "bbk_input_sock", "bbk_frame_sock"):
+            sock = getattr(self, name)
+            if sock is not None:
                 try:
-                    self.hmp_sock.close()
+                    sock.close()
                 except OSError:
                     pass
-                self.hmp_sock = None
-            if self.gdb_sock is not None:
-                try:
-                    self.gdb_sock.close()
-                except OSError:
-                    pass
-                self.gdb_sock = None
-            if self.bbk_input_sock is not None:
-                try:
-                    self.bbk_input_sock.close()
-                except OSError:
-                    pass
-                self.bbk_input_sock = None
-            if self.bbk_frame_sock is not None:
-                try:
-                    self.bbk_frame_sock.close()
-                except OSError:
-                    pass
-                self.bbk_frame_sock = None
-            _close_windows_job(self._process_job_handle)
-            self._process_job_handle = None
+                setattr(self, name, None)
+        _close_windows_job(self._process_job_handle)
+        self._process_job_handle = None
 
     def set_storage_trace(self, enabled: bool) -> dict[str, object]:
         """Enable or disable the bbk9588 storage trace at runtime."""
@@ -1263,35 +1423,7 @@ class QemuProcessBackend:
         with self._lock:
             proc = self.proc
             if proc is not None and proc.poll() is not None:
-                self.returncode = proc.returncode
-                if self.finished_at is None:
-                    self.finished_at = time.time()
-                if self.hmp_sock is not None:
-                    try:
-                        self.hmp_sock.close()
-                    except OSError:
-                        pass
-                    self.hmp_sock = None
-                if self.gdb_sock is not None:
-                    try:
-                        self.gdb_sock.close()
-                    except OSError:
-                        pass
-                    self.gdb_sock = None
-                if self.bbk_input_sock is not None:
-                    try:
-                        self.bbk_input_sock.close()
-                    except OSError:
-                        pass
-                    self.bbk_input_sock = None
-                if self.bbk_frame_sock is not None:
-                    try:
-                        self.bbk_frame_sock.close()
-                    except OSError:
-                        pass
-                    self.bbk_frame_sock = None
-                _close_windows_job(self._process_job_handle)
-                self._process_job_handle = None
+                self._record_process_exit_locked(proc.returncode)
             elif proc is not None and self.hmp_sock is not None and time.time() - self.register_sample_at >= 0.5:
                 try:
                     status = _hmp_command(self.hmp_sock, "info status")
@@ -1804,21 +1936,21 @@ class QemuProcessBackend:
                 self.gdb_register_write_count += len(saved)
 
     def _pause_for_gdb_locked(self) -> None:
-        if self.hmp_sock is not None:
-            _hmp_command(self.hmp_sock, "stop")
-            time.sleep(0.02)
+        if self.gdb_sock is not None:
+            _gdb_interrupt(self.gdb_sock)
             return
-        if self.gdb_sock is None:
-            raise RuntimeError("QEMU GDB stub is not connected")
-        _gdb_interrupt(self.gdb_sock)
+        if self.hmp_sock is None:
+            raise RuntimeError("QEMU debug monitor is not connected")
+        _hmp_command(self.hmp_sock, "stop")
+        time.sleep(0.02)
 
     def _resume_after_gdb_locked(self) -> None:
-        if self.hmp_sock is not None:
-            _hmp_command(self.hmp_sock, "cont")
+        if self.gdb_sock is not None:
+            _gdb_continue(self.gdb_sock)
             return
-        if self.gdb_sock is None:
+        if self.hmp_sock is None:
             return
-        _gdb_continue(self.gdb_sock)
+        _hmp_command(self.hmp_sock, "cont")
 
     def _is_guest_ram_va(self, va: int, size: int = 1) -> bool:
         if va == 0 or va < 0x80000000:
@@ -4484,11 +4616,11 @@ class QemuProcessBackend:
             "nand_bch_busy_reads",
             "nand_addr_count",
             "gpio_flag_200",
-            "sysctrl_wake_enable_20",
-            "sysctrl_wake_enable_24",
-            "extgpio_wake_enable_80",
-            "sysctrl_wake_pending",
-            "sysctrl_wake_count",
+            "cpm_clkgr_wake_mask",
+            "cpm_scr_wake_mask",
+            "reserved_128",
+            "reserved_12c",
+            "reserved_130",
             "tcu_irq_mask",
             "tcu_compare4",
             "tcu_period4_ms",
@@ -4561,8 +4693,6 @@ class QemuProcessBackend:
                 out["emc_nfints_int"] = int(words[69])
                 out["nand_addr_count_int"] = int(words[70])
                 out["gpio_flag_200_int"] = int(words[71])
-                out["sysctrl_wake_pending_bool"] = bool(words[75])
-                out["sysctrl_wake_count_int"] = int(words[76])
                 if self.gdb_sock is not None:
                     self.gdb_read_count += 1
                     self.last_gdb_error = None
@@ -7315,6 +7445,8 @@ class QemuProcessBackend:
         return out
 
     def _snapshot_locked(self) -> dict[str, object]:
+        if self.proc is not None:
+            self._record_process_exit_locked(self.proc.poll())
         now = time.time()
         elapsed = None if self.started_at is None else (self.finished_at or now) - self.started_at
         performance = self._update_performance_metrics_locked(now, elapsed)
@@ -7332,6 +7464,8 @@ class QemuProcessBackend:
                 "running": self.proc is not None and self.proc.poll() is None,
                 "process_id": None if self.proc is None else self.proc.pid,
                 "returncode": self.returncode,
+                "exit_reason": self.exit_reason,
+                "stop_requested": self.stop_requested,
                 "stdout_tail": list(self.stdout_tail[-80:]),
                 "stderr_tail": list(self.stderr_tail[-80:]),
                 "last_error": self.last_error,
@@ -7345,6 +7479,9 @@ class QemuProcessBackend:
                 "kill_with_parent": self._process_job_handle is not None,
                 "process_job_error": self.last_process_job_error,
                 "hmp_port": self.hmp_port,
+                "qmp_port": self.qmp_port,
+                "qmp_last_event": self.qmp_last_event,
+                "last_qmp_error": self.last_qmp_error,
                 "gdb_port": self.gdb_port,
                 "gdb_connected": self.gdb_sock is not None,
                 "bbk_input_port": self.bbk_input_port,
@@ -7627,6 +7764,9 @@ def build_bbk_qemu_config(
     plugins: tuple[Path, ...] = (),
     extra_args: tuple[str, ...] = (),
     firmware_patches: tuple[str, ...] | list[str] | None = None,
+    hibernate_wakeup: bool = False,
+    startup_power_key: bool = False,
+    startup_power_hold_seconds: float = 0.75,
 ) -> QemuSystemConfig:
     firmware_patches = normalize_firmware_patches(
         firmware_patches,
@@ -7681,6 +7821,11 @@ def build_bbk_qemu_config(
     else:
         raise ValueError(f"unsupported QEMU boot_mode {boot_mode!r}")
     if machine.lower() == "bbk9588":
+        option_names = {
+            option.split("=", 1)[0] for option in bbk_machine_options
+        }
+        if hibernate_wakeup and "hibernate-wakeup" not in option_names:
+            bbk_machine_options = (*bbk_machine_options, "hibernate-wakeup=on")
         bbk_machine_options = default_bbk9588_machine_options(bbk_machine_options)
     return QemuSystemConfig(
         executable=executable,
@@ -7704,6 +7849,8 @@ def build_bbk_qemu_config(
         extra_args=extra_args,
         timeout_seconds=timeout_seconds,
         firmware_patches=firmware_patches,
+        startup_power_key=bool(startup_power_key),
+        startup_power_hold_seconds=max(0.0, float(startup_power_hold_seconds)),
     )
 
 
@@ -7880,6 +8027,53 @@ def _hmp_command(sock: socket.socket, command: str) -> str:
     if "(qemu)" not in text:
         text += _read_hmp_available(sock, 0.5)
     return text
+
+
+def _read_qmp_message(sock: socket.socket) -> dict[str, object]:
+    line = bytearray()
+    while True:
+        byte = sock.recv(1)
+        if not byte:
+            raise EOFError("QEMU QMP monitor closed")
+        if byte == b"\n":
+            if not line.strip():
+                line.clear()
+                continue
+            message = json.loads(line.decode("utf-8"))
+            if not isinstance(message, dict):
+                raise ValueError("invalid QMP message")
+            return message
+        line.extend(byte)
+
+
+def _connect_qmp(port: int, timeout: float = 3.0) -> socket.socket:
+    deadline = time.time() + timeout
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=0.25)
+            sock.settimeout(max(0.25, deadline - time.time()))
+            greeting = _read_qmp_message(sock)
+            if "QMP" not in greeting:
+                raise ValueError("missing QMP greeting")
+            sock.sendall(b'{"execute":"qmp_capabilities"}\r\n')
+            while True:
+                response = _read_qmp_message(sock)
+                if "return" in response:
+                    sock.settimeout(None)
+                    return sock
+                if "error" in response:
+                    raise RuntimeError(f"QMP capability negotiation failed: {response['error']}")
+        except (OSError, EOFError, ValueError, RuntimeError) as exc:
+            last_error = exc
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            time.sleep(0.05)
+    raise TimeoutError(f"could not connect to QEMU QMP monitor on port {port}: {last_error}")
 
 
 def _connect_gdb(port: int, timeout: float = 3.0) -> socket.socket:

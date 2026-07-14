@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +33,7 @@ from emu.qemu.nand_fs import (
     mutate_nand_files,
     normalize_nand_path,
     read_nand_file,
+    validate_nand_image,
 )
 from emu.qemu.nand_lock import NandImageInUseError, NandImageLease
 from emu.qemu.nand_source import import_nand_source
@@ -165,7 +167,11 @@ def _make_nand_file_manager_fixture(root: Path) -> tuple[Path, Path]:
             for page in range(PAGES_PER_BLOCK):
                 start = page * PAGE_SIZE
                 nand.seek(physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE)
-                nand.write(block[start : start + PAGE_SIZE])
+                page_data = block[start : start + PAGE_SIZE]
+                nand.write(page_data)
+                parity = jz4740_page_oob_ecc(page_data, offset=4)
+                nand.seek(physical * RAW_BLOCK_SIZE + page * PAGE_STRIDE + PAGE_SIZE + 4)
+                nand.write(parity[4:])
             oob = physical * RAW_BLOCK_SIZE + PAGE_SIZE
             nand.seek(oob + 58)
             nand.write((1).to_bytes(2, "little"))
@@ -180,11 +186,16 @@ class _QTestClient:
         *,
         nand_image: Path | None = None,
         extra_args: tuple[str, ...] = (),
+        hibernate_poweroff: bool = False,
+        hibernate_wakeup: bool = False,
     ) -> None:
         command = [
             executable,
             "-M",
-            "bbk9588",
+            "bbk9588,hibernate-poweroff=" +
+            ("on" if hibernate_poweroff else "off") +
+            ",hibernate-wakeup=" +
+            ("on" if hibernate_wakeup else "off"),
             "-accel",
             "qtest",
             "-display",
@@ -212,12 +223,17 @@ class _QTestClient:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
 
     def command(self, command: str) -> str:
         if self.process.stdin is None or self.process.stdout is None:
@@ -1230,6 +1246,27 @@ class QemuSystemCommandTests(unittest.TestCase):
             command,
         )
 
+    def test_hibernate_wakeup_uses_pin_reset_without_gpio_key(self) -> None:
+        config = build_bbk_qemu_config(
+            boot_mode="nand",
+            hibernate_wakeup=True,
+        )
+
+        self.assertIn("hibernate-wakeup=on", config.bbk_machine_options)
+        self.assertFalse(config.startup_power_key)
+        self.assertIn(
+            "hibernate-wakeup=on",
+            build_qemu_command(config)[build_qemu_command(config).index("-M") + 1],
+        )
+
+    def test_startup_power_key_release_waits_for_first_frame(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "emu/qemu/system.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("if self.latest_frame_chardev is not None:", source)
+        self.assertIn("time.monotonic() < deadline", source)
+
     def test_bbk9588_default_patches_skip_c_device_stubs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "C200.bin"
@@ -1486,8 +1523,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('qdev_prop_set_uint32(dev, "period-ms", board->tcu_period_ms);', board)
         self.assertIn("BBK9588_KSEG_TO_PHYS(0xb0002000u)", board)
         self.assertIn("jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU0)", board)
-        self.assertIn("jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU1) ||", board)
-        self.assertIn("board->sysctrl_wake_pending", board)
+        self.assertIn("jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU1));", board)
+        self.assertNotIn("BBK9588_SYSCTRL_WAKE_PROXY_IRQ", board)
+        self.assertNotIn("sysctrl_wake_pending", board)
         self.assertIn("jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU2)", board)
         self.assertIn("output == JZ4740_TCU_EVENT ? bbk9588_tcu_event_handler", board)
         self.assertIn(
@@ -1536,7 +1574,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("rc->phases.exit = jz4740_cpm_reset_exit;", source)
         self.assertIn("sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0000000u));", board)
         self.assertIn("jz4740_cpm_set_update(board->cpm, bbk9588_cpm_update, board);", board)
-        self.assertIn("jz4740_cpm_wake_enabled(board->cpm)", board)
+        self.assertNotIn("jz4740_cpm_wake_enabled(board->cpm)", board)
         self.assertNotIn("BBK9588_MMIO_SYSCTRL", board)
         self.assertNotIn("bbk9588.sysctrl", board)
 
@@ -1780,6 +1818,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('sscanf(line, "K %u %u"', source)
         self.assertIn("bbk9588_host_input_configure", board)
         self.assertIn("bbk9588_key_apply_host_input", board)
+        self.assertIn("#define BBK9588_HOST_KEY_POWER     11u", board)
+        self.assertIn("case BBK9588_HOST_KEY_POWER:", board)
+        self.assertIn("*mask = 0x20000000u;", board)
         self.assertIn("bbk9588_touch_apply_host_input", board)
         self.assertIn("../input/bbk9588_host_input.c", meson)
         self.assertNotIn("CharFrontend input_chr;", board)
@@ -2008,6 +2049,8 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("#define RTC_RTCCR_1HZIE            0x00000020u", source)
         self.assertIn("#define RTC_HCR_PD                 0x00000001u", source)
         self.assertIn("#define RTC_HWRSR_PPR              0x00000010u", source)
+        self.assertIn("#define RTC_HWRSR_HR               0x00000020u", source)
+        self.assertIn("#define RTC_HWRSR_PIN              0x00000002u", source)
         self.assertIn("static uint32_t rtc_host_seconds", source)
         self.assertIn("uint32_t jz4740_rtc_seconds", source)
         self.assertIn("static uint32_t rtc_latch_flags", source)
@@ -2015,6 +2058,10 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("static void rtc_schedule", source)
         self.assertIn("static void rtc_timer_cb", source)
         self.assertIn("static void rtc_enter_hibernate", source)
+        self.assertIn("JZ4740RTCPowerDownCallback power_down_callback;", source)
+        self.assertIn("s->power_down_callback(s->power_down_opaque);", source)
+        self.assertIn('DEFINE_PROP_BOOL("hibernate-wakeup", JZ4740RTCState,', source)
+        self.assertIn("RTC_HWRSR_HR | RTC_HWRSR_PIN : RTC_HWRSR_PPR", source)
         self.assertIn("static void rtc_write_while_hibernating", source)
         self.assertIn("case RTC_RTCCR:", source)
         self.assertIn("case RTC_RTCSR:", source)
@@ -2038,10 +2085,39 @@ class QemuSystemCommandTests(unittest.TestCase):
             board,
         )
         self.assertIn("JZ4740_INTC_IRQ_RTC", board)
+        self.assertIn("qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);", board)
+        self.assertIn("bbk9588: RTC HCR.PD requested guest shutdown", board)
+        self.assertIn('object_class_property_add_bool(oc, "hibernate-poweroff"', board)
+        self.assertIn('object_class_property_add_bool(oc, "hibernate-wakeup"', board)
+        self.assertIn('qdev_prop_set_bit(dev, "hibernate-wakeup",', board)
+        self.assertIn('qdev_prop_set_uint32(dev, "input-reset-d", 0x20200000u);', board)
         self.assertNotIn("BBK9588_MMIO_RTC", board)
         self.assertNotIn("QEMUTimer *rtc_timer;", board)
         self.assertNotIn("static uint32_t bbk9588_rtc_read", board)
         self.assertNotIn('"ready-status"', board)
+
+    def test_qemu_jz4740_rtc_hcr_requests_guest_shutdown(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        rtc = 0x10003000
+        gpio_d_pin = 0x10010300
+        with _QTestClient(qemu, hibernate_poweroff=True) as client:
+            self.assertEqual(client.readl(gpio_d_pin) & 0x20000000, 0x20000000)
+            self.assertEqual(client.readl(rtc + 0x20), 0)
+            client.writel(rtc + 0x20, 1)
+            self.assertEqual(client.process.wait(timeout=5), 0)
+
+    def test_qemu_jz4740_rtc_hibernate_pin_wakeup_status(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        rtc = 0x10003000
+        with _QTestClient(qemu, hibernate_wakeup=True) as client:
+            self.assertEqual(client.readl(rtc + 0x20), 0)
+            self.assertEqual(client.readl(rtc + 0x30), 0x22)
 
     def test_jz4740_dmac_source_follows_channel_semantics(self) -> None:
         root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
@@ -2874,7 +2950,66 @@ class QemuSystemCommandTests(unittest.TestCase):
         command = popen_args[0]
         self.assertIn(nand.resolve().as_posix(), " ".join(command))
         self.assertNotIn("qemu_nand_runs", " ".join(command))
+        self.assertIn("-S", command)
         self.assertTrue(nand_survived)
+
+    def test_qemu_process_backend_resumes_paused_debug_stub_with_stop_query(self) -> None:
+        class FakeProcess:
+            stdout: list[str] = []
+            stderr: list[str] = []
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                return 0
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nand = Path(tmp) / "nand.bin"
+            nand.write_bytes(b"\xff" * 4096)
+            config = QemuSystemConfig(
+                executable=sys.executable,
+                machine="bbk9588",
+                monitor="none",
+                gdb="auto",
+                bbk_input="null,id=bbk9588-input",
+                bbk_frame="null,id=bbk9588-frame",
+                bbk_machine_options=("bootrom-nand=on",),
+                nand_image=nand,
+                extra_args=("-qmp", "none"),
+            )
+            backend = QemuProcessBackend(config)
+            gdb_socket = mock.MagicMock()
+            hmp_socket = mock.MagicMock()
+            with (
+                mock.patch.object(subprocess, "Popen", return_value=FakeProcess()),
+                mock.patch("emu.qemu.system._connect_hmp", return_value=hmp_socket),
+                mock.patch("emu.qemu.system._connect_gdb", return_value=gdb_socket),
+                mock.patch("emu.qemu.system._gdb_packet", return_value="T05core:01;") as query,
+                mock.patch("emu.qemu.system._gdb_continue") as resume,
+                mock.patch(
+                    "emu.qemu.system._hmp_command",
+                    side_effect=lambda _sock, command: (
+                        "VM status: paused" if command == "info status" else ""
+                    ),
+                ) as hmp_command,
+            ):
+                backend.start()
+                self.assertEqual(hmp_command.call_args_list[0], mock.call(hmp_socket, "info status"))
+                query.assert_called_once_with(gdb_socket, "?")
+                resume.assert_called_once_with(gdb_socket)
+                self.assertIs(backend.gdb_sock, gdb_socket)
+                backend.stop()
+
+        gdb_socket.close.assert_called_once_with()
 
     @unittest.skipUnless(os.name == "nt", "Windows Job Object test")
     def test_windows_job_handle_close_terminates_child_process(self) -> None:
@@ -2941,6 +3076,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(process.kill_count, 0)
         self.assertTrue(hmp.closed)
         self.assertEqual(backend.returncode, 0)
+        self.assertEqual(backend.exit_reason, "user-stop")
 
     def test_qemu_process_backend_stop_accepts_hmp_disconnect_after_quit(self) -> None:
         class FakeProcess:
@@ -2981,6 +3117,290 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(process.terminate_count, 0)
         self.assertIsNone(backend.last_error)
         self.assertEqual(backend.returncode, 0)
+        self.assertEqual(backend.exit_reason, "user-stop")
+
+    def test_qemu_process_backend_classifies_unrequested_process_exit(self) -> None:
+        class FakeProcess:
+            def __init__(self, returncode: int):
+                self.returncode = returncode
+                self.pid = 1
+
+            def poll(self) -> int:
+                return self.returncode
+
+        backend = QemuProcessBackend(QemuSystemConfig(machine="bbk9588"))
+        backend.proc = FakeProcess(0)  # type: ignore[assignment]
+        normal = backend.snapshot(refresh=False)
+
+        self.assertFalse(normal["running"])
+        self.assertEqual(normal["exit_reason"], "process-exit")
+        self.assertEqual(normal["returncode"], 0)
+
+        guest_shutdown = QemuProcessBackend(QemuSystemConfig(machine="bbk9588"))
+        guest_shutdown._handle_qmp_message_locked({
+            "event": "SHUTDOWN",
+            "data": {"guest": True, "reason": "guest-shutdown"},
+        })
+        guest_shutdown.proc = FakeProcess(0)  # type: ignore[assignment]
+        shutdown = guest_shutdown.snapshot(refresh=False)
+
+        self.assertEqual(shutdown["exit_reason"], "guest-shutdown")
+        self.assertEqual(shutdown["qmp_last_event"], {
+            "event": "SHUTDOWN",
+            "data": {"guest": True, "reason": "guest-shutdown"},
+            "timestamp": None,
+        })
+
+        failed = QemuProcessBackend(QemuSystemConfig(machine="bbk9588"))
+        failed.proc = FakeProcess(7)  # type: ignore[assignment]
+        error = failed.snapshot(refresh=False)
+
+        self.assertEqual(error["exit_reason"], "process-error")
+        self.assertEqual(error["returncode"], 7)
+
+    def test_frontend_stop_detail_preserves_guest_shutdown_reason(self) -> None:
+        state = FrontendState.__new__(FrontendState)
+        state.last_error = None
+        state.job_finished_at = None
+
+        detail = state._stop_detail(
+            False,
+            {
+                "exit_reason": "guest-shutdown",
+                "returncode": 0,
+                "finished_at": 123.0,
+                "last_error": "HMP ConnectionResetError: monitor closed",
+            },
+        )
+
+        self.assertEqual(detail, {
+            "code": "guest-shutdown",
+            "returncode": 0,
+            "occurred_at": 123.0,
+            "expected": True,
+            "error": None,
+        })
+
+    @staticmethod
+    def _make_safe_shutdown_state(backend) -> FrontendState:
+        state = FrontendState.__new__(FrontendState)
+        state.lock = threading.RLock()
+        state.input_lock = threading.RLock()
+        state.pending_keys = deque()
+        state.qemu_backend = backend
+        state.frontend_key_leases = {("page", 11): time.monotonic() + 60.0}
+        state.frontend_active_key_codes = {11}
+        state.last_input_event = None
+        state.input_wake_count = 0
+        state.safe_shutdown_state = "idle"
+        state.safe_shutdown_started_at = None
+        state.safe_shutdown_finished_at = None
+        state.safe_shutdown_error = None
+        state._publish_snapshot_locked = lambda: None  # type: ignore[method-assign]
+        return state
+
+    def test_frontend_safe_shutdown_holds_power_until_guest_shutdown(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.running = True
+                self.events: list[tuple[int, bool]] = []
+
+            def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
+                return {
+                    "running": self.running,
+                    "exit_reason": None if self.running else "guest-shutdown",
+                    "returncode": None if self.running else 0,
+                }
+
+            def apply_gui_key_event(self, code: int, down: bool) -> dict[str, object]:
+                self.events.append((code, down))
+                if not down:
+                    self.running = False
+                return {"applied": True, "code": code, "down": down}
+
+        backend = FakeBackend()
+        state = self._make_safe_shutdown_state(backend)
+
+        snapshot = state._request_guest_shutdown_locked(hold_seconds=0.0, timeout=0.2)
+
+        self.assertEqual(backend.events, [(11, True), (11, False)])
+        self.assertFalse(snapshot["running"])
+        self.assertEqual(snapshot["exit_reason"], "guest-shutdown")
+        self.assertEqual(state.safe_shutdown_state, "complete")
+        self.assertEqual(state.frontend_key_leases, {})
+        self.assertEqual(state.frontend_active_key_codes, set())
+
+    def test_frontend_safe_shutdown_timeout_keeps_qemu_running(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.events: list[tuple[int, bool]] = []
+
+            def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
+                return {"running": True, "exit_reason": None, "returncode": None}
+
+            def apply_gui_key_event(self, code: int, down: bool) -> dict[str, object]:
+                self.events.append((code, down))
+                return {"applied": True, "code": code, "down": down}
+
+        backend = FakeBackend()
+        state = self._make_safe_shutdown_state(backend)
+
+        with self.assertRaisesRegex(RuntimeError, "firmware did not complete"):
+            state._request_guest_shutdown_locked(hold_seconds=0.0, timeout=0.02)
+
+        self.assertEqual(backend.events, [(11, True), (11, False)])
+        self.assertEqual(state.safe_shutdown_state, "failed")
+        self.assertIn("TimeoutError", state.safe_shutdown_error or "")
+
+    def test_frontend_reset_host_stops_when_firmware_has_no_frame(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.running = True
+                self.stop_count = 0
+
+            def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
+                return {"running": self.running, "frame_chardev_count": 0}
+
+            def stop(self) -> None:
+                self.stop_count += 1
+                self.running = False
+
+        backend = FakeBackend()
+        state = FrontendState.__new__(FrontendState)
+        state._request_guest_shutdown_locked = mock.Mock()  # type: ignore[method-assign]
+
+        fallback = state._stop_backend_for_reset_locked(backend)  # type: ignore[arg-type]
+
+        self.assertIsNotNone(fallback)
+        self.assertEqual(backend.stop_count, 1)
+        state._request_guest_shutdown_locked.assert_not_called()
+        self.assertIn("固件尚未完成启动", fallback[0])  # type: ignore[index]
+
+    def test_frontend_reset_falls_back_after_guest_shutdown_failure(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.running = True
+                self.stop_count = 0
+
+            def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
+                return {"running": self.running, "frame_chardev_count": 3}
+
+            def stop(self) -> None:
+                self.stop_count += 1
+                self.running = False
+
+        backend = FakeBackend()
+        state = FrontendState.__new__(FrontendState)
+        state._request_guest_shutdown_locked = mock.Mock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("safe shutdown failed: timeout")
+        )
+
+        fallback = state._stop_backend_for_reset_locked(  # type: ignore[arg-type]
+            backend,
+            shutdown_timeout=0.02,
+        )
+
+        self.assertIsNotNone(fallback)
+        self.assertEqual(backend.stop_count, 1)
+        state._request_guest_shutdown_locked.assert_called_once_with(timeout=0.02)
+        self.assertIn("safe shutdown failed: timeout", fallback[1])  # type: ignore[index]
+
+    def test_frontend_force_stop_command_uses_explicit_force_path(self) -> None:
+        state = FrontendState.__new__(FrontendState)
+        state.force_stop = mock.Mock(return_value={"forced": True})  # type: ignore[method-assign]
+
+        result = state.command({"op": "force-stop"})
+
+        self.assertEqual(result, {"forced": True})
+        state.force_stop.assert_called_once_with()
+
+    def test_frontend_key_lease_coalesces_heartbeats_and_releases_stale_keys(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.events: list[tuple[int, bool]] = []
+
+            def running(self) -> bool:
+                return True
+
+            def apply_gui_key_event(self, code: int, down: bool) -> dict[str, object]:
+                self.events.append((code, down))
+                return {"applied": True, "code": code, "down": down}
+
+        backend = FakeBackend()
+        state = FrontendState.__new__(FrontendState)
+        state.lock = threading.RLock()
+        state.input_lock = threading.RLock()
+        state.pending_keys = deque()
+        state.qemu_backend = backend
+        state.frontend_key_leases = {}
+        state.frontend_active_key_codes = set()
+        state.frontend_key_lease_expiration_count = 0
+        state.last_input_event = None
+        state.input_wake_count = 0
+        state._ensure_qemu_started_locked = lambda: backend
+        state._notify_frontend_activity = lambda: None
+
+        state.key(6, True, include_snapshot=False, input_session="page-a", source="gamepad")
+        state.key(6, True, include_snapshot=False, input_session="page-a", source="heartbeat")
+        state.key(6, True, include_snapshot=False, input_session="page-b", source="gamepad")
+        state.key(6, False, include_snapshot=False, input_session="page-a", source="gamepad")
+        self.assertEqual(backend.events, [(6, True)])
+
+        state.key(6, False, include_snapshot=False, input_session="page-b", source="gamepad")
+        self.assertEqual(backend.events, [(6, True), (6, False)])
+
+        state.key(6, True, include_snapshot=False, input_session="page-a", source="gamepad")
+        state.frontend_key_leases[("page-a", 6)] = 0.0
+        state._expire_frontend_key_leases_locked()
+        self.assertEqual(backend.events[-2:], [(6, True), (6, False)])
+        self.assertEqual(state.frontend_active_key_codes, set())
+        self.assertEqual(state.frontend_key_lease_expiration_count, 1)
+        self.assertEqual(state.last_input_event["source"], "frontend-key-lease-expired")
+
+    def test_qemu_process_backend_reports_guest_shutdown_lifecycle(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        words = (
+            0x3C08B000,  # lui t0, 0xb000
+            0x35083020,  # ori t0, t0, 0x3020 (RTC HCR)
+            0x24090001,  # addiu t1, zero, 1
+            0xAD090000,  # sw t1, 0(t0)
+            0x08001004,  # j 0x80004010
+            0x00000000,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "rtc-powerdown.bin"
+            image.write_bytes(struct.pack(f"<{len(words)}I", *words))
+            config = build_bbk_qemu_config(
+                boot_mode="c200",
+                executable=qemu,
+                image=image,
+                firmware_patches=("none",),
+                extra_args=("-S",),
+            )
+            backend = QemuProcessBackend(config)
+            try:
+                backend.start()
+                backend.refresh()
+                assert backend.proc is not None
+                self.assertEqual(backend.proc.wait(timeout=5), 0)
+                deadline = time.time() + 2.0
+                snapshot = backend.snapshot(refresh=False)
+                while snapshot.get("exit_reason") != "guest-shutdown" and time.time() < deadline:
+                    time.sleep(0.02)
+                    snapshot = backend.snapshot(refresh=False)
+            finally:
+                backend.stop()
+
+        self.assertEqual(snapshot.get("exit_reason"), "guest-shutdown", snapshot)
+        self.assertIsNotNone(snapshot.get("qmp_port"))
+        self.assertIsNone(snapshot.get("last_qmp_error"))
+        self.assertTrue(any(
+            "bbk9588: RTC HCR.PD requested guest shutdown" in str(line)
+            for line in snapshot.get("stderr_tail", [])
+        ))
 
     def test_qemu_wav_capture_header_is_finalized_and_pcm_is_analyzed(self) -> None:
         samples = [
@@ -4098,6 +4518,25 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertEqual(normalize_nand_path("A:\\应用\\游戏"), "/应用/游戏")
             with self.assertRaises(ValueError):
                 normalize_nand_path("/应用/../系统")
+
+    def test_nand_validation_rejects_mapped_block_ecc_damage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _fat_image, nand_image = _make_nand_file_manager_fixture(Path(tmp))
+            validation = validate_nand_image(nand_image)
+            self.assertGreater(validation["ecc_pages_checked"], 0)
+
+            first_mapped_page = PAGES_PER_BLOCK
+            with nand_image.open("r+b") as stream:
+                stream.seek(first_mapped_page * PAGE_STRIDE + PAGE_SIZE + 4)
+                parity_byte = stream.read(1)
+                stream.seek(first_mapped_page * PAGE_STRIDE + PAGE_SIZE + 4)
+                stream.write(bytes([parity_byte[0] ^ 1]))
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"invalid RS ECC at physical page 0x40.*stamp_nand_ecc\.py",
+            ):
+                validate_nand_image(nand_image)
 
     def test_nand_candidate_validation_failure_preserves_original_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6837,7 +7276,12 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="openStatusDrawer"', frontend)
         self.assertIn('id="drawerBackdrop"', frontend)
         self.assertIn("const mobileLayoutQuery = window.matchMedia('(max-width: 760px)');", frontend)
-        self.assertIn(".keymap-panel { display: none; }", frontend)
+        self.assertIn('id="settingsDialog" class="settings-dialog"', frontend)
+        self.assertIn('id="keymapSettingsTab"', frontend)
+        self.assertIn('id="touchSettingsTab"', frontend)
+        self.assertIn('id="keymapSettingsPane" class="settings-pane keymap-panel"', frontend)
+        self.assertIn("if (settingsDialogEl.open) return;", frontend)
+        self.assertIn("if (!settingsDialogEl.open) settingsDialogEl.showModal();", frontend)
         self.assertIn(".control-sidebar.drawer-open, .status-sidebar.drawer-open", frontend)
         self.assertIn("controlsDrawerEl.inert = mobile && !controlsOpen;", frontend)
         self.assertIn("if (ev.code === 'Escape' && activeDrawer !== null)", frontend)
@@ -6871,13 +7315,41 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("/api/files/delete", frontend)
         self.assertIn('id="rotateLeft"', frontend)
         self.assertIn('id="rotateRight"', frontend)
+        self.assertIn('id="openSettings"', frontend)
+        self.assertLess(frontend.index('id="openSettings"'), frontend.index('id="rotateLeft"'))
+        self.assertLess(frontend.index('id="settingsDialog"'), frontend.index('data-binding-code="4"'))
+        device_controls = frontend[
+            frontend.index('<div class="device-controls">'):frontend.index('</main>')
+        ]
+        self.assertNotIn('data-binding-code=', device_controls)
         self.assertIn('id="toggleFullscreen"', frontend)
         self.assertIn('id="toggleAudio"', frontend)
+        self.assertIn('class="audio-icon" aria-hidden="true"', frontend)
+        self.assertIn("toggleAudioEl.classList.toggle('is-muted', !audioEnabled);", frontend)
+        self.assertNotIn("toggleAudioEl.textContent", frontend)
+        self.assertNotIn("🔊", frontend)
+        self.assertNotIn("🔇", frontend)
+        self.assertIn('id="powerKey"', frontend)
+        self.assertIn('data-key="11" data-name="power"', frontend)
+        self.assertIn('id="stop" class="secondary">安全关机</button>', frontend)
+        self.assertIn('id="forceStop" class="warn">强制停止</button>', frontend)
+        self.assertIn("runLifecycleCommand('stop', '正在等待固件安全关机')", frontend)
+        self.assertIn("runLifecycleCommand('reset', '正在安全关机并重新启动')", frontend)
+        self.assertIn("setOperationStatus(status.lifecycle_notice || '')", frontend)
+        self.assertIn("runLifecycleCommand('force-stop', '正在强制停止')", frontend)
+        self.assertIn("强制停止可能中断 NAND 写入并损坏文件系统", frontend)
+        self.assertNotIn("wsSend({op:'stop'})", frontend)
         self.assertIn('id="screenWrap" class="screen-wrap"', frontend)
+        self.assertIn('id="screenStopOverlay"', frontend)
+        self.assertIn('id="restartFromOverlay"', frontend)
+        self.assertIn("detail.code === 'guest-shutdown'", frontend)
+        self.assertIn("系统固件已通过 RTC 电源管理完成关机。", frontend)
         self.assertIn('id="exitFullscreen"', frontend)
         self.assertIn("wsSend({op:'set-orientation', orientation:next})", frontend)
         self.assertIn("screenWrapEl.requestFullscreen || screenWrapEl.webkitRequestFullscreen", frontend)
         self.assertIn("document.addEventListener('fullscreenchange', updateFullscreenScreenSize)", frontend)
+        self.assertIn("screenResizeObserver.observe(screenWrapEl)", frontend)
+        self.assertIn("screenWrapEl.clientHeight - verticalPadding", frontend)
         self.assertIn("Math.min(availableWidth / screen.width, availableHeight / screen.height)", frontend)
         self.assertIn(".screen-wrap:fullscreen #screen", frontend)
         self.assertIn("const keyBindingStorageKey = 'bbk9588.keyBindings.v1';", frontend)
@@ -6885,18 +7357,41 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("5:'KeyS'", frontend)
         self.assertIn("6:'KeyA'", frontend)
         self.assertIn("7:'KeyD'", frontend)
-        self.assertIn("9:'Escape'", frontend)
-        self.assertIn("10:'Space'", frontend)
+        self.assertIn("9:'KeyK'", frontend)
+        self.assertIn("10:'KeyJ'", frontend)
         self.assertIn("const gamepadBindingStorageKey = 'bbk9588.gamepadBindings.v1';", frontend)
-        self.assertIn("4:'button:12'", frontend)
+        self.assertIn("const defaultGamepadBindings = Object.freeze({\n  4:'button:12'", frontend)
         self.assertIn("5:'button:13'", frontend)
         self.assertIn("6:'button:14'", frontend)
         self.assertIn("7:'button:15'", frontend)
         self.assertIn("9:'button:1'", frontend)
         self.assertIn("10:'button:0'", frontend)
+        self.assertIn("const legacyDefaultKeyBindings = Object.freeze({9:'Escape', 10:'Space'});", frontend)
+        self.assertIn("const legacyDefaultGamepadBindings = Object.freeze({\n  4:'axis:1:-'", frontend)
+        self.assertIn("if (migrated) localStorage.setItem(keyBindingStorageKey", frontend)
+        self.assertIn("if (migrated) localStorage.setItem(gamepadBindingStorageKey", frontend)
+        self.assertIn("'1:-':'左摇杆↑'", frontend)
         self.assertIn("navigator.getGamepads", frontend)
         self.assertIn("capturedGamepadBinding(gamepad, previous)", frontend)
         self.assertIn("gamepadBindingActive(gamepad, binding, activeGamepadInputs.has(sourceId))", frontend)
+        self.assertIn("const gamepadPressThreshold = 0.55;", frontend)
+        self.assertIn("const gamepadReleaseThreshold = 0.35;", frontend)
+        self.assertIn("const gamepadCaptureThreshold = 0.5;", frontend)
+        self.assertIn("function gamepadHasActivity(gamepad)", frontend)
+        self.assertIn("if (detectedGamepads.some(gamepadHasActivity)) gamepadInputFocused = true;", frontend)
+        self.assertIn(
+            "Math.abs(previousValue) < gamepadCaptureThreshold",
+            frontend,
+        )
+        self.assertNotIn(
+            "Math.abs(previousValue) < gamepadReleaseThreshold",
+            frontend,
+        )
+        self.assertIn("const keyLeaseHeartbeatMs = 250;", frontend)
+        self.assertIn("function refreshActiveKeyLeases()", frontend)
+        self.assertIn("input_session:inputSessionId", frontend)
+        self.assertIn("setInterval(refreshActiveKeyLeases, keyLeaseHeartbeatMs);", frontend)
+        self.assertIn("releaseButtonInputs('button-pagehide');", frontend)
         self.assertIn("window.addEventListener('gamepaddisconnected'", frontend)
         self.assertIn("captureSuppressedGamepadInputs", frontend)
         self.assertIn('id="gamepadStatus"', frontend)
@@ -7258,7 +7753,12 @@ class QemuSystemCommandTests(unittest.TestCase):
     def test_qemu_gdb_virtual_memory_bridge_reads_boot_payload(self) -> None:
         if find_qemu() is None:
             self.skipTest("qemu-system-mipsel is not installed")
-        config = build_bbk_qemu_config(boot_mode="c200", gdb="auto", timeout_seconds=1.5)
+        config = build_bbk_qemu_config(
+            boot_mode="c200",
+            gdb="auto",
+            bbk_machine_options=("hibernate-poweroff=off",),
+            timeout_seconds=1.5,
+        )
         backend = QemuProcessBackend(config)
         try:
             backend.start()
@@ -7396,6 +7896,123 @@ class QemuSystemCommandTests(unittest.TestCase):
             time.sleep(0.08)
             gpio_up = struct.unpack("<I", backend.read_virtual_memory(0xB0010100, 4))[0]
             self.assertEqual(gpio_up & 0x08000000, 0x08000000)
+
+            power_down = backend.apply_gui_key_event(11, True)
+            self.assertTrue(power_down.get("applied"), power_down)
+            time.sleep(0.08)
+            gpio_d_down = struct.unpack("<I", backend.read_virtual_memory(0xB0010300, 4))[0]
+            self.assertEqual(gpio_d_down & 0x20000000, 0)
+            power_up = backend.apply_gui_key_event(11, False)
+            self.assertTrue(power_up.get("applied"), power_up)
+            time.sleep(0.08)
+            gpio_d_up = struct.unpack("<I", backend.read_virtual_memory(0xB0010300, 4))[0]
+            self.assertEqual(gpio_d_up & 0x20000000, 0x20000000)
+        finally:
+            backend.stop()
+
+    def test_qemu_gpio_key_wakes_cpu_from_cpm_sleep_wait(self) -> None:
+        if find_qemu() is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        marker_va = 0x80006000
+        marker = 0x51EECAFE
+        words = (
+            0x3C08B000,  # lui t0, 0xb000
+            0x35081000,  # ori t0, t0, 0x1000 (INTC)
+            0x3C090800,  # lui t1, 0x0800 (GPIO1 source 27)
+            0xAD09000C,  # sw t1, ICMCR(t0)
+            0x3C08B000,  # lui t0, 0xb000 (CPM)
+            0x24090001,  # addiu t1, zero, 1 (LCR.SLEEP)
+            0xAD090004,  # sw t1, LCR(t0)
+            0x400A6000,  # mfc0 t2, Status
+            0x354A0400,  # ori t2, t2, Status.IM2
+            0x408A6000,  # mtc0 t2, Status
+            0x42000020,  # wait
+            0x3C0A8000,  # lui t2, 0x8000
+            0x354A6000,  # ori t2, t2, 0x6000
+            0x3C0B51EE,  # lui t3, 0x51ee
+            0x356BCAFE,  # ori t3, t3, 0xcafe
+            0xAD4B0000,  # sw t3, 0(t2)
+            0x08001010,  # j 0x80004040
+            0x00000000,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "cpm-sleep-wait.bin"
+            image.write_bytes(struct.pack(f"<{len(words)}I", *words))
+            config = build_bbk_qemu_config(
+                boot_mode="c200",
+                image=image,
+                firmware_patches=("none",),
+                gdb="auto",
+                timeout_seconds=2.0,
+            )
+            backend = QemuProcessBackend(config)
+            try:
+                backend.start()
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    lcr = struct.unpack(
+                        "<I", backend.read_virtual_memory(0xB0000004, 4)
+                    )[0]
+                    if lcr == 1:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(lcr, 1)
+                self.assertEqual(
+                    struct.unpack("<I", backend.read_virtual_memory(marker_va, 4))[0],
+                    0,
+                )
+
+                press = backend.apply_gui_key_event(7, True)
+                self.assertTrue(press.get("applied"), press)
+                deadline = time.time() + 2.0
+                observed = 0
+                while time.time() < deadline:
+                    observed = struct.unpack(
+                        "<I", backend.read_virtual_memory(marker_va, 4)
+                    )[0]
+                    if observed == marker:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(observed, marker)
+                self.assertEqual(
+                    struct.unpack("<I", backend.read_virtual_memory(0xB0001010, 4))[0]
+                    & (1 << 27),
+                    1 << 27,
+                )
+                backend.apply_gui_key_event(7, False)
+            finally:
+                backend.stop()
+
+    def test_qemu_power_key_chardev_drives_gpio_d29(self) -> None:
+        if find_qemu() is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        config = build_bbk_qemu_config(
+            boot_mode="c200",
+            gdb="auto",
+            bbk_machine_options=("hibernate-poweroff=off",),
+            timeout_seconds=1.5,
+        )
+        backend = QemuProcessBackend(config)
+        try:
+            backend.start()
+            self.assertTrue(backend.running())
+            idle = struct.unpack("<I", backend.read_virtual_memory(0xB0010300, 4))[0]
+            self.assertEqual(idle & 0x20000000, 0x20000000)
+
+            press = backend.apply_gui_key_event(11, True)
+            self.assertTrue(press.get("applied"), press)
+            time.sleep(0.08)
+            down = struct.unpack("<I", backend.read_virtual_memory(0xB0010300, 4))[0]
+            self.assertEqual(down & 0x20000000, 0)
+
+            release = backend.apply_gui_key_event(11, False)
+            self.assertTrue(release.get("applied"), release)
+            time.sleep(0.08)
+            up = struct.unpack("<I", backend.read_virtual_memory(0xB0010300, 4))[0]
+            self.assertEqual(up & 0x20000000, 0x20000000)
         finally:
             backend.stop()
 
@@ -7462,7 +8079,12 @@ class QemuSystemCommandTests(unittest.TestCase):
     def test_qemu_bbk9588_touch_uses_chardev_without_guest_ram_global_writes(self) -> None:
         if find_qemu() is None:
             self.skipTest("qemu-system-mipsel is not installed")
-        config = build_bbk_qemu_config(boot_mode="c200", gdb="auto", timeout_seconds=1.5)
+        config = build_bbk_qemu_config(
+            boot_mode="c200",
+            gdb="auto",
+            bbk_machine_options=("hibernate-poweroff=off",),
+            timeout_seconds=1.5,
+        )
         backend = QemuProcessBackend(config)
         try:
             backend.start()

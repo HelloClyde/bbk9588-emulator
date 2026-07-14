@@ -391,11 +391,9 @@ void bbk9588_diag_touch_record(Bbk9588DiagState *s, uint32_t reason,
                     jz4740_cpm_clkgr_wake_mask(s->sources.cpm));
     diag_write_le32(TOUCH_TRACE_VA + 0x124,
                     jz4740_cpm_scr_wake_mask(s->sources.cpm));
-    diag_write_le32(TOUCH_TRACE_VA + 0x128,
-                    board->extgpio_wake_enable);
-    diag_write_le32(TOUCH_TRACE_VA + 0x12c,
-                    board->sysctrl_wake_pending ? 1u : 0u);
-    diag_write_le32(TOUCH_TRACE_VA + 0x130, board->sysctrl_wake_count);
+    diag_write_le32(TOUCH_TRACE_VA + 0x128, 0);
+    diag_write_le32(TOUCH_TRACE_VA + 0x12c, 0);
+    diag_write_le32(TOUCH_TRACE_VA + 0x130, 0);
     diag_write_le32(TOUCH_TRACE_VA + 0x134, tcu.irq_mask);
     diag_write_le32(TOUCH_TRACE_VA + 0x138, tcu.compare[4]);
     diag_write_le32(TOUCH_TRACE_VA + 0x13c, tcu.period_ms[4]);

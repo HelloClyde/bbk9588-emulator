@@ -1081,7 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
                 (ns.out_dir / f"{ns.prefix}_qemu_screen_after_touch.png").write_bytes(after_png)
                 if after_digest == qemu_screen_digest and not qemu_c_touch_consumed:
                     failures.append("qemu touch input was accepted but framebuffer did not change")
-            stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "stop"})
+            stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "force-stop"})
             interactions.append({"step": "qemu-stop", "status": summarize_status(stopped)})
             if stopped.get("running"):
                 failures.append("qemu backend stop left process running")
@@ -1116,7 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
         boot_ok = looks_like_menu(menu_status)
         if not boot_ok:
             failures.append("cold boot did not reach a menu-looking framebuffer through the web worker")
-            ws.send_json({"op": "stop"})
+            ws.send_json({"op": "force-stop"})
             ws.pump(1.0)
             stopped = http_json(ns.host, port, "GET", "/api/status")
             interactions.append({"step": "stop-after-boot-failure", "status": summarize_status(stopped)})
@@ -1267,7 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
                     failures.append(f"key {name} left pending_keys={status.get('pending_keys')}")
 
             stop_seq = int(time.time() * 1000)
-            ws.send_json({"op": "stop", "command_seq": stop_seq})
+            ws.send_json({"op": "force-stop", "command_seq": stop_seq})
             stop_reply = ws.wait_for_command_seq(stop_seq, 5)
             stopped = stop_reply or ws.last_status
             if stop_reply is None or stopped.get("running"):
@@ -1279,7 +1279,7 @@ def main(argv: list[str] | None = None) -> int:
                         "status": summarize_status(stopped),
                     }
                 )
-                stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "stop"})
+                stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "force-stop"})
                 deadline = time.time() + 5
                 while stopped.get("running") and time.time() < deadline:
                     time.sleep(0.2)

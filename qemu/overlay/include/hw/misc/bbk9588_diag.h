@@ -55,9 +55,6 @@ typedef struct Bbk9588DiagSources {
 typedef struct Bbk9588DiagBoardSnapshot {
     uint32_t intc_last_cp0_status;
     uint32_t intc_last_cp0_cause;
-    uint32_t extgpio_wake_enable;
-    uint32_t sysctrl_wake_count;
-    bool sysctrl_wake_pending;
 } Bbk9588DiagBoardSnapshot;
 
 void bbk9588_diag_connect_sources(Bbk9588DiagState *s,

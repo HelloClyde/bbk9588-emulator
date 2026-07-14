@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/rtc/jz4740_rtc.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
@@ -77,6 +78,9 @@ struct JZ4740RTCState {
     uint32_t last_write_offset;
     uint32_t last_write_value;
     bool irq_level;
+    bool hibernate_wakeup;
+    JZ4740RTCPowerDownCallback power_down_callback;
+    void *power_down_opaque;
 };
 
 static uint32_t rtc_host_seconds(void)
@@ -227,8 +231,13 @@ static uint32_t rtc_read_reg(JZ4740RTCState *s, hwaddr offset)
 
 static void rtc_enter_hibernate(JZ4740RTCState *s)
 {
+    bool was_powered_down = (s->hcr & RTC_HCR_PD) != 0;
+
     s->hcr |= RTC_HCR_PD;
     s->hwrsr &= ~(RTC_HWRSR_ALM | RTC_HWRSR_PIN);
+    if (!was_powered_down && s->power_down_callback) {
+        s->power_down_callback(s->power_down_opaque);
+    }
 }
 
 static void rtc_write_while_hibernating(JZ4740RTCState *s, hwaddr offset,
@@ -405,6 +414,16 @@ void jz4740_rtc_get_diagnostics(JZ4740RTCState *s,
     diagnostics->irq_level = s->irq_level;
 }
 
+void jz4740_rtc_set_power_down_callback(
+    JZ4740RTCState *s, JZ4740RTCPowerDownCallback callback, void *opaque)
+{
+    if (!s) {
+        return;
+    }
+    s->power_down_callback = callback;
+    s->power_down_opaque = opaque;
+}
+
 static void rtc_reset_hold(Object *obj, ResetType type)
 {
     JZ4740RTCState *s = JZ4740_RTC(obj);
@@ -420,7 +439,8 @@ static void rtc_reset_hold(Object *obj, ResetType type)
     s->hwfcr = 0;
     s->hrcr = 0;
     s->hwcr = 0;
-    s->hwrsr = RTC_HWRSR_PPR;
+    s->hwrsr = s->hibernate_wakeup ?
+               RTC_HWRSR_HR | RTC_HWRSR_PIN : RTC_HWRSR_PPR;
     s->scratch = RTC_MAGIC;
     s->last_read_offset = 0;
     s->last_read_value = 0;
@@ -486,12 +506,18 @@ static void rtc_finalize(Object *obj)
     timer_free(s->timer);
 }
 
+static const Property rtc_properties[] = {
+    DEFINE_PROP_BOOL("hibernate-wakeup", JZ4740RTCState,
+                     hibernate_wakeup, false),
+};
+
 static void rtc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     dc->vmsd = &vmstate_jz4740_rtc;
+    device_class_set_props(dc, rtc_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     rc->phases.hold = rtc_reset_hold;
 }

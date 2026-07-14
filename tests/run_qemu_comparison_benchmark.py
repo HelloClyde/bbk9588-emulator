@@ -34,6 +34,7 @@ def qemu_backend_probe(ns: argparse.Namespace) -> dict[str, object]:
         nand_image=ns.nand_image,
         cpu=ns.qemu_cpu,
         accel=ns.qemu_accel,
+        bbk_machine_options=("hibernate-poweroff=off",),
         firmware_patches=ns.qemu_firmware_patch,
     )
     if find_qemu(ns.qemu) is None:
@@ -66,7 +67,7 @@ def qemu_web_probe(ns: argparse.Namespace) -> dict[str, object]:
         no_nand=ns.nand_image is None,
         frontend_profile_out=None,
         qemu_extra_arg=[],
-        qemu_machine_option=[],
+        qemu_machine_option=["hibernate-poweroff=off"],
         qemu_firmware_patch=ns.qemu_firmware_patch,
     )
     args = argparse.Namespace(**values)
@@ -77,7 +78,7 @@ def qemu_web_probe(ns: argparse.Namespace) -> dict[str, object]:
         wait_http(ns.host, port, 30)
         status = http_json(ns.host, port, "GET", "/api/status?detail=full")
         qemu = status.get("qemu") if isinstance(status.get("qemu"), dict) else {}
-        stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "stop"})
+        stopped = http_json(ns.host, port, "POST", "/api/command", {"op": "force-stop"})
         return {
             "ok": status.get("backend") == "qemu" and bool(qemu.get("register_sample")),
             "kind": "web-qemu-backend",
