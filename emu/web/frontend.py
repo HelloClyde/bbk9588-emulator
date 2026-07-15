@@ -111,6 +111,8 @@ HTML = r"""<!doctype html>
     .settings-tab.active { color: white; border-bottom-color: #5794ff; background: #25292f; }
     .settings-dialog-body { min-height: 0; padding: 14px; overflow-y: auto; overscroll-behavior: contain; }
     .settings-pane[hidden] { display: none; }
+    .setting-row { min-height: 46px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 2px; }
+    .setting-row .check { margin-left: auto; }
     .keymap-panel { width: 100%; }
     .keymap-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .keymap-header h2 { margin: 0; }
@@ -286,6 +288,7 @@ HTML = r"""<!doctype html>
       <div class="settings-tabs" role="tablist" aria-label="设置分类">
         <button id="keymapSettingsTab" class="settings-tab active" role="tab" aria-selected="true" aria-controls="keymapSettingsPane">按键映射</button>
         <button id="touchSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="touchSettingsPane">触摸</button>
+        <button id="powerSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="powerSettingsPane">电源</button>
       </div>
       <div class="settings-dialog-body">
         <section id="keymapSettingsPane" class="settings-pane keymap-panel" role="tabpanel" aria-labelledby="keymapSettingsTab">
@@ -306,6 +309,9 @@ HTML = r"""<!doctype html>
         <section id="touchSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="touchSettingsTab" hidden>
           <label class="check"><input id="frontendInputCalibration" type="checkbox">前端输入校准</label>
         </section>
+        <section id="powerSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="powerSettingsTab" hidden>
+          <div class="setting-row"><span>USB 供电</span><label class="check"><input id="usbPowerConnected" type="checkbox" checked>已连接</label></div>
+        </section>
       </div>
     </div>
   </dialog>
@@ -315,14 +321,17 @@ const screenCtx = screen.getContext('2d', { alpha: false });
 screenCtx.imageSmoothingEnabled = false;
 const statusEl = document.getElementById('status');
 const frontendInputCalibrationEl = document.getElementById('frontendInputCalibration');
+const usbPowerConnectedEl = document.getElementById('usbPowerConnected');
 const imageStatusEl = document.getElementById('imageStatus');
 const openSettingsEl = document.getElementById('openSettings');
 const settingsDialogEl = document.getElementById('settingsDialog');
 const closeSettingsEl = document.getElementById('closeSettings');
 const keymapSettingsTabEl = document.getElementById('keymapSettingsTab');
 const touchSettingsTabEl = document.getElementById('touchSettingsTab');
+const powerSettingsTabEl = document.getElementById('powerSettingsTab');
 const keymapSettingsPaneEl = document.getElementById('keymapSettingsPane');
 const touchSettingsPaneEl = document.getElementById('touchSettingsPane');
+const powerSettingsPaneEl = document.getElementById('powerSettingsPane');
 const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
 const toggleAudioEl = document.getElementById('toggleAudio');
@@ -706,15 +715,20 @@ function setSidebarTab(tab) {
   if (filesActive) loadNandFiles(currentNandDirectory).catch(showFileManagerError);
 }
 function setSettingsTab(tab) {
-  currentSettingsTab = tab === 'touch' ? 'touch' : 'keymap';
+  currentSettingsTab = ['keymap', 'touch', 'power'].includes(tab) ? tab : 'keymap';
   const touchActive = currentSettingsTab === 'touch';
-  keymapSettingsTabEl.classList.toggle('active', !touchActive);
+  const keymapActive = currentSettingsTab === 'keymap';
+  const powerActive = currentSettingsTab === 'power';
+  keymapSettingsTabEl.classList.toggle('active', keymapActive);
   touchSettingsTabEl.classList.toggle('active', touchActive);
-  keymapSettingsTabEl.setAttribute('aria-selected', String(!touchActive));
+  powerSettingsTabEl.classList.toggle('active', powerActive);
+  keymapSettingsTabEl.setAttribute('aria-selected', String(keymapActive));
   touchSettingsTabEl.setAttribute('aria-selected', String(touchActive));
-  keymapSettingsPaneEl.hidden = touchActive;
+  powerSettingsTabEl.setAttribute('aria-selected', String(powerActive));
+  keymapSettingsPaneEl.hidden = !keymapActive;
   touchSettingsPaneEl.hidden = !touchActive;
-  if (touchActive && bindingCaptureCode !== null) {
+  powerSettingsPaneEl.hidden = !powerActive;
+  if (!keymapActive && bindingCaptureCode !== null) {
     bindingCaptureCode = null;
     updateKeyBindingUi();
   }
@@ -966,6 +980,7 @@ function requestRotation(delta) {
 function renderStatus(s) {
   applyFrontendOrientation(s.orientation || currentOrientation);
   frontendInputCalibrationEl.checked = Boolean(s.frontend_input_calibration);
+  usbPowerConnectedEl.checked = Boolean(s.usb_power_connected);
   imageStatusEl.textContent = basename(s.nand_image) || 'bbk9588_nand.bin';
   const qemuPerf = s.qemu?.performance || {};
   const qemuAudio = qemuPerf.audio || {};
@@ -991,6 +1006,7 @@ function renderStatus(s) {
     ['boot', s.boot_mode || ''],
     ['nand', basename(s.nand_image || '')],
     ['nand writes', s.qemu?.nand_write_mode || s.nand_write_mode || 'none'],
+    ['usb power', (s.qemu?.usb_power_connected ?? s.usb_power_connected) ? 'connected' : 'disconnected'],
     ['orientation', s.orientation || ''],
     ['input calib', `${s.frontend_input_calibration ? 'on' : 'off'}:${s.frontend_input_calibration_stage_label || s.frontend_input_calibration_stage || 0}`],
     ['touch queue', s.pending_touches ?? 0],
@@ -1055,6 +1071,7 @@ function renderLifecycle(s) {
   resetEl.disabled = lifecycleRequestPending;
   forceStopEl.disabled = !s.running || lifecycleRequestPending;
   powerKeyEl.disabled = !s.running || lifecycleRequestPending;
+  usbPowerConnectedEl.disabled = !s.running || lifecycleRequestPending;
   for (const button of deviceKeyEls) button.disabled = !s.running || lifecycleRequestPending;
   if (!presentation) return;
   screenStopOverlayEl.classList.toggle('error', presentation.error);
@@ -1452,10 +1469,14 @@ forceStopEl.onclick = () => {
 frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
+usbPowerConnectedEl.onchange = () => {
+  wsSend({op:'set-usb-power', connected:usbPowerConnectedEl.checked});
+};
 openSettingsEl.onclick = openSettingsDialog;
 closeSettingsEl.onclick = closeSettingsDialog;
 keymapSettingsTabEl.onclick = () => setSettingsTab('keymap');
 touchSettingsTabEl.onclick = () => setSettingsTab('touch');
+powerSettingsTabEl.onclick = () => setSettingsTab('power');
 settingsDialogEl.addEventListener('cancel', ev => {
   ev.preventDefault();
   closeSettingsDialog();

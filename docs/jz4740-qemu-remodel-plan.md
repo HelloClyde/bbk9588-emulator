@@ -35,7 +35,7 @@ patch。当前版本已经具备可用的启动、显示、输入和存储路径
 | LCD | controller、descriptor DMA、IRQ 和 BBK panel/status 窗口已拆为独立 QOM device；固定 guest mirror 与 alias scanout 已删除，完整 panel command 细节留作非阻塞研究项 |
 | SADC/Touch/GPIO | SADC、GPIO 已拆为独立 QOM device，当前交互路径基本完成；板级接线真机确认仍未完成 |
 | AIC/I2S/audio codec | 独立 AIC、internal codec、audio DMA、host/Web output 已实现并经用户实际验收；外部板级 route trace 属于非阻塞研究项 |
-| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立，MSC/DMAC/AIC transport 已进入无 MMIO board bridge；MSC 已与 raw NAND 解耦，真实 WAIT/按键唤醒和 RTC HCR.PD 关机已完成，USB packet transport、独立可选介质、低电压/reset cause/clock gating 和剩余 DMA request 仍是缺口 |
+| DMAC/MSC/UART/UDC/CIM/RTC/PM | CPM、DMAC、MSC、RTC、UART、UDC、CIM 已独立，MSC/DMAC/AIC transport 已进入无 MMIO board bridge；MSC 已与 raw NAND 解耦，真实 WAIT/按键唤醒、PB18 USB 供电检测和 RTC HCR.PD 关机已完成，USB packet transport、独立可选介质、低电压/reset cause/clock gating 和剩余 DMA request 仍是缺口 |
 | Python/Web 收敛 | 默认路径已完成，旧诊断代码仍可继续删除 |
 | QEMU 文件结构 | 部分完成，主要 SoC 设备、host output/input、DMA bridge 和全部 diagnostic recorder 已独立；板级 wake、touch GPIO/SADC 接线等 glue 仍在 `bbk9588.c` |
 
@@ -483,6 +483,9 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   展示明确原因和重启入口，不再只显示 `running=false`。
 - [x] Web 屏幕工具栏提供真机电源键，按下和长按通过 input chardev 驱动 active-low
   GPIO D29；它不等同于 host stop，关机仍由固件和 RTC HCR.PD 流程完成。
+- [x] 固件使用的 active-low GPIO B18 USB/充电供电检测已独立建模，默认连接并可在
+  Web 设置中切换；触摸不再改写该引脚，安全关机在按电源键前临时模拟拔出 USB，
+  避免固件按“仍在充电”路径重新启动。
 - [x] battery sample 由 SADC PBAT conversion 给出，并可通过 machine property 配置 raw 值。
 - [x] graphics/UART/RTC 的固定 ready override machine properties 已移除。
 
@@ -493,7 +496,8 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
   audio request 作为 P0 优先补齐，其余 request 放到 P3。
 - [ ] PM 已有独立 CPM register、真实 `LCR.SLEEP + WAIT`/GPIO wake 和 RTC HCR.PD
   关机；尚未完整建模 reset cause、module clock gating、RTC alarm 冷启动和低电压关机。
-- [ ] USB device attach/data transfer 未实现；当前 UDC 只满足 no-host idle 路径。
+- [ ] USB device data attach/transfer 未实现；板级供电检测已完成，当前 UDC 仍只满足
+  no-host idle 路径。
 
 验收：
 
@@ -502,7 +506,9 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 - [x] 写后 raw NAND 冷启动不再依赖 host canonical checkpoint；QEMU 直接复用同一活动
   raw 文件。细粒度物理掉电语义仍是非阻塞研究项。
 - [x] suspend/WAIT、GPIO 按键 resume 和 RTC HCR.PD guest shutdown 有可重复运行时测试。
-- [ ] USB attach、低电压提示和 RTC alarm 冷启动仍缺少可重复运行时测试。
+- [x] USB 供电连接/断开可通过 machine property 重复测试，默认连接会阻止固件空闲
+  自动关机。
+- [ ] USB 数据 attach/transfer、低电压提示和 RTC alarm 冷启动仍缺少可重复运行时测试。
 
 ### 7. AIC/I2S/audio codec：P0，部分完成
 

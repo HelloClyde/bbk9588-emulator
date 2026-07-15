@@ -69,6 +69,7 @@
 #define BBK9588_LCD_WIDTH          240
 #define BBK9588_LCD_HEIGHT         320
 #define BBK9588_HOST_KEY_POWER     11u
+#define BBK9588_USB_POWER_MASK     0x00040000u
 #define BBK9588_LCD_STRIDE         (BBK9588_LCD_WIDTH * 2)
 #define BBK9588_LCD_BYTES          (BBK9588_LCD_STRIDE * BBK9588_LCD_HEIGHT)
 #define BBK9588_LCD_VBLANK_PERIOD_MS 33
@@ -139,6 +140,7 @@ struct Bbk9588MachineState {
     bool bootrom_nand_enabled;
     bool hibernate_poweroff_enabled;
     bool hibernate_wakeup_enabled;
+    bool usb_power_connected;
     uint32_t nand_id_code;
     uint32_t firmware_phys;
     uint32_t reset_pc;
@@ -837,10 +839,18 @@ static void bbk9588_touch_set_state(Bbk9588MachineState *board,
                                     bool down)
 {
     jz4740_sadc_set_touch(board->sadc, raw_x, raw_y, down);
-    jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_B,
-                                0x00040000u, !down, false);
     jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_C,
                                 0x08000000u, !down, false);
+}
+
+static void bbk9588_set_usb_power_state(Bbk9588MachineState *board,
+                                         bool connected)
+{
+    board->usb_power_connected = connected;
+    if (board->gpio) {
+        jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_B,
+                                    BBK9588_USB_POWER_MASK, !connected, true);
+    }
 }
 
 static void bbk9588_gpio_trace(void *opaque, uint32_t reason)
@@ -1070,7 +1080,9 @@ static void bbk9588_create_gpio_device(Bbk9588MachineState *board)
     DeviceState *dev = qdev_new(TYPE_JZ4740_GPIO);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
-    qdev_prop_set_uint32(dev, "input-reset-b", 0x78040000u);
+    qdev_prop_set_uint32(dev, "input-reset-b",
+                         board->usb_power_connected ? 0x78000000u :
+                                                      0x78040000u);
     qdev_prop_set_uint32(dev, "input-reset-c", 0x48000000u);
     qdev_prop_set_uint32(dev, "input-reset-d", 0x20200000u);
     sysbus_realize(sbd, &error_fatal);
@@ -1382,6 +1394,19 @@ static void bbk9588_set_hibernate_wakeup(Object *obj, bool value,
     board->hibernate_wakeup_enabled = value;
 }
 
+static bool bbk9588_get_usb_power_connected(Object *obj, Error **errp)
+{
+    Bbk9588MachineState *board = BBK9588_MACHINE(obj);
+
+    return board->usb_power_connected;
+}
+
+static void bbk9588_set_usb_power_connected(Object *obj, bool value,
+                                             Error **errp)
+{
+    bbk9588_set_usb_power_state(BBK9588_MACHINE(obj), value);
+}
+
 static void bbk9588_set_bootrom_nand(Object *obj, bool value, Error **errp)
 {
     Bbk9588MachineState *board = BBK9588_MACHINE(obj);
@@ -1565,6 +1590,7 @@ static void bbk9588_instance_init(Object *obj)
     board->bootrom_nand_enabled = false;
     board->hibernate_poweroff_enabled = true;
     board->hibernate_wakeup_enabled = false;
+    board->usb_power_connected = true;
     board->nand_id_code = BBK9588_NAND_DEFAULT_ID_CODE;
     board->bootrom_nand_page = BBK9588_BOOTROM_NAND_PAGE;
     board->bootrom_size = BBK9588_BOOTROM_FIRST_STAGE_BYTES;
@@ -1708,6 +1734,12 @@ static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(
         oc, "hibernate-wakeup",
         "Start after a PD29 wakeup-pin hibernate reset instead of RTC power-on reset");
+    object_class_property_add_bool(oc, "usb-power-connected",
+                                   bbk9588_get_usb_power_connected,
+                                   bbk9588_set_usb_power_connected);
+    object_class_property_set_description(
+        oc, "usb-power-connected",
+        "Drive the BBK9588 active-low PB18 USB/charger power-detect input");
     bbk9588_add_u32_property(
         oc, "sadc-battery-raw",
         offsetof(Bbk9588MachineState, sadc_battery_raw),

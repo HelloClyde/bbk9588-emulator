@@ -2021,7 +2021,13 @@ class QemuSystemCommandTests(unittest.TestCase):
         )
         self.assertIn("JZ4740_INTC_IRQ_GPIO0", board)
         self.assertIn("JZ4740_INTC_IRQ_GPIO3", board)
-        self.assertIn('qdev_prop_set_uint32(dev, "input-reset-b", 0x78040000u);', board)
+        self.assertIn("board->usb_power_connected ? 0x78000000u", board)
+        self.assertIn('object_class_property_add_bool(oc, "usb-power-connected"', board)
+        touch_body = board[
+            board.index("static void bbk9588_touch_set_state(", board.index("static void bbk9588_touch_set_state(") + 1):
+            board.index("static void bbk9588_set_usb_power_state(")
+        ]
+        self.assertNotIn("JZ4740_GPIO_PORT_B", touch_body)
         self.assertIn("jz4740_gpio_set_input_level(board->gpio, port, mask,", board)
         self.assertIn("jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C", board)
         self.assertIn("jz4740_gpio_set_input_sample_callback(", board)
@@ -3196,6 +3202,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         state.safe_shutdown_started_at = None
         state.safe_shutdown_finished_at = None
         state.safe_shutdown_error = None
+        state.usb_power_connected = True
         state._publish_snapshot_locked = lambda: None  # type: ignore[method-assign]
         return state
 
@@ -3204,6 +3211,7 @@ class QemuSystemCommandTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.running = True
                 self.events: list[tuple[int, bool]] = []
+                self.usb_power_events: list[bool] = []
 
             def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
                 return {
@@ -3218,12 +3226,17 @@ class QemuSystemCommandTests(unittest.TestCase):
                     self.running = False
                 return {"applied": True, "code": code, "down": down}
 
+            def apply_usb_power_state(self, connected: bool) -> dict[str, object]:
+                self.usb_power_events.append(connected)
+                return {"applied": True, "connected": connected}
+
         backend = FakeBackend()
         state = self._make_safe_shutdown_state(backend)
 
         snapshot = state._request_guest_shutdown_locked(hold_seconds=0.0, timeout=0.2)
 
         self.assertEqual(backend.events, [(11, True), (11, False)])
+        self.assertEqual(backend.usb_power_events, [False])
         self.assertFalse(snapshot["running"])
         self.assertEqual(snapshot["exit_reason"], "guest-shutdown")
         self.assertEqual(state.safe_shutdown_state, "complete")
@@ -3234,6 +3247,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         class FakeBackend:
             def __init__(self) -> None:
                 self.events: list[tuple[int, bool]] = []
+                self.usb_power_events: list[bool] = []
 
             def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
                 return {"running": True, "exit_reason": None, "returncode": None}
@@ -3242,6 +3256,10 @@ class QemuSystemCommandTests(unittest.TestCase):
                 self.events.append((code, down))
                 return {"applied": True, "code": code, "down": down}
 
+            def apply_usb_power_state(self, connected: bool) -> dict[str, object]:
+                self.usb_power_events.append(connected)
+                return {"applied": True, "connected": connected}
+
         backend = FakeBackend()
         state = self._make_safe_shutdown_state(backend)
 
@@ -3249,6 +3267,7 @@ class QemuSystemCommandTests(unittest.TestCase):
             state._request_guest_shutdown_locked(hold_seconds=0.0, timeout=0.02)
 
         self.assertEqual(backend.events, [(11, True), (11, False)])
+        self.assertEqual(backend.usb_power_events, [False, True])
         self.assertEqual(state.safe_shutdown_state, "failed")
         self.assertIn("TimeoutError", state.safe_shutdown_error or "")
 
@@ -4862,6 +4881,31 @@ class QemuSystemCommandTests(unittest.TestCase):
             [
                 "qom-set /machine storage-trace true",
                 "qom-set /machine storage-trace false",
+            ],
+        )
+
+    def test_qemu_usb_power_runtime_toggle_uses_machine_property(self) -> None:
+        class _RunningProc:
+            def poll(self) -> None:
+                return None
+
+        backend = QemuProcessBackend(QemuSystemConfig(machine="bbk9588"))
+        backend.proc = _RunningProc()  # type: ignore[assignment]
+        backend.hmp_sock = object()  # type: ignore[assignment]
+
+        with mock.patch("emu.qemu.system._hmp_command", return_value="") as hmp:
+            disconnected = backend.apply_usb_power_state(False)
+            connected = backend.apply_usb_power_state(True)
+
+        self.assertTrue(disconnected.get("applied"), disconnected)
+        self.assertFalse(disconnected.get("connected"), disconnected)
+        self.assertTrue(connected.get("connected"), connected)
+        self.assertTrue(backend.usb_power_connected)
+        self.assertEqual(
+            [call.args[1] for call in hmp.call_args_list],
+            [
+                "qom-set /machine usb-power-connected false",
+                "qom-set /machine usb-power-connected true",
             ],
         )
 
@@ -7279,6 +7323,8 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="settingsDialog" class="settings-dialog"', frontend)
         self.assertIn('id="keymapSettingsTab"', frontend)
         self.assertIn('id="touchSettingsTab"', frontend)
+        self.assertIn('id="powerSettingsTab"', frontend)
+        self.assertIn('id="usbPowerConnected" type="checkbox" checked', frontend)
         self.assertIn('id="keymapSettingsPane" class="settings-pane keymap-panel"', frontend)
         self.assertIn("if (settingsDialogEl.open) return;", frontend)
         self.assertIn("if (!settingsDialogEl.open) settingsDialogEl.showModal();", frontend)
@@ -7337,6 +7383,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("runLifecycleCommand('reset', '正在安全关机并重新启动')", frontend)
         self.assertIn("setOperationStatus(status.lifecycle_notice || '')", frontend)
         self.assertIn("runLifecycleCommand('force-stop', '正在强制停止')", frontend)
+        self.assertIn("wsSend({op:'set-usb-power', connected:usbPowerConnectedEl.checked})", frontend)
         self.assertIn("强制停止可能中断 NAND 写入并损坏文件系统", frontend)
         self.assertNotIn("wsSend({op:'stop'})", frontend)
         self.assertIn('id="screenWrap" class="screen-wrap"', frontend)
@@ -8135,7 +8182,7 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertEqual(backend.gdb_register_write_count, register_writes_before_release)
             time.sleep(0.08)
             released_gpio = struct.unpack("<I", backend.read_virtual_memory(0xB0010100, 4))[0]
-            self.assertEqual(released_gpio & 0x00040000, 0x00040000)
+            self.assertEqual(released_gpio & 0x00040000, 0)
             released_status = backend.read_virtual_memory(0xB007000C, 1)[0]
             released_intc_pending = struct.unpack("<I", backend.read_virtual_memory(0xB0001010, 4))[0]
             if released_status & 0x08:
@@ -8145,6 +8192,30 @@ class QemuSystemCommandTests(unittest.TestCase):
             qemu = backend.snapshot()
             self.assertGreaterEqual(int(qemu.get("bbk_input_write_count") or 0), 1)
             self.assertTrue(qemu.get("guest_input_events"))
+
+            disconnected = backend.apply_usb_power_state(False)
+            self.assertTrue(disconnected.get("applied"), disconnected)
+            time.sleep(0.08)
+            disconnected_gpio = struct.unpack(
+                "<I", backend.read_virtual_memory(0xB0010100, 4)
+            )[0]
+            self.assertEqual(disconnected_gpio & 0x00040000, 0x00040000)
+
+            backend.apply_touch_state(120, 160, True)
+            backend.apply_touch_state(120, 160, False)
+            time.sleep(0.08)
+            after_touch_gpio = struct.unpack(
+                "<I", backend.read_virtual_memory(0xB0010100, 4)
+            )[0]
+            self.assertEqual(after_touch_gpio & 0x00040000, 0x00040000)
+
+            connected = backend.apply_usb_power_state(True)
+            self.assertTrue(connected.get("applied"), connected)
+            time.sleep(0.08)
+            connected_gpio = struct.unpack(
+                "<I", backend.read_virtual_memory(0xB0010100, 4)
+            )[0]
+            self.assertEqual(connected_gpio & 0x00040000, 0)
         finally:
             backend.stop()
 

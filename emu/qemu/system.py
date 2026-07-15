@@ -677,6 +677,9 @@ class QemuProcessBackend:
         self.guest_call_count = 0
         self.bbk_input_write_count = 0
         self.last_bbk_input_error: str | None = None
+        self.usb_power_connected = self._bbk_machine_bool_option_value(
+            "usb-power-connected", True
+        )
         self.last_gdb_error: str | None = None
         self.guest_input_events: list[dict[str, object]] = []
         self.touch_capture_active: int | None = None
@@ -710,6 +713,9 @@ class QemuProcessBackend:
         self.last_process_job_error: str | None = None
 
     def _bbk_machine_bool_option_enabled(self, name: str) -> bool:
+        return self._bbk_machine_bool_option_value(name, False)
+
+    def _bbk_machine_bool_option_value(self, name: str, default: bool) -> bool:
         needle = name.lower()
         for option in self.config.bbk_machine_options:
             key, sep, value = str(option).partition("=")
@@ -718,7 +724,7 @@ class QemuProcessBackend:
             if not sep:
                 return True
             return value.strip().lower() in {"1", "on", "true", "yes"}
-        return False
+        return bool(default)
 
     def _update_performance_metrics_locked(
         self,
@@ -1417,6 +1423,38 @@ class QemuProcessBackend:
                 return {"error": f"{type(exc).__name__}: {exc}"}
             return {
                 "storage_trace_enabled": bool(enabled),
+            }
+
+    def apply_usb_power_state(self, connected: bool) -> dict[str, object]:
+        """Drive the BBK9588 board-level USB/charger power-detect input."""
+
+        connected = bool(connected)
+        with self._lock:
+            if self.config.machine.lower() != "bbk9588":
+                return {
+                    "applied": False,
+                    "error": "USB power state requires the bbk9588 machine",
+                }
+            if self.proc is None or self.proc.poll() is not None:
+                return {"applied": False, "error": "QEMU process is not running"}
+            if self.hmp_sock is None:
+                return {
+                    "applied": False,
+                    "error": "QEMU HMP monitor is not connected",
+                }
+            value = "true" if connected else "false"
+            try:
+                _hmp_command(
+                    self.hmp_sock,
+                    f"qom-set /machine usb-power-connected {value}",
+                )
+            except Exception as exc:
+                return {"applied": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.usb_power_connected = connected
+            return {
+                "applied": True,
+                "connected": connected,
+                "source": "qemu-machine-property",
             }
 
     def refresh(self) -> None:
@@ -7488,6 +7526,7 @@ class QemuProcessBackend:
                 "bbk_input_connected": self.bbk_input_sock is not None,
                 "bbk_input_write_count": self.bbk_input_write_count,
                 "last_bbk_input_error": self.last_bbk_input_error,
+                "usb_power_connected": self.usb_power_connected,
                 "register_sample": register_sample,
                 "pc": register_sample.get("pc") if isinstance(register_sample, dict) else None,
                 "cp0": register_sample.get("cp0") if isinstance(register_sample, dict) else None,

@@ -295,6 +295,7 @@ class FrontendState:
         self.safe_shutdown_finished_at: float | None = None
         self.safe_shutdown_error: str | None = None
         self.lifecycle_notice: str | None = None
+        self.usb_power_connected = True
 
         self.job_name: str | None = None
         self.job_total_steps = 0
@@ -758,6 +759,16 @@ class FrontendState:
         deadline = time.monotonic() + timeout
         self._set_safe_shutdown_state("requesting")
 
+        restore_usb_power = self.usb_power_connected
+        usb_result = backend.apply_usb_power_state(False)
+        if not usb_result.get("applied"):
+            error = str(
+                usb_result.get("error")
+                or "QEMU did not accept the USB power state"
+            )
+            self._set_safe_shutdown_state("failed", error=error)
+            raise RuntimeError(f"safe shutdown failed: {error}")
+
         with self.lock:
             for token in [
                 token
@@ -773,6 +784,8 @@ class FrontendState:
                 source="safe-shutdown",
             )
         if not result.get("applied"):
+            if restore_usb_power:
+                backend.apply_usb_power_state(True)
             error = str(result.get("error") or "QEMU did not accept the power key")
             self._set_safe_shutdown_state("failed", error=error)
             raise RuntimeError(f"safe shutdown failed: {error}")
@@ -819,7 +832,10 @@ class FrontendState:
                     f"returncode={snapshot.get('returncode')!r})"
                 )
         except Exception as exc:
-            if not released and self._backend_snapshot(backend, refresh=False).get("running"):
+            backend_running = bool(
+                self._backend_snapshot(backend, refresh=False).get("running")
+            )
+            if not released and backend_running:
                 try:
                     with self.lock:
                         self._record_frontend_key_transition_locked(
@@ -828,6 +844,11 @@ class FrontendState:
                             False,
                             source="safe-shutdown-error",
                         )
+                except Exception:
+                    pass
+            if backend_running and restore_usb_power:
+                try:
+                    backend.apply_usb_power_state(True)
                 except Exception:
                     pass
             error = f"{type(exc).__name__}: {exc}"
@@ -935,6 +956,13 @@ class FrontendState:
             self.qemu_backend.set_audio_ready_callback(self._on_qemu_audio_ready)
             try:
                 self.qemu_backend.start()
+                usb_result = self.qemu_backend.apply_usb_power_state(
+                    self.usb_power_connected
+                )
+                if not usb_result.get("applied"):
+                    raise RuntimeError(
+                        usb_result.get("error") or "failed to apply USB power state"
+                    )
                 self.running = bool(self._backend_snapshot(self.qemu_backend, refresh=False).get("running"))
                 self._start_qemu_tick_worker_locked()
             except Exception as exc:
@@ -984,6 +1012,13 @@ class FrontendState:
             qemu = self._backend_snapshot(self.qemu_backend, refresh=True)
         if not qemu.get("running") and qemu.get("returncode") is not None:
             self.qemu_backend.start()
+            usb_result = self.qemu_backend.apply_usb_power_state(
+                self.usb_power_connected
+            )
+            if not usb_result.get("applied"):
+                raise RuntimeError(
+                    usb_result.get("error") or "failed to apply USB power state"
+                )
             self._start_qemu_tick_worker_locked()
             qemu = self._backend_snapshot(self.qemu_backend, refresh=False)
         self.running = bool(qemu.get("running"))
@@ -1667,6 +1702,17 @@ class FrontendState:
             self._publish_snapshot_locked()
             return self.snapshot()
 
+    def set_usb_power_connected(self, connected: bool) -> dict[str, object]:
+        with self.lock:
+            backend = self._ensure_qemu_started_locked()
+            result = backend.apply_usb_power_state(bool(connected))
+            if result.get("applied"):
+                self.usb_power_connected = bool(connected)
+            self._publish_snapshot_locked()
+            snapshot = self.snapshot()
+            snapshot["usb_power_result"] = result
+            return snapshot
+
     def set_orientation(self, orientation: object) -> dict[str, object]:
         value = str(orientation or "").strip().lower()
         if value not in FRONTEND_ORIENTATIONS:
@@ -1724,6 +1770,13 @@ class FrontendState:
             if enabled is None:
                 enabled = not self._frontend_input_calibration_enabled()
             return self.set_frontend_input_calibration(enabled)
+        if op in {"usb-power", "usb_power", "set-usb-power", "set_usb_power"}:
+            connected = self._coerce_optional_bool(
+                msg.get("connected", msg.get("enabled"))
+            )
+            if connected is None:
+                return {"error": "connected must be a boolean"}
+            return self.set_usb_power_connected(connected)
         if op in {"set-nand-image", "set_nand_image", "select-nand-image", "select_nand_image"}:
             reset = self._coerce_optional_bool(msg.get("reset"))
             return self.set_nand_image(msg.get("path") or msg.get("image"), reset=reset is not False)
@@ -2058,6 +2111,7 @@ class FrontendState:
                 "reason": "Legacy Python/GDB hooks are disabled; default bbk9588 behavior is modeled in QEMU.",
             },
             "frontend_input_calibration": self._frontend_input_calibration_enabled(),
+            "usb_power_connected": self.usb_power_connected,
             "frontend_input_calibration_stage": self.frontend_input_calibration_stage,
             "frontend_input_calibration_stage_label": FRONTEND_INPUT_CALIBRATION_STAGE_LABELS.get(
                 self.frontend_input_calibration_stage,

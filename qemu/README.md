@@ -165,6 +165,9 @@ bin/bbk9588-qemu-system-mipsel.exe
   hibernate 状态。
 - GPIO D29 按 9588 active-low 电源键建模，空闲/释放电平为高。普通按键待机唤醒
   通过 GPIO flag、GPIO parent、INTC IP2 和 MIPS WAIT 完成，不再借用 TCU1 wake proxy。
+- GPIO B18 按 9588 active-low USB/充电供电检测建模，默认保持“USB 供电已连接”；
+  `usb-power-connected` machine property 可在运行时连接或断开供电检测。该板级电源
+  信号独立于 UDC packet transport，也不再由触摸按下/抬起事件改写。
 - 兼容性诊断寄存器和 machine property。
 
 overlay 还包含少量 `target/mips` 侧 instrumentation/helper，用于当前 machine model
