@@ -7660,6 +7660,21 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('"qemu_nand_persistent"', importer)
         self.assertNotIn("qemu_nand_runs", script)
 
+    def test_release_launcher_waits_for_frontend_before_opening_browser(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "packaging" / "start-web.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('$StatusUrl = "${url}api/status"', script)
+        self.assertIn("$BrowserReadyJob = Start-Job -ScriptBlock", script)
+        self.assertIn("Invoke-WebRequest", script)
+        self.assertRegex(
+            script,
+            r"if \(\[int\]\$response\.StatusCode -eq 200\) \{\s+"
+            r"Start-Process \$BrowserUrl",
+        )
+        self.assertNotIn("Start-Process $url", script)
+
     def test_frontend_qemu_backend_status_and_stop(self) -> None:
         if find_qemu() is None:
             self.skipTest("qemu-system-mipsel is not installed")

@@ -179,20 +179,57 @@ $NandImportArgs = @()
 if ($NandImportSource) {
     $NandImportArgs = @("--nand-import-source", $NandImportSource)
 }
-
-$url = "http://${HostName}:${Port}/"
+$BrowserHost = $HostName
+if ($BrowserHost -in @("0.0.0.0", "::", "[::]")) {
+    $BrowserHost = "127.0.0.1"
+}
+$url = "http://${BrowserHost}:${Port}/"
 Write-Host "Starting BBK 9588 emulator at $url"
+$BrowserReadyJob = $null
 if (-not $NoOpenBrowser) {
-    Start-Process $url
+    Write-Host "The browser will open when the web frontend is ready."
+    $StatusUrl = "${url}api/status"
+    $BrowserReadyJob = Start-Job -ScriptBlock {
+        param(
+            [string]$StatusUrl,
+            [string]$BrowserUrl
+        )
+
+        while ($true) {
+            try {
+                $response = Invoke-WebRequest `
+                    -Uri $StatusUrl `
+                    -UseBasicParsing `
+                    -TimeoutSec 2 `
+                    -ErrorAction Stop
+                if ([int]$response.StatusCode -eq 200) {
+                    Start-Process $BrowserUrl
+                    return
+                }
+            } catch {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+    } -ArgumentList $StatusUrl, $url
 }
 
 $env:PYTHONNOUSERSITE = "1"
-& $Python -m emu.web.frontend `
-    --boot-mode $BootMode `
-    --qemu $Qemu `
-    --nand-image $NandImage `
-    --host $HostName `
-    --port $Port `
-    @NandImportArgs `
-    @ImageArgs `
-    @ExtraArgs
+$FrontendExitCode = 1
+try {
+    & $Python -m emu.web.frontend `
+        --boot-mode $BootMode `
+        --qemu $Qemu `
+        --nand-image $NandImage `
+        --host $HostName `
+        --port $Port `
+        @NandImportArgs `
+        @ImageArgs `
+        @ExtraArgs
+    $FrontendExitCode = $LASTEXITCODE
+} finally {
+    if ($null -ne $BrowserReadyJob) {
+        Stop-Job -Job $BrowserReadyJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $BrowserReadyJob -Force -ErrorAction SilentlyContinue
+    }
+}
+exit $FrontendExitCode
