@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import mimetypes
 import os
+import platform
 import socket
+import sys
 import tempfile
 import threading
 import time
+import zipfile
 from collections import deque
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import BinaryIO
@@ -22,6 +27,84 @@ MAX_JSON_BODY_BYTES = 64 * 1024
 MAX_NAND_UPLOAD_BYTES = 128 * 1024 * 1024
 NAND_UPLOAD_CHUNK_BYTES = 64 * 1024
 NAND_UPLOAD_READ_TIMEOUT_SECONDS = 30.0
+
+
+def _diagnostic_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
+
+
+def build_feedback_archive(
+    state: object,
+    *,
+    client: dict[str, object] | None = None,
+    captured_at: datetime | None = None,
+) -> tuple[str, bytes]:
+    """Build a read-only diagnostic bundle suitable for attaching to a bug report."""
+    created = captured_at or datetime.now(timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    created = created.astimezone(timezone.utc)
+    errors: list[dict[str, str]] = []
+
+    try:
+        status = state.snapshot(detail="traces")
+    except Exception as exc:
+        errors.append({"section": "status", "error": f"{type(exc).__name__}: {exc}"})
+        status = {"capture_error": errors[-1]["error"]}
+
+    try:
+        logs = state.logs(5000)
+    except Exception as exc:
+        errors.append({"section": "logs", "error": f"{type(exc).__name__}: {exc}"})
+        logs = {"count": 0, "limit": 5000, "events": [], "capture_error": errors[-1]["error"]}
+
+    screen: bytes | None = None
+    try:
+        cached_frame = getattr(state, "cached_frame", None)
+        if isinstance(status, dict) and status.get("running"):
+            screen = state.dump_frame()
+        else:
+            screen = cached_frame() if callable(cached_frame) else None
+    except Exception as exc:
+        errors.append({"section": "screen", "error": f"{type(exc).__name__}: {exc}"})
+
+    manifest = {
+        "schema_version": 1,
+        "captured_at": created.isoformat().replace("+00:00", "Z"),
+        "host": {
+            "platform": platform.platform(),
+            "python": sys.version,
+        },
+        "client": client or {},
+        "contents": {
+            "status": "status.json",
+            "logs": "logs.json",
+            "text_log": "qemu.log",
+            "screen": "screen.png" if screen else None,
+            "errors": "capture-errors.json" if errors else None,
+        },
+        "privacy": "The archive contains runtime paths and logs, but no NAND image or guest file contents.",
+    }
+    text_log = "\n".join(
+        f"[{event.get('stream', 'log')}] {event.get('text', '')}"
+        for event in logs.get("events", [])
+        if isinstance(event, dict)
+    )
+    if text_log:
+        text_log += "\n"
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", _diagnostic_json_bytes(manifest))
+        archive.writestr("status.json", _diagnostic_json_bytes(status))
+        archive.writestr("logs.json", _diagnostic_json_bytes(logs))
+        archive.writestr("qemu.log", text_log.encode("utf-8"))
+        if screen:
+            archive.writestr("screen.png", screen)
+        if errors:
+            archive.writestr("capture-errors.json", _diagnostic_json_bytes(errors))
+    filename = f"bbk9588-feedback-{created.strftime('%Y%m%d-%H%M%SZ')}.zip"
+    return filename, output.getvalue()
 
 
 def stream_upload_to_path(
@@ -86,11 +169,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _json(self, data: object, status: int = 200) -> None:
         self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
-    def _download(self, name: str, body: bytes) -> None:
+    def _download(self, name: str, body: bytes, content_type: str = "application/octet-stream") -> None:
         self.close_connection = True
         self.connection.settimeout(1.0)
         self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
         self.send_header("Cache-Control", "no-store")
@@ -413,6 +496,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/logs":
                 limit = int(parse_qs(parsed.query).get("limit", ["512"])[0])
                 self._json(self.state.logs(limit))
+            elif parsed.path == "/api/feedback":
+                name, data = build_feedback_archive(
+                    self.state,
+                    client={
+                        "user_agent": self.headers.get("User-Agent", ""),
+                        "accept_language": self.headers.get("Accept-Language", ""),
+                    },
+                )
+                self._download(name, data, "application/zip")
             elif parsed.path == "/screen.png":
                 self._send(200, self.state.dump_frame(), "image/png")
             elif parsed.path == "/debug/rgb565.png":
@@ -465,6 +557,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._json(self.state.reset())
             elif parsed.path == "/api/command":
                 self._json(self.state.command(self._read_json_body()))
+            elif parsed.path == "/api/feedback":
+                body = self._read_json_body()
+                browser = body.get("client")
+                client = dict(browser) if isinstance(browser, dict) else {}
+                client["http_user_agent"] = self.headers.get("User-Agent", "")
+                client["http_accept_language"] = self.headers.get("Accept-Language", "")
+                name, data = build_feedback_archive(self.state, client=client)
+                self._download(name, data, "application/zip")
             elif parsed.path == "/api/files/mkdir":
                 body = self._read_json_body()
                 self._json(self.state.nand_files_mkdir(body.get("path", "/"), body.get("name")))

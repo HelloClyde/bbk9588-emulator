@@ -80,6 +80,13 @@ python .\tools\package_nand_release.py D:\dumps\bbk9588_nand.bin --version v1
 
 详细边界见 [DATA_NOTICE.md](DATA_NOTICE.md) 和 [镜像说明](docs/images.md)。
 
+## 问题反馈
+
+遇到卡死、输入无响应、黑屏或音视频异常时，先保持故障现场，再点击 Web 界面左侧
+“保存反馈包”。生成的 `bbk9588-feedback-*.zip` 包含完整运行状态、QEMU 近期日志、
+浏览器环境和当前屏幕截图，可直接附在 issue 中。反馈包不包含 NAND 镜像或 NAND
+内的文件内容，但日志可能包含本机运行路径，公开上传前可自行检查。
+
 ## 架构
 
 ```text

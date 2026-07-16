@@ -153,6 +153,7 @@ HTML = r"""<!doctype html>
     .file-manager-status { min-height: 18px; margin-top: 8px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
     .operation-status { width: 100%; min-height: 18px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
     .operation-status.error { color: #ff9f9f; }
+    .feedback-actions { margin-top: 8px; }
     .mobile-drawer-button, .drawer-header, .drawer-backdrop { display: none; }
     .drawer-header { min-height: 38px; align-items: center; justify-content: space-between; margin-bottom: 12px; color: #cbd3dd; font-size: 13px; font-weight: 600; }
     .drawer-close { width: 32px; height: 32px; padding: 0; background: #343941; font-size: 22px; line-height: 1; }
@@ -212,6 +213,9 @@ HTML = r"""<!doctype html>
           <button id="stop" class="secondary">安全关机</button>
           <button id="reset" class="secondary">重新启动</button>
           <button id="forceStop" class="warn">强制停止</button>
+        </div>
+        <div class="row feedback-actions">
+          <button id="saveFeedback" class="secondary" title="保存状态、日志和当前屏幕截图">保存反馈包</button>
         </div>
         <div id="operationStatus" class="operation-status" role="status" aria-live="polite"></div>
       </section>
@@ -345,6 +349,7 @@ const restartFromOverlayEl = document.getElementById('restartFromOverlay');
 const stopEl = document.getElementById('stop');
 const resetEl = document.getElementById('reset');
 const forceStopEl = document.getElementById('forceStop');
+const saveFeedbackEl = document.getElementById('saveFeedback');
 const operationStatusEl = document.getElementById('operationStatus');
 const powerKeyEl = document.getElementById('powerKey');
 const deviceKeyEls = [...document.querySelectorAll('.device-key')];
@@ -368,6 +373,7 @@ let poller = null;
 let framePoller = null;
 let framePollInFlight = false;
 let lifecycleRequestPending = false;
+let feedbackRequestPending = false;
 let ws = null;
 let wsOpenPromise = null;
 let wsWatchdog = null;
@@ -1433,6 +1439,88 @@ function setOperationStatus(message = '', error = false) {
   operationStatusEl.textContent = message;
   operationStatusEl.classList.toggle('error', error);
 }
+function feedbackClientSnapshot() {
+  let gamepads = [];
+  try {
+    gamepads = typeof navigator.getGamepads === 'function' ? Array.from(navigator.getGamepads()).filter(Boolean) : [];
+  } catch (_) {}
+  return {
+    captured_at: new Date().toISOString(),
+    user_agent: navigator.userAgent,
+    language: navigator.language,
+    platform: navigator.platform || '',
+    visibility_state: document.visibilityState,
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      device_pixel_ratio: window.devicePixelRatio,
+    },
+    canvas: {
+      width: screen.width,
+      height: screen.height,
+      client_width: screen.clientWidth,
+      client_height: screen.clientHeight,
+    },
+    frontend: {
+      orientation: currentOrientation,
+      websocket_state: ws?.readyState ?? null,
+      websocket_last_message_age_ms: wsLastMessageAt ? Math.round(performance.now() - wsLastMessageAt) : null,
+      audio_enabled: audioEnabled,
+      audio_context_state: audioContext?.state || 'uninitialized',
+      audio_packets_received: audioPacketsReceived,
+      audio_packets_scheduled: audioPacketsScheduled,
+      audio_packets_rejected: audioPacketsRejected,
+      audio_last_error: audioLastError,
+      pointer_active: pointerActive,
+      active_keyboard_keys: activeKeyboardKeys.size,
+      active_button_keys: buttonKeyStates.size,
+      active_gamepad_inputs: activeGamepadInputs.size,
+      key_bindings: {...keyBindings},
+      gamepad_bindings: {...gamepadBindings},
+    },
+    gamepads: gamepads.map(gamepad => ({
+      index: gamepad.index,
+      connected: gamepad.connected,
+      mapping: gamepad.mapping,
+      buttons: gamepad.buttons.length,
+      axes: gamepad.axes.length,
+    })),
+  };
+}
+function feedbackDownloadName(response) {
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (!encoded) return `bbk9588-feedback-${Date.now()}.zip`;
+  try { return decodeURIComponent(encoded); } catch (_) { return encoded; }
+}
+async function saveFeedbackBundle() {
+  if (feedbackRequestPending) return;
+  feedbackRequestPending = true;
+  saveFeedbackEl.disabled = true;
+  setOperationStatus('正在收集反馈日志');
+  try {
+    const response = await fetch('/api/feedback', jsonRequest({client:feedbackClientSnapshot()}));
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(body || `HTTP ${response.status}`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = feedbackDownloadName(response);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setOperationStatus('反馈包已保存，请将 ZIP 文件附在问题反馈中');
+  } catch (err) {
+    console.error(err);
+    setOperationStatus(`保存反馈包失败：${err?.message || String(err)}`, true);
+  } finally {
+    feedbackRequestPending = false;
+    saveFeedbackEl.disabled = false;
+  }
+}
 async function runLifecycleCommand(op, pendingLabel) {
   if (lifecycleRequestPending) return;
   lifecycleRequestPending = true;
@@ -1466,6 +1554,7 @@ forceStopEl.onclick = () => {
   if (!window.confirm('强制停止可能中断 NAND 写入并损坏文件系统，确定继续？')) return;
   runLifecycleCommand('force-stop', '正在强制停止');
 };
+saveFeedbackEl.onclick = saveFeedbackBundle;
 frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
