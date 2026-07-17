@@ -33,6 +33,7 @@ from emu.qemu.nand_fs import (
     mutate_nand_files,
     normalize_nand_path,
     read_nand_file,
+    replace_fat_file,
     validate_nand_image,
 )
 from emu.qemu.nand_lock import NandImageInUseError, NandImageLease
@@ -4537,6 +4538,32 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertEqual(normalize_nand_path("A:\\应用\\游戏"), "/应用/游戏")
             with self.assertRaises(ValueError):
                 normalize_nand_path("/应用/../系统")
+
+    def test_nand_file_manager_safely_replaces_multicluster_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _fat_image, nand_image = _make_nand_file_manager_fixture(Path(tmp))
+            original = bytes((index * 17 + 3) & 0xff for index in range(256 * 1024))
+            neighbor = bytes((index * 29 + 7) & 0xff for index in range(256 * 1024))
+            replacement = bytes((index * 11 + 5) & 0xff for index in range(80 * 1024))
+
+            def install(fs: PyFatFS) -> None:
+                fs.writebytes("/应用/replace.bda", original)
+                fs.writebytes("/应用/keep.bin", neighbor)
+
+            mutate_nand_files(nand_image, install)
+
+            def replace(fs: PyFatFS) -> None:
+                replace_fat_file(fs, "/应用/replace.bda", io.BytesIO(replacement))
+
+            mutate_nand_files(nand_image, replace)
+            self.assertEqual(
+                read_nand_file(nand_image, "/应用/replace.bda")[1],
+                replacement,
+            )
+            self.assertEqual(
+                read_nand_file(nand_image, "/应用/keep.bin")[1],
+                neighbor,
+            )
 
     def test_nand_validation_rejects_mapped_block_ecc_damage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

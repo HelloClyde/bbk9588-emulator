@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
-import shutil
 import struct
 import threading
 import time
@@ -16,11 +15,13 @@ from pathlib import Path, PurePosixPath
 from emu.core.framebuffer import png_bytes_from_rgb, rgb565_raw_to_info_rgb
 from emu.qemu.nand_fs import (
     extract_logical_fat_image,
+    fat_file_clusters,
     join_nand_path,
     list_fat_directory,
     mutate_nand_files,
     normalize_nand_path,
     read_fat_file,
+    replace_fat_file,
     validate_nand_image,
 )
 from emu.qemu.nand_lock import NandImageLease
@@ -580,8 +581,8 @@ class FrontendState:
         target = join_nand_path(directory, name)
 
         def operation(fs) -> None:
-            with source.open("rb") as input_stream, fs.openbin(target, "w") as output_stream:
-                shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+            with source.open("rb") as input_stream:
+                replace_fat_file(fs, target, input_stream)
 
         def validator(fs) -> None:
             if not fs.isfile(target):
@@ -628,6 +629,7 @@ class FrontendState:
             if fs.isdir(target):
                 fs.removetree(target)
             elif fs.isfile(target):
+                fat_file_clusters(fs, target)
                 fs.remove(target)
             else:
                 raise FileNotFoundError(f"NAND path does not exist: {target}")

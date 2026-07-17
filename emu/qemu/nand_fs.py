@@ -11,7 +11,7 @@ import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from pyfatfs.EightDotThree import EightDotThree
 from pyfatfs.PyFatFS import PyFatFS
@@ -440,6 +440,53 @@ def read_nand_file(nand_path: Path, file_path: object) -> tuple[str, bytes]:
         fat_path = Path(tmp) / "nand-fat.img"
         extract_logical_fat_image(nand_path, fat_path)
         return read_fat_file(fat_path, file_path)
+
+
+def fat_file_clusters(fs: PyFatFS, file_path: object) -> tuple[int, ...]:
+    """Return an exact, validated FAT cluster chain for one regular file."""
+
+    normalized = normalize_nand_path(file_path, allow_root=False)
+    if not fs.isfile(normalized):
+        raise FileNotFoundError(f"NAND file does not exist: {normalized}")
+    entry = fs._get_dir_entry(normalized)
+    required = (
+        entry.filesize + fs.fs.bytes_per_cluster - 1
+    ) // fs.fs.bytes_per_cluster
+    start = entry.get_cluster()
+    if start == 0:
+        chain: tuple[int, ...] = ()
+    else:
+        try:
+            chain = tuple(fs.fs.get_cluster_chain(start))
+        except Exception as exc:
+            raise ValueError(
+                f"invalid FAT cluster chain for {normalized}: {exc}"
+            ) from exc
+    if len(chain) != required:
+        raise ValueError(
+            f"invalid FAT cluster chain for {normalized}: "
+            f"file size requires {required} clusters but chain has {len(chain)}"
+        )
+    return chain
+
+
+def replace_fat_file(
+    fs: PyFatFS,
+    file_path: object,
+    source: BinaryIO,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> None:
+    """Replace a file without using pyfatfs' unsafe multi-cluster truncate."""
+
+    target = normalize_nand_path(file_path, allow_root=False)
+    if fs.isdir(target):
+        raise IsADirectoryError(f"NAND path is a directory: {target}")
+    if fs.isfile(target):
+        fat_file_clusters(fs, target)
+        fs.remove(target)
+    with fs.openbin(target, "x") as output:
+        shutil.copyfileobj(source, output, length=chunk_size)
 
 
 def mutate_nand_files(
