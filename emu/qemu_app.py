@@ -14,6 +14,7 @@ if __package__ in (None, ""):
 
 from emu.qemu.system import (
     DEFAULT_C200_PHYS,
+    DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
     build_bbk_qemu_config,
@@ -74,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--load-addr", type=lambda value: int(value, 0), help="Physical load address for the boot image.")
     ap.add_argument("--pc", type=lambda value: int(value, 0), help="Initial virtual PC.")
     ap.add_argument("--machine", default=DEFAULT_QEMU_MACHINE)
-    ap.add_argument("--cpu", default="24Kf")
+    ap.add_argument("--cpu", default=DEFAULT_QEMU_CPU)
     ap.add_argument("--ram-mb", type=int, default=160)
     ap.add_argument("--accel", default="tcg,thread=multi,tb-size=256")
     ap.add_argument("--display", default="none")

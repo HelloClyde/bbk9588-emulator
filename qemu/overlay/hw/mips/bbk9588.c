@@ -1788,7 +1788,7 @@ static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "BBK 9588 handheld learning computer";
     mc->init = bbk9588_init;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("24Kf");
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("JZ4740");
     mc->default_ram_size = BBK9588_RAM_DEFAULT_SIZE;
     mc->default_ram_id = "bbk9588.ram";
     mc->max_cpus = 1;

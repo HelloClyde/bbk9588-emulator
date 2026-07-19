@@ -178,10 +178,18 @@ jobs:
 
       - name: Probe packaged emulator binary
         run: |
-          & "${{ steps.qemu-runtime.outputs.qemu_exe }}" --version
+          $qemuExe = "${{ steps.qemu-runtime.outputs.qemu_exe }}"
+          & $qemuExe --version
           if ($LASTEXITCODE -ne 0) {
             throw "packaged QEMU probe failed"
           }
+          $cpuModels = (& $qemuExe -cpu help 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $cpuModels -notmatch '(?m)^\s*JZ4740\s*$') {
+            throw "packaged QEMU does not expose the JZ4740 CPU model"
+          }
+          $env:BBK9588_QEMU = $qemuExe
+          python -m unittest `
+            tests.test_qemu_system.QemuSystemCommandTests.test_qemu_jz4740_cpu_reports_expected_cp0_configuration
 
       - name: Package emulator
         id: package

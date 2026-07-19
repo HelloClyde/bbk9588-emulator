@@ -315,6 +315,10 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 
 已完成：
 
+- [x] 新增基于 XBurstR1 执行核心的专用 `JZ4740` CPU 型号：按手册设置
+  `PRId=0x0ad0024f`、MIPS32 Release 1 + MXU、32 项 dual-page TLB、16 KiB I/D cache、
+  32-byte cache line、4-way associativity；Config0 不再错误声明 Release 2，Config1
+  不再暴露 FPU/MIPS16。machine、Web、CLI 和 probe 默认值统一使用 `JZ4740`。
 - [x] INTC 实现 `ICSR/ICMR/ICMSR/ICMCR/ICPR`、reset mask 和手册 source 编号。
 - [x] INTC 已迁移到独立 `hw/intc/jz4740_intc.c`，拥有独立 state、MMIO、32 路 IRQ
   input、IP2 汇总 output、reset、migration 和诊断接口；`bbk9588.c` 只保留 source
@@ -342,6 +346,11 @@ NAND 持久化和音频已完成当前用户验收，不再作为后续阻塞项
 
 验收：
 
+- [x] CPU 型号有源码契约和运行时 HMP 回归，直接校验 PRId、Config0~3。2026-07-20
+  Windows QEMU 11.0.0 构建及 249 项非音频系统测试整体通过，其中 31 项按既有环境或
+  旧诊断条件跳过；独立 raw NAND 冷启动进入主菜单，按键切换和触摸启动“词典专家”
+  正常；文件导入、列表、导出、删除、两次重启以及最终安全关机均通过，未留下
+  Web/QEMU 进程。Release workflow 同步校验发布包中的 CPU 型号和 CP0 配置。
 - [x] 默认启动不需要 CP0 IRQ、status restore 或 WAIT firmware patch。
 - [x] GUI tick、触摸、LCD、DMA、RTC 等设备 pending 能通过 INTC 唤醒 CPU。
 - [x] 2026-07-11 独立 INTC 版本通过 Windows QEMU 全量构建和 195 项 Python 测试；

@@ -13,7 +13,11 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from emu.qemu.system import DEFAULT_QEMU_EXECUTABLE, DEFAULT_QEMU_MACHINE
+from emu.qemu.system import (
+    DEFAULT_QEMU_CPU,
+    DEFAULT_QEMU_EXECUTABLE,
+    DEFAULT_QEMU_MACHINE,
+)
 from emu.web.frontend_server import FrontendHandler as Handler
 from emu.web.frontend_state import (
     DEFAULT_WEB_QEMU_ICOUNT,
@@ -2295,7 +2299,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--backend", choices=["qemu"], default="qemu", help=argparse.SUPPRESS)
     ap.add_argument("--qemu", default=DEFAULT_QEMU_EXECUTABLE, help="QEMU executable.")
     ap.add_argument("--qemu-machine", default=DEFAULT_QEMU_MACHINE, help="QEMU machine.")
-    ap.add_argument("--qemu-cpu", default="24Kf", help="QEMU CPU model.")
+    ap.add_argument("--qemu-cpu", default=DEFAULT_QEMU_CPU, help="QEMU CPU model.")
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256", help="QEMU accelerator options.")
     ap.add_argument(
         "--qemu-icount",

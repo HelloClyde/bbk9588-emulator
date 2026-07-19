@@ -13,7 +13,13 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from emu.qemu.system import build_bbk_qemu_config, classify_guest_pc, find_qemu, run_qemu
+from emu.qemu.system import (
+    DEFAULT_QEMU_CPU,
+    build_bbk_qemu_config,
+    classify_guest_pc,
+    find_qemu,
+    run_qemu,
+)
 from tests.run_frontend_web_smoke import (
     BUILD,
     find_free_port,
@@ -148,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Caller-owned writable NAND fixture; omitted for direct boot.",
     )
     ap.add_argument("--qemu-machine", default="bbk9588")
-    ap.add_argument("--qemu-cpu", default="24Kf")
+    ap.add_argument("--qemu-cpu", default=DEFAULT_QEMU_CPU)
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256")
     ap.add_argument("--qemu-gdb", dest="qemu_gdb", default=None)
     ap.add_argument("--qemu-timeout", type=float, default=2.0)

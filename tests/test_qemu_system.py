@@ -41,6 +41,7 @@ from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
     DEFAULT_BBK9588_FIRMWARE_PATCHES,
     DEFAULT_C200_BASE,
+    DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_FIRMWARE_PATCHES,
     DEFAULT_QEMU_MACHINE,
@@ -580,6 +581,75 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("cache=writeback", drive)
         self.assertIn(nand.resolve().as_posix(), drive)
         self.assertNotIn("qemu_nand_runs", drive)
+
+    def test_bbk9588_defaults_to_dedicated_jz4740_cpu(self) -> None:
+        config = build_bbk_qemu_config(nand_image=Path("build") / "bbk9588_nand.bin")
+
+        command = build_qemu_command(config)
+
+        self.assertEqual(DEFAULT_QEMU_CPU, "JZ4740")
+        self.assertEqual(command[command.index("-cpu") + 1], DEFAULT_QEMU_CPU)
+
+    def test_jz4740_cpu_model_matches_documented_cp0_geometry(self) -> None:
+        overlay = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        cpu_source = (overlay / "target" / "mips" / "cpu.c").read_text(
+            encoding="utf-8"
+        )
+        board_source = (overlay / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
+        start = cpu_source.index("static const mips_def_t jz4740_cpu_def")
+        end = cpu_source.index("static void mips_cpu_reset_hold", start)
+        model = cpu_source[start:end]
+
+        self.assertIn('.name = "JZ4740"', model)
+        self.assertIn(".CP0_PRid = 0x0ad0024f", model)
+        self.assertIn("(MMU_TYPE_R4000 << CP0C0_MT)", model)
+        self.assertNotIn("CP0C0_AR", model)
+        self.assertIn("(31 << CP0C1_MMU)", model)
+        self.assertIn("(1 << CP0C1_IS) | (4 << CP0C1_IL) | (3 << CP0C1_IA)", model)
+        self.assertIn("(1 << CP0C1_DS) | (4 << CP0C1_DL) | (3 << CP0C1_DA)", model)
+        self.assertIn(".insn_flags = CPU_MIPS32R1 | ASE_MXU", model)
+        self.assertNotIn("CP0C1_FP", model)
+        self.assertNotIn("ASE_MIPS16", model)
+        self.assertIn("mips_register_cpudef_type(&jz4740_cpu_def);", cpu_source)
+        self.assertIn('MIPS_CPU_TYPE_NAME("JZ4740")', board_source)
+
+    def test_qemu_jz4740_cpu_reports_expected_cp0_configuration(self) -> None:
+        executable = os.environ.get("BBK9588_QEMU") or find_qemu()
+        if executable is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        result = subprocess.run(
+            [
+                executable,
+                "-M",
+                "bbk9588",
+                "-cpu",
+                DEFAULT_QEMU_CPU,
+                "-accel",
+                "tcg",
+                "-S",
+                "-display",
+                "none",
+                "-serial",
+                "none",
+                "-monitor",
+                "stdio",
+            ],
+            input="\ninfo registers\nquit\n",
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=qemu_subprocess_env(executable),
+        )
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("PRId 0x0ad0024f", output)
+        self.assertIn("Config0 0x80000082 Config1 0xbe63318a", output)
+        self.assertIn("Config2 0x80000000 Config3 0x00000000", output)
 
     def test_bbk9588_bootrom_source_does_not_load_fat_kernel(self) -> None:
         source = (
@@ -7586,7 +7656,7 @@ class QemuSystemCommandTests(unittest.TestCase):
                 orientation="rot180",
                 qemu=DEFAULT_QEMU_EXECUTABLE,
                 qemu_machine=DEFAULT_QEMU_MACHINE,
-                qemu_cpu="24Kf",
+                qemu_cpu=DEFAULT_QEMU_CPU,
                 qemu_accel="tcg",
                 qemu_gdb="none",
                 qemu_timeout=5.0,

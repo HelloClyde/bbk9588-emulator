@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- 新增基于 XBurstR1 的专用 `JZ4740` CPU 型号，修正 PRId、MIPS32 R1/MXU 能力、
+  32 项 TLB、16 KiB I/D cache 和 CP0 Config；BBK 9588 的 CLI、Web 与测试默认值不再
+  使用 MIPS32 R2、带 FPU 的 `24Kf`。
 - Web 默认启用 QEMU 自适应 icount，并在启用时使用单线程 TCG，使 TCU 虚拟时间与
   guest 指令进度保持同步；修复视频解码负载下播放器错过目标 tick 后永久忙等、
   画面停住且 CPU 单核满载的问题。可用 `--no-qemu-icount` 关闭以做时序对比。

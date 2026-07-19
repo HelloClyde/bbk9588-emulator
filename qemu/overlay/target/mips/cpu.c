@@ -106,6 +106,7 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->CP0_Cause |
                  (env->bbk9588_irq_ip2_level ? (1u << (2 + CP0Ca_IP)) : 0),
                  env->CP0_EPC);
+    qemu_fprintf(f, "    PRId 0x%08x\n", env->CP0_PRid);
     qemu_fprintf(f, "    Config0 0x%08x Config1 0x%08x LLAddr 0x%016"
                  PRIx64 "\n",
                  env->CP0_Config0, env->CP0_Config1, env->CP0_LLAddr);
@@ -185,6 +186,31 @@ static bool mips_cpu_has_work(CPUState *cs)
 #endif /* !CONFIG_USER_ONLY */
 
 #include "cpu-defs.c.inc"
+
+/*
+ * The JZ4740 is an XBurst generation-one core, but its architectural
+ * identity and cache/TLB geometry differ from QEMU's generic XBurstR1.
+ */
+static const mips_def_t jz4740_cpu_def = {
+    .name = "JZ4740",
+    .CP0_PRid = 0x0ad0024f,
+    .CP0_Config0 = MIPS_CONFIG0 | (MMU_TYPE_R4000 << CP0C0_MT),
+    .CP0_Config1 = MIPS_CONFIG1 | (31 << CP0C1_MMU) |
+                   (1 << CP0C1_IS) | (4 << CP0C1_IL) | (3 << CP0C1_IA) |
+                   (1 << CP0C1_DS) | (4 << CP0C1_DL) | (3 << CP0C1_DA) |
+                   (0 << CP0C1_CA),
+    .CP0_Config2 = MIPS_CONFIG2,
+    .CP0_Config3 = MIPS_CONFIG3,
+    .CP0_LLAddr_rw_bitmask = 0,
+    .CP0_LLAddr_shift = 4,
+    .SYNCI_Step = 32,
+    .CCRes = 2,
+    .CP0_Status_rw_bitmask = 0x1278FF17,
+    .SEGBITS = 32,
+    .PABITS = 32,
+    .insn_flags = CPU_MIPS32R1 | ASE_MXU,
+    .mmu_type = MMU_TYPE_R4000,
+};
 
 static void mips_cpu_reset_hold(Object *obj, ResetType type)
 {
@@ -668,6 +694,7 @@ static void mips_cpu_register_types(void)
     for (i = 0; i < mips_defs_number; i++) {
         mips_register_cpudef_type(&mips_defs[i]);
     }
+    mips_register_cpudef_type(&jz4740_cpu_def);
 }
 
 type_init(mips_cpu_register_types)

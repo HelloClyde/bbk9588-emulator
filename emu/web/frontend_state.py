@@ -27,6 +27,7 @@ from emu.qemu.nand_fs import (
 from emu.qemu.nand_lock import NandImageLease
 from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
+    DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
     DEFAULT_QEMU_NAND_IMAGE,
@@ -940,7 +941,7 @@ class FrontendState:
                 payload=getattr(self.args, "payload", None),
                 ram_mb=int(getattr(self.args, "ram_mb", 160)),
                 machine=getattr(self.args, "qemu_machine", DEFAULT_QEMU_MACHINE),
-                cpu=getattr(self.args, "qemu_cpu", "24Kf"),
+                cpu=getattr(self.args, "qemu_cpu", DEFAULT_QEMU_CPU),
                 accel=accel,
                 display="none",
                 serial="mon:stdio",

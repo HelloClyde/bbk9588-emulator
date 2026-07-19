@@ -25,6 +25,7 @@ from .ftl import normalize_c200_logical_tail_pages
 
 DEFAULT_QEMU_EXECUTABLE = "qemu-system-mipsel"
 DEFAULT_QEMU_MACHINE = "bbk9588"
+DEFAULT_QEMU_CPU = "JZ4740"
 DEFAULT_BBK9588_COMPAT_MACHINE_OPTIONS: tuple[str, ...] = ()
 REMOVED_BBK9588_MACHINE_OPTIONS: tuple[str, ...] = (
     "semaphore-fastpath",
@@ -567,7 +568,7 @@ class QemuSystemConfig:
 
     executable: str = DEFAULT_QEMU_EXECUTABLE
     machine: str = "malta"
-    cpu: str = "24Kf"
+    cpu: str = DEFAULT_QEMU_CPU
     ram_mb: int = 160
     accel: str = "tcg,thread=multi,tb-size=256"
     display: str = "none"
@@ -7789,7 +7790,7 @@ def build_bbk_qemu_config(
     load_addr: int | None = None,
     pc: int | None = None,
     machine: str = DEFAULT_QEMU_MACHINE,
-    cpu: str = "24Kf",
+    cpu: str = DEFAULT_QEMU_CPU,
     ram_mb: int = 160,
     accel: str = "tcg,thread=multi,tb-size=256",
     display: str = "none",
