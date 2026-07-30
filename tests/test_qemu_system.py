@@ -60,6 +60,8 @@ from emu.qemu.system import (
     QemuSystemConfig,
     _assign_windows_kill_on_close_job,
     _close_windows_job,
+    _decode_mips_memory_access,
+    _parse_register_sample,
     build_bbk_qemu_config,
     build_qemu_command,
     classify_guest_pc,
@@ -650,6 +652,40 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("PRId 0x0ad0024f", output)
         self.assertIn("Config0 0x80000082 Config1 0xbe63318a", output)
         self.assertIn("Config2 0x80000000 Config3 0x00000000", output)
+        self.assertIn("BadVAddr", output)
+        self.assertIn("EntryHi", output)
+
+    def test_register_sample_includes_tlb_fault_address(self) -> None:
+        sample = _parse_register_sample(
+            "\n".join(
+                (
+                    "pc=0x80004ab0",
+                    "CP0 Status  0x10000403 Cause   0x00808408 EPC    0x81c1eeec",
+                    "    BadVAddr 0x00000011 EntryHi 0x00000000",
+                )
+            ),
+            12.5,
+        )
+
+        self.assertEqual(sample["cp0_badvaddr"], "0x00000011")
+        self.assertEqual(sample["cp0"]["badvaddr"], "0x00000011")
+
+    def test_decode_mips_lbu_effective_address(self) -> None:
+        gprs = [0] * 32
+        gprs[4] = 0
+
+        access = _decode_mips_memory_access(0x90830011, gprs)
+
+        self.assertEqual(
+            access,
+            {
+                "mnemonic": "lbu",
+                "base_register": "a0",
+                "target_register": "v1",
+                "offset": 17,
+                "effective_address": "0x00000011",
+            },
+        )
 
     def test_bbk9588_bootrom_source_does_not_load_fat_kernel(self) -> None:
         source = (
@@ -3394,6 +3430,46 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(backend.stop_count, 1)
         state._request_guest_shutdown_locked.assert_called_once_with(timeout=0.02)
         self.assertIn("safe shutdown failed: timeout", fallback[1])  # type: ignore[index]
+
+    def test_frontend_stop_falls_back_after_guest_shutdown_failure(self) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.running = True
+                self.stop_count = 0
+
+            def snapshot(self, *, refresh: bool = False) -> dict[str, object]:
+                return {"running": self.running}
+
+            def stop(self) -> None:
+                self.stop_count += 1
+                self.running = False
+
+        backend = FakeBackend()
+        state = FrontendState.__new__(FrontendState)
+        state.nand_lifecycle_lock = threading.RLock()
+        state.lock = threading.RLock()
+        state.qemu_backend = backend
+        state._request_guest_shutdown_locked = mock.Mock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("safe shutdown failed: timeout")
+        )
+        state.cancel_run = threading.Event()
+        state.qemu_worker = None
+        state.running = True
+        state.job_finished_at = None
+        state.safe_shutdown_state = "failed"
+        state.safe_shutdown_finished_at = None
+        state.safe_shutdown_error = None
+        state.lifecycle_notice = None
+        state._publish_snapshot_locked = lambda: None  # type: ignore[method-assign]
+        state.snapshot = mock.Mock(return_value={"running": False})  # type: ignore[method-assign]
+
+        result = state.stop()
+
+        self.assertEqual(result, {"running": False})
+        self.assertEqual(backend.stop_count, 1)
+        self.assertEqual(state.safe_shutdown_state, "host-fallback")
+        self.assertIn("QEMU 正常停止", state.lifecycle_notice or "")
+        self.assertIn("safe shutdown failed: timeout", state.safe_shutdown_error or "")
 
     def test_frontend_force_stop_command_uses_explicit_force_path(self) -> None:
         state = FrontendState.__new__(FrontendState)

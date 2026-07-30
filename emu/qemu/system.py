@@ -61,6 +61,41 @@ DEFAULT_QEMU_DMAC_TRACE = DEFAULT_QEMU_DIAG_BASE + 0x0300
 QEMU_DMAC_TRACE_MAGIC = 0x444D4B42
 DEFAULT_QEMU_SURFACE_TRACE = DEFAULT_QEMU_DIAG_BASE + 0x0500
 QEMU_SURFACE_TRACE_MAGIC = 0x53555246
+BBK_C200_EXCEPTION_GPR_FRAME = 0x8033AE50
+MIPS_GPR_NAMES = (
+    "zero",
+    "at",
+    "v0",
+    "v1",
+    "a0",
+    "a1",
+    "a2",
+    "a3",
+    "t0",
+    "t1",
+    "t2",
+    "t3",
+    "t4",
+    "t5",
+    "t6",
+    "t7",
+    "s0",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "s5",
+    "s6",
+    "s7",
+    "t8",
+    "t9",
+    "k0",
+    "k1",
+    "gp",
+    "sp",
+    "fp",
+    "ra",
+)
 DEFAULT_QEMU_NAND_IMAGE = Path("runtime") / "bbk9588_nand.bin"
 DEFAULT_QEMU_NAND_IMAGE_CANDIDATES = (
     DEFAULT_QEMU_NAND_IMAGE,
@@ -1752,6 +1787,97 @@ class QemuProcessBackend:
         payload = _gdb_packet(self.gdb_sock, f"P{int(regno):x}={self._gdb_u32_to_hex(value)}")
         if payload != "OK":
             raise IOError(f"GDB register write failed: {payload}")
+
+    def exception_context_snapshot(self) -> dict[str, object]:
+        """Capture the original GPR frame while C200 reports an exception."""
+
+        self.refresh()
+        with self._lock:
+            sample = self.register_sample
+            if not isinstance(sample, dict):
+                return {"captured": False, "reason": "register sample is unavailable"}
+            classification = classify_guest_pc(sample.get("pc"))
+            if classification.get("region") != "c200-exception-report-tcu-restore":
+                return {
+                    "captured": False,
+                    "reason": "guest is not in the C200 exception report path",
+                }
+
+            cp0 = sample.get("cp0") if isinstance(sample.get("cp0"), dict) else {}
+            epc_text = sample.get("cp0_epc") or cp0.get("epc")
+            if not isinstance(epc_text, str):
+                return {"captured": False, "reason": "CP0 EPC is unavailable"}
+            epc = int(epc_text, 16) & 0xFFFFFFFF
+            badvaddr_text = sample.get("cp0_badvaddr") or cp0.get("badvaddr")
+            badvaddr = (
+                int(badvaddr_text, 16) & 0xFFFFFFFF
+                if isinstance(badvaddr_text, str)
+                else None
+            )
+
+            frame_data: bytes
+            instruction_data: bytes
+            source = "hmp-physical-memory"
+            try:
+                if self.gdb_sock is not None:
+                    source = "gdb-registers+hmp-physical-memory"
+                    self._pause_for_gdb_locked()
+                    try:
+                        badvaddr = self._read_register_paused_locked(35) & 0xFFFFFFFF
+                        cause = self._read_register_paused_locked(36) & 0xFFFFFFFF
+                        pc = self._read_register_paused_locked(37) & 0xFFFFFFFF
+                        self.gdb_register_read_count += 3
+                        frame_data = self.read_physical_memory(
+                            BBK_C200_EXCEPTION_GPR_FRAME & 0x1FFFFFFF,
+                            32 * 4,
+                        )
+                        if not self._is_guest_ram_va(epc, 4):
+                            raise ValueError(f"EPC is outside guest RAM: 0x{epc:08x}")
+                        instruction_data = self.read_physical_memory(epc & 0x1FFFFFFF, 4)
+                    finally:
+                        self._resume_after_gdb_locked()
+                else:
+                    cause_text = sample.get("cp0_cause") or cp0.get("cause")
+                    cause = int(cause_text, 16) & 0xFFFFFFFF
+                    pc = int(str(sample.get("pc")), 16) & 0xFFFFFFFF
+                    frame_data = self.read_physical_memory(
+                        BBK_C200_EXCEPTION_GPR_FRAME & 0x1FFFFFFF,
+                        32 * 4,
+                    )
+                    if not self._is_guest_ram_va(epc, 4):
+                        raise ValueError(f"EPC is outside guest RAM: 0x{epc:08x}")
+                    instruction_data = self.read_physical_memory(epc & 0x1FFFFFFF, 4)
+            except Exception as exc:
+                return {
+                    "captured": False,
+                    "source": source,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
+        gpr_values = struct.unpack("<32I", frame_data)
+        gprs = {
+            name: f"0x{value:08x}"
+            for name, value in zip(MIPS_GPR_NAMES, gpr_values, strict=True)
+        }
+        instruction = struct.unpack("<I", instruction_data)[0]
+        access = _decode_mips_memory_access(instruction, gpr_values)
+        out: dict[str, object] = {
+            "captured": True,
+            "source": source,
+            "frame_address": f"0x{BBK_C200_EXCEPTION_GPR_FRAME:08x}",
+            "pc": f"0x{pc:08x}",
+            "epc": f"0x{epc:08x}",
+            "cause": f"0x{cause:08x}",
+            "badvaddr": None if badvaddr is None else f"0x{badvaddr:08x}",
+            "instruction": f"0x{instruction:08x}",
+            "gprs": gprs,
+            "memory_access": access,
+        }
+        if access is not None and badvaddr is not None:
+            out["badvaddr_matches_effective_address"] = (
+                access["effective_address"] == f"0x{badvaddr:08x}"
+            )
+        return out
 
     def _step_paused_locked(self) -> str:
         if self.gdb_sock is None:
@@ -4547,11 +4673,13 @@ class QemuProcessBackend:
                 out["tcu_regs_b0002000"] = tcu_words
                 try:
                     cp0_status = self._read_register_paused_locked(32)
-                    cp0_cause = self._read_register_paused_locked(33)
+                    cp0_badvaddr = self._read_register_paused_locked(35)
+                    cp0_cause = self._read_register_paused_locked(36)
                     pc = self._read_register_paused_locked(37)
-                    self.gdb_register_read_count += 3
+                    self.gdb_register_read_count += 4
                     out["cp0"] = {
                         "status": f"0x{cp0_status & 0xFFFFFFFF:08x}",
+                        "badvaddr": f"0x{cp0_badvaddr & 0xFFFFFFFF:08x}",
                         "cause": f"0x{cp0_cause & 0xFFFFFFFF:08x}",
                         "pc": f"0x{pc & 0xFFFFFFFF:08x}",
                     }
@@ -8321,6 +8449,45 @@ def _parse_register_sample(raw: str, sample_at_seconds: float) -> dict[str, obje
         if isinstance(sample.get("cp0"), dict):
             sample["cp0"]["badvaddr"] = f"0x{badvaddr:08x}"
     return sample
+
+
+def _decode_mips_memory_access(
+    instruction: int,
+    gprs: tuple[int, ...] | list[int],
+) -> dict[str, object] | None:
+    memory_opcodes = {
+        0x20: "lb",
+        0x21: "lh",
+        0x22: "lwl",
+        0x23: "lw",
+        0x24: "lbu",
+        0x25: "lhu",
+        0x26: "lwr",
+        0x28: "sb",
+        0x29: "sh",
+        0x2A: "swl",
+        0x2B: "sw",
+        0x2E: "swr",
+        0x30: "ll",
+        0x38: "sc",
+    }
+    opcode = (instruction >> 26) & 0x3F
+    mnemonic = memory_opcodes.get(opcode)
+    if mnemonic is None or len(gprs) < 32:
+        return None
+    base = (instruction >> 21) & 0x1F
+    target = (instruction >> 16) & 0x1F
+    offset = instruction & 0xFFFF
+    if offset & 0x8000:
+        offset -= 0x10000
+    effective_address = (int(gprs[base]) + offset) & 0xFFFFFFFF
+    return {
+        "mnemonic": mnemonic,
+        "base_register": MIPS_GPR_NAMES[base],
+        "target_register": MIPS_GPR_NAMES[target],
+        "offset": offset,
+        "effective_address": f"0x{effective_address:08x}",
+    }
 
 
 def decode_cp0(*, status: int, cause: int, epc: int) -> dict[str, object]:

@@ -889,6 +889,17 @@ class FrontendState:
             )
         return None
 
+    def _record_host_shutdown_fallback(
+        self,
+        notice: str,
+        error: str,
+    ) -> None:
+        with self.lock:
+            self.safe_shutdown_state = "host-fallback"
+            self.safe_shutdown_finished_at = time.time()
+            self.safe_shutdown_error = error
+            self.lifecycle_notice = notice
+
     def _reset_nand_locked(self) -> dict[str, object]:
         old_backend = self.qemu_backend
         restart_fallback: tuple[str, str] | None = None
@@ -919,10 +930,7 @@ class FrontendState:
             self.cancel_run.clear()
             self._reset_runtime_fields_locked()
             if restart_fallback is not None:
-                self.safe_shutdown_state = "host-fallback"
-                self.safe_shutdown_finished_at = time.time()
-                self.safe_shutdown_error = restart_fallback[1]
-                self.lifecycle_notice = restart_fallback[0]
+                self._record_host_shutdown_fallback(*restart_fallback)
             extra_args = tuple(getattr(self.args, "qemu_extra_arg", []) or ())
             accel, extra_args = web_qemu_timing_options(
                 getattr(self.args, "qemu_accel", "tcg,thread=multi,tb-size=256"),
@@ -1468,8 +1476,16 @@ class FrontendState:
     def stop(self) -> dict[str, object]:
         with self.nand_lifecycle_lock:
             backend = self.qemu_backend
+            fallback: tuple[str, str] | None = None
             if backend is not None and self._backend_snapshot(backend, refresh=False).get("running"):
-                self._request_guest_shutdown_locked()
+                try:
+                    self._request_guest_shutdown_locked()
+                except RuntimeError as exc:
+                    backend.stop()
+                    fallback = (
+                        "固件未完成关机，已由 QEMU 正常停止并刷新 NAND。",
+                        str(exc),
+                    )
             self.cancel_run.set()
             if (
                 self.qemu_worker is not None
@@ -1480,6 +1496,8 @@ class FrontendState:
             with self.lock:
                 self.running = False
                 self.job_finished_at = time.time()
+                if fallback is not None:
+                    self._record_host_shutdown_fallback(*fallback)
                 self._publish_snapshot_locked()
                 return self.snapshot()
 
@@ -2204,6 +2222,8 @@ class FrontendState:
         if detail in {"full", "traces"}:
             snapshot["detail"] = detail
             if backend is not None:
+                if qemu_pc_region == "c200-exception-report-tcu-restore":
+                    snapshot["exception_context"] = backend.exception_context_snapshot()
                 snapshot["event_queue"] = backend.guest_queue_snapshot(0x80473F6C)
                 snapshot["display_event_queue"] = backend.guest_display_queue_snapshot(0x80825840)
                 snapshot["guest_gui_state"] = backend.guest_gui_state_snapshot()

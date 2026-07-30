@@ -106,6 +106,9 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->CP0_Cause |
                  (env->bbk9588_irq_ip2_level ? (1u << (2 + CP0Ca_IP)) : 0),
                  env->CP0_EPC);
+    qemu_fprintf(f, "    BadVAddr 0x" TARGET_FMT_lx
+                 " EntryHi 0x" TARGET_FMT_lx "\n",
+                 env->CP0_BadVAddr, env->CP0_EntryHi);
     qemu_fprintf(f, "    PRId 0x%08x\n", env->CP0_PRid);
     qemu_fprintf(f, "    Config0 0x%08x Config1 0x%08x LLAddr 0x%016"
                  PRIx64 "\n",
