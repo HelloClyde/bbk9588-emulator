@@ -296,6 +296,7 @@ HTML = r"""<!doctype html>
       <div class="settings-tabs" role="tablist" aria-label="设置分类">
         <button id="keymapSettingsTab" class="settings-tab active" role="tab" aria-selected="true" aria-controls="keymapSettingsPane">按键映射</button>
         <button id="touchSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="touchSettingsPane">触摸</button>
+        <button id="performanceSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="performanceSettingsPane">性能</button>
         <button id="powerSettingsTab" class="settings-tab" role="tab" aria-selected="false" aria-controls="powerSettingsPane">电源</button>
       </div>
       <div class="settings-dialog-body">
@@ -317,6 +318,9 @@ HTML = r"""<!doctype html>
         <section id="touchSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="touchSettingsTab" hidden>
           <label class="check"><input id="frontendInputCalibration" type="checkbox">前端输入校准</label>
         </section>
+        <section id="performanceSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="performanceSettingsTab" hidden>
+          <div class="setting-row"><span>性能优先模式</span><label class="check"><input id="performancePriority" type="checkbox" checked>已开启</label></div>
+        </section>
         <section id="powerSettingsPane" class="settings-pane" role="tabpanel" aria-labelledby="powerSettingsTab" hidden>
           <div class="setting-row"><span>USB 供电</span><label class="check"><input id="usbPowerConnected" type="checkbox" checked>已连接</label></div>
         </section>
@@ -329,6 +333,7 @@ const screenCtx = screen.getContext('2d', { alpha: false });
 screenCtx.imageSmoothingEnabled = false;
 const statusEl = document.getElementById('status');
 const frontendInputCalibrationEl = document.getElementById('frontendInputCalibration');
+const performancePriorityEl = document.getElementById('performancePriority');
 const usbPowerConnectedEl = document.getElementById('usbPowerConnected');
 const imageStatusEl = document.getElementById('imageStatus');
 const openSettingsEl = document.getElementById('openSettings');
@@ -336,9 +341,11 @@ const settingsDialogEl = document.getElementById('settingsDialog');
 const closeSettingsEl = document.getElementById('closeSettings');
 const keymapSettingsTabEl = document.getElementById('keymapSettingsTab');
 const touchSettingsTabEl = document.getElementById('touchSettingsTab');
+const performanceSettingsTabEl = document.getElementById('performanceSettingsTab');
 const powerSettingsTabEl = document.getElementById('powerSettingsTab');
 const keymapSettingsPaneEl = document.getElementById('keymapSettingsPane');
 const touchSettingsPaneEl = document.getElementById('touchSettingsPane');
+const performanceSettingsPaneEl = document.getElementById('performanceSettingsPane');
 const powerSettingsPaneEl = document.getElementById('powerSettingsPane');
 const rotateLeftEl = document.getElementById('rotateLeft');
 const rotateRightEl = document.getElementById('rotateRight');
@@ -669,6 +676,15 @@ function formatGuestIps(perf) {
   if (ips >= 1000) return `${(ips / 1000).toFixed(1)} Kips`;
   return `${ips.toFixed(0)} ips`;
 }
+function formatPerformancePriority(s) {
+  const detail = s.qemu?.performance_priority || {};
+  if (!s.performance_priority) return 'off';
+  if (detail.supported === false) return 'on (system)';
+  const cpuSets = detail.cpu_sets_applied ? ` P ${detail.cpu_set_count}/${detail.cpu_set_total}` : '';
+  const errors = Array.isArray(detail.errors) ? detail.errors : [];
+  if (errors.length) return `partial${cpuSets}`;
+  return `${detail.priority_class || 'starting'}${cpuSets}`;
+}
 function formatCounter(value) {
   const count = Number(value || 0);
   if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
@@ -725,18 +741,22 @@ function setSidebarTab(tab) {
   if (filesActive) loadNandFiles(currentNandDirectory).catch(showFileManagerError);
 }
 function setSettingsTab(tab) {
-  currentSettingsTab = ['keymap', 'touch', 'power'].includes(tab) ? tab : 'keymap';
+  currentSettingsTab = ['keymap', 'touch', 'performance', 'power'].includes(tab) ? tab : 'keymap';
   const touchActive = currentSettingsTab === 'touch';
   const keymapActive = currentSettingsTab === 'keymap';
+  const performanceActive = currentSettingsTab === 'performance';
   const powerActive = currentSettingsTab === 'power';
   keymapSettingsTabEl.classList.toggle('active', keymapActive);
   touchSettingsTabEl.classList.toggle('active', touchActive);
+  performanceSettingsTabEl.classList.toggle('active', performanceActive);
   powerSettingsTabEl.classList.toggle('active', powerActive);
   keymapSettingsTabEl.setAttribute('aria-selected', String(keymapActive));
   touchSettingsTabEl.setAttribute('aria-selected', String(touchActive));
+  performanceSettingsTabEl.setAttribute('aria-selected', String(performanceActive));
   powerSettingsTabEl.setAttribute('aria-selected', String(powerActive));
   keymapSettingsPaneEl.hidden = !keymapActive;
   touchSettingsPaneEl.hidden = !touchActive;
+  performanceSettingsPaneEl.hidden = !performanceActive;
   powerSettingsPaneEl.hidden = !powerActive;
   if (!keymapActive && bindingCaptureCode !== null) {
     bindingCaptureCode = null;
@@ -990,6 +1010,7 @@ function requestRotation(delta) {
 function renderStatus(s) {
   applyFrontendOrientation(s.orientation || currentOrientation);
   frontendInputCalibrationEl.checked = Boolean(s.frontend_input_calibration);
+  performancePriorityEl.checked = s.performance_priority !== false;
   usbPowerConnectedEl.checked = Boolean(s.usb_power_connected);
   imageStatusEl.textContent = basename(s.nand_image) || 'bbk9588_nand.bin';
   const qemuPerf = s.qemu?.performance || {};
@@ -1007,6 +1028,7 @@ function renderStatus(s) {
     ['png fps', formatRate(frontendPerf.screen_png_fps, 'fps')],
     ['qemu cpu', formatPercent(firstNumber(qemuPerf.qemu_cpu_one_core_percent, qemuPerf.qemu_cpu_host_percent))],
     ['guest ips', formatGuestIps(qemuPerf)],
+    ['host perf', formatPerformancePriority(s)],
     ['audio', formatAudioMode(qemuAudio)],
     ['web audio', formatWebAudio(audioTransport)],
     ['audio fifo', `tx ${qemuAudio.tx_fifo_level ?? 0} / rx ${qemuAudio.rx_fifo_level ?? 0}`],
@@ -1562,6 +1584,9 @@ saveFeedbackEl.onclick = saveFeedbackBundle;
 frontendInputCalibrationEl.onchange = () => {
   wsSend({op:'frontend-input-calibration', enabled:frontendInputCalibrationEl.checked});
 };
+performancePriorityEl.onchange = () => {
+  wsSend({op:'set-performance-priority', enabled:performancePriorityEl.checked});
+};
 usbPowerConnectedEl.onchange = () => {
   wsSend({op:'set-usb-power', connected:usbPowerConnectedEl.checked});
 };
@@ -1569,6 +1594,7 @@ openSettingsEl.onclick = openSettingsDialog;
 closeSettingsEl.onclick = closeSettingsDialog;
 keymapSettingsTabEl.onclick = () => setSettingsTab('keymap');
 touchSettingsTabEl.onclick = () => setSettingsTab('touch');
+performanceSettingsTabEl.onclick = () => setSettingsTab('performance');
 powerSettingsTabEl.onclick = () => setSettingsTab('power');
 settingsDialogEl.addEventListener('cancel', ev => {
   ev.preventDefault();
@@ -2301,6 +2327,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--qemu-machine", default=DEFAULT_QEMU_MACHINE, help="QEMU machine.")
     ap.add_argument("--qemu-cpu", default=DEFAULT_QEMU_CPU, help="QEMU CPU model.")
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256", help="QEMU accelerator options.")
+    ap.add_argument(
+        "--performance-priority",
+        dest="performance_priority",
+        action="store_true",
+        default=True,
+        help="Prioritize QEMU latency and single-thread performance on Windows.",
+    )
+    ap.add_argument(
+        "--no-performance-priority",
+        dest="performance_priority",
+        action="store_false",
+        help="Use the operating system's default QEMU scheduling policy.",
+    )
     ap.add_argument(
         "--qemu-icount",
         default=DEFAULT_WEB_QEMU_ICOUNT,

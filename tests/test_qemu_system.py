@@ -60,8 +60,11 @@ from emu.qemu.system import (
     QemuSystemConfig,
     _assign_windows_kill_on_close_job,
     _close_windows_job,
+    _configure_windows_performance_priority,
     _decode_mips_memory_access,
     _parse_register_sample,
+    _parse_windows_cpu_set_buffer,
+    _select_windows_performance_cpu_sets,
     build_bbk_qemu_config,
     build_qemu_command,
     classify_guest_pc,
@@ -3047,16 +3050,20 @@ class QemuSystemCommandTests(unittest.TestCase):
                 nand_image=nand,
             )
             backend = QemuProcessBackend(config)
-            with mock.patch.object(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000, create=True):
+            with mock.patch.object(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0x8000, create=True):
                 with mock.patch.object(subprocess, "Popen", side_effect=fake_popen):
-                    backend.start()
-                    backend.stop()
+                    with mock.patch(
+                        "emu.qemu.system._configure_windows_performance_priority",
+                        return_value={"requested": True, "applied": True},
+                    ):
+                        backend.start()
+                        backend.stop()
             nand_survived = nand.exists()
 
         kwargs = calls.get("kwargs")
         self.assertIsInstance(kwargs, dict)
         assert isinstance(kwargs, dict)
-        self.assertEqual(kwargs.get("creationflags"), 0x4000)
+        self.assertEqual(kwargs.get("creationflags"), 0x8000)
         popen_args = calls.get("args")
         self.assertIsInstance(popen_args, tuple)
         assert isinstance(popen_args, tuple)
@@ -3065,6 +3072,63 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("qemu_nand_runs", " ".join(command))
         self.assertIn("-S", command)
         self.assertTrue(nand_survived)
+
+    def test_windows_performance_cpu_sets_choose_highest_class(self) -> None:
+        def cpu_set(cpu_set_id: int, efficiency: int, flags: int = 0) -> bytes:
+            return struct.pack(
+                "<IIIH6BIQ",
+                32,
+                0,
+                cpu_set_id,
+                0,
+                cpu_set_id,
+                cpu_set_id,
+                0,
+                0,
+                efficiency,
+                flags,
+                0,
+                0,
+            )
+
+        raw = b"".join(
+            (
+                cpu_set(0, 0),
+                cpu_set(1, 1),
+                cpu_set(2, 1),
+                cpu_set(3, 1, 0x02),
+            )
+        )
+        records = _parse_windows_cpu_set_buffer(raw)
+        selected, efficiency, reason = _select_windows_performance_cpu_sets(records)
+
+        self.assertEqual(len(records), 4)
+        self.assertEqual(selected, [1, 2])
+        self.assertEqual(efficiency, 1)
+        self.assertEqual(reason, "highest-efficiency-class")
+
+        homogeneous = [dict(record, efficiency_class=0) for record in records]
+        self.assertEqual(
+            _select_windows_performance_cpu_sets(homogeneous),
+            ([], 0, "homogeneous-cpu"),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows scheduling API test")
+    def test_windows_performance_priority_applies_and_restores(self) -> None:
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            enabled = _configure_windows_performance_priority(proc, True)
+            self.assertTrue(enabled.get("priority_applied"), enabled)
+            self.assertTrue(enabled.get("power_throttling_applied"), enabled)
+            self.assertEqual(enabled.get("priority_class"), "above-normal")
+            disabled = _configure_windows_performance_priority(proc, False)
+            self.assertTrue(disabled.get("priority_applied"), disabled)
+            self.assertTrue(disabled.get("power_throttling_applied"), disabled)
+            self.assertEqual(disabled.get("priority_class"), "normal")
+            self.assertEqual(disabled.get("cpu_set_reason"), "assignment-cleared")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
     def test_qemu_process_backend_resumes_paused_debug_stub_with_stop_query(self) -> None:
         class FakeProcess:
@@ -7496,7 +7560,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="settingsDialog" class="settings-dialog"', frontend)
         self.assertIn('id="keymapSettingsTab"', frontend)
         self.assertIn('id="touchSettingsTab"', frontend)
+        self.assertIn('id="performanceSettingsTab"', frontend)
         self.assertIn('id="powerSettingsTab"', frontend)
+        self.assertIn('id="performancePriority" type="checkbox" checked', frontend)
         self.assertIn('id="usbPowerConnected" type="checkbox" checked', frontend)
         self.assertIn('id="keymapSettingsPane" class="settings-pane keymap-panel"', frontend)
         self.assertIn("if (settingsDialogEl.open) return;", frontend)
@@ -7557,6 +7623,12 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("setOperationStatus(status.lifecycle_notice || '')", frontend)
         self.assertIn("runLifecycleCommand('force-stop', '正在强制停止')", frontend)
         self.assertIn("wsSend({op:'set-usb-power', connected:usbPowerConnectedEl.checked})", frontend)
+        self.assertIn(
+            "wsSend({op:'set-performance-priority', enabled:performancePriorityEl.checked})",
+            frontend,
+        )
+        self.assertIn("['host perf', formatPerformancePriority(s)]", frontend)
+        self.assertIn('"--no-performance-priority"', frontend)
         self.assertIn("强制停止可能中断 NAND 写入并损坏文件系统", frontend)
         self.assertNotIn("wsSend({op:'stop'})", frontend)
         self.assertIn('id="screenWrap" class="screen-wrap"', frontend)
@@ -7721,6 +7793,33 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertEqual(display_to_touch_point(0, 0, 240, 320, "raw"), (239, 319))
         self.assertEqual(display_to_touch_point(0, 0, 320, 240, "cw90"), (239, 0))
         self.assertEqual(display_to_touch_point(0, 0, 320, 240, "ccw90"), (0, 319))
+
+    def test_frontend_performance_priority_command_updates_running_qemu(self) -> None:
+        backend = mock.Mock()
+        backend.set_performance_priority.return_value = {
+            "requested": False,
+            "applied": True,
+            "priority_class": "normal",
+        }
+        state = FrontendState.__new__(FrontendState)
+        state.args = argparse.Namespace(performance_priority=True)
+        state.lock = threading.RLock()
+        state.qemu_backend = backend
+        state._publish_snapshot_locked = lambda: None  # type: ignore[method-assign]
+        state.snapshot = lambda: {  # type: ignore[method-assign]
+            "performance_priority": state.args.performance_priority
+        }
+
+        result = state.command(
+            {"op": "set-performance-priority", "enabled": False}
+        )
+
+        backend.set_performance_priority.assert_called_once_with(False)
+        self.assertFalse(result.get("performance_priority"), result)
+        performance_result = result.get("performance_priority_result")
+        self.assertIsInstance(performance_result, dict)
+        assert isinstance(performance_result, dict)
+        self.assertEqual(performance_result.get("priority_class"), "normal")
 
     def test_frontend_qemu_storage_service_error_uses_legacy_hook_terms(self) -> None:
         state = self._frontend_state_without_qemu(

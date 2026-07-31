@@ -206,6 +206,214 @@ def _close_windows_job(handle: object | None) -> None:
     kernel32.CloseHandle(handle)
 
 
+def _parse_windows_cpu_set_buffer(data: bytes) -> list[dict[str, int]]:
+    """Decode the variable-sized SYSTEM_CPU_SET_INFORMATION records."""
+
+    records: list[dict[str, int]] = []
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < 8:
+            raise ValueError("truncated SYSTEM_CPU_SET_INFORMATION header")
+        size, info_type = struct.unpack_from("<II", data, offset)
+        if size < 8 or offset + size > len(data):
+            raise ValueError(f"invalid SYSTEM_CPU_SET_INFORMATION size {size}")
+        if info_type == 0 and size >= 20:
+            (
+                cpu_set_id,
+                group,
+                logical_processor,
+                core,
+                last_level_cache,
+                numa_node,
+                efficiency_class,
+                flags,
+            ) = struct.unpack_from("<IH6B", data, offset + 8)
+            records.append(
+                {
+                    "id": cpu_set_id,
+                    "group": group,
+                    "logical_processor": logical_processor,
+                    "core": core,
+                    "last_level_cache": last_level_cache,
+                    "numa_node": numa_node,
+                    "efficiency_class": efficiency_class,
+                    "flags": flags,
+                }
+            )
+        offset += size
+    return records
+
+
+def _select_windows_performance_cpu_sets(
+    records: list[dict[str, int]],
+) -> tuple[list[int], int | None, str]:
+    eligible = [
+        record
+        for record in records
+        if not (record.get("flags", 0) & 0x02)
+        or bool(record.get("flags", 0) & 0x04)
+    ]
+    if not eligible:
+        return [], None, "no-eligible-cpu-sets"
+    efficiency_classes = {record["efficiency_class"] for record in eligible}
+    highest_class = max(efficiency_classes)
+    if len(efficiency_classes) == 1:
+        return [], highest_class, "homogeneous-cpu"
+    selected = sorted(
+        record["id"]
+        for record in eligible
+        if record["efficiency_class"] == highest_class
+    )
+    return selected, highest_class, "highest-efficiency-class"
+
+
+def _configure_windows_performance_priority(
+    proc: subprocess.Popen[str],
+    enabled: bool,
+) -> dict[str, object]:
+    """Apply latency-oriented Windows scheduling policy to a QEMU process."""
+
+    status: dict[str, object] = {
+        "requested": bool(enabled),
+        "platform": "windows" if os.name == "nt" else os.name,
+        "supported": os.name == "nt",
+        "priority_class": "system-default",
+        "priority_applied": False,
+        "power_throttling": "system-managed",
+        "power_throttling_applied": False,
+        "cpu_sets_applied": False,
+        "cpu_set_ids": [],
+        "cpu_set_count": 0,
+        "cpu_set_total": 0,
+        "efficiency_class": None,
+        "cpu_set_reason": "non-windows" if os.name != "nt" else "not-queried",
+        "errors": [],
+    }
+    if os.name != "nt":
+        status["applied"] = False
+        return status
+    if not hasattr(proc, "_handle"):
+        status["errors"] = ["QEMU process handle is unavailable"]
+        status["applied"] = False
+        return status
+
+    import ctypes
+    from ctypes import wintypes
+
+    errors: list[str] = []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    process_handle = wintypes.HANDLE(proc._handle)
+
+    try:
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        priority_class = 0x00008000 if enabled else 0x00000020
+        if not kernel32.SetPriorityClass(process_handle, priority_class):
+            raise OSError(ctypes.get_last_error(), "SetPriorityClass failed")
+        status["priority_class"] = "above-normal" if enabled else "normal"
+        status["priority_applied"] = True
+    except Exception as exc:
+        errors.append(f"priority: {type(exc).__name__}: {exc}")
+
+    class ProcessPowerThrottlingState(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.DWORD),
+            ("ControlMask", wintypes.DWORD),
+            ("StateMask", wintypes.DWORD),
+        ]
+
+    try:
+        kernel32.SetProcessInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        power = ProcessPowerThrottlingState()
+        power.Version = 1
+        power.ControlMask = 0x1 if enabled else 0
+        power.StateMask = 0
+        if not kernel32.SetProcessInformation(
+            process_handle,
+            4,
+            ctypes.byref(power),
+            ctypes.sizeof(power),
+        ):
+            raise OSError(ctypes.get_last_error(), "SetProcessInformation failed")
+        status["power_throttling"] = "disabled" if enabled else "system-managed"
+        status["power_throttling_applied"] = True
+    except Exception as exc:
+        errors.append(f"power: {type(exc).__name__}: {exc}")
+
+    try:
+        kernel32.SetProcessDefaultCpuSets.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        kernel32.SetProcessDefaultCpuSets.restype = wintypes.BOOL
+        if not enabled:
+            if not kernel32.SetProcessDefaultCpuSets(process_handle, None, 0):
+                raise OSError(ctypes.get_last_error(), "SetProcessDefaultCpuSets failed")
+            status["cpu_set_reason"] = "assignment-cleared"
+        else:
+            kernel32.GetSystemCpuSetInformation.argtypes = [
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.HANDLE,
+                wintypes.DWORD,
+            ]
+            kernel32.GetSystemCpuSetInformation.restype = wintypes.BOOL
+            required = wintypes.DWORD()
+            kernel32.GetSystemCpuSetInformation(
+                None, 0, ctypes.byref(required), process_handle, 0
+            )
+            if required.value == 0:
+                raise OSError(
+                    ctypes.get_last_error(), "GetSystemCpuSetInformation size query failed"
+                )
+            buffer = (ctypes.c_ubyte * required.value)()
+            returned = wintypes.DWORD(required.value)
+            if not kernel32.GetSystemCpuSetInformation(
+                buffer,
+                required.value,
+                ctypes.byref(returned),
+                process_handle,
+                0,
+            ):
+                raise OSError(
+                    ctypes.get_last_error(), "GetSystemCpuSetInformation failed"
+                )
+            records = _parse_windows_cpu_set_buffer(bytes(buffer[: returned.value]))
+            selected, efficiency_class, reason = _select_windows_performance_cpu_sets(
+                records
+            )
+            status["cpu_set_total"] = len(records)
+            status["efficiency_class"] = efficiency_class
+            status["cpu_set_reason"] = reason
+            if selected:
+                cpu_set_ids = (wintypes.DWORD * len(selected))(*selected)
+                if not kernel32.SetProcessDefaultCpuSets(
+                    process_handle, cpu_set_ids, len(selected)
+                ):
+                    raise OSError(
+                        ctypes.get_last_error(), "SetProcessDefaultCpuSets failed"
+                    )
+                status["cpu_sets_applied"] = True
+                status["cpu_set_ids"] = selected
+                status["cpu_set_count"] = len(selected)
+    except Exception as exc:
+        errors.append(f"cpu-sets: {type(exc).__name__}: {exc}")
+
+    status["errors"] = errors
+    status["applied"] = bool(
+        status["priority_applied"] and status["power_throttling_applied"]
+    )
+    return status
+
+
 DEFAULT_QEMU_FIRMWARE_PATCHES = (
     "c200-lcd-ready",
     "c200-intc-no-pending",
@@ -624,6 +832,7 @@ class QemuSystemConfig:
     firmware_patches: tuple[str, ...] = DEFAULT_QEMU_FIRMWARE_PATCHES
     startup_power_key: bool = False
     startup_power_hold_seconds: float = 0.75
+    performance_priority: bool = True
 
 
 @dataclass(frozen=True)
@@ -747,6 +956,14 @@ class QemuProcessBackend:
         self._frame_reader_thread: threading.Thread | None = None
         self._process_job_handle: object | None = None
         self.last_process_job_error: str | None = None
+        self.performance_priority_status: dict[str, object] = {
+            "requested": bool(config.performance_priority),
+            "platform": "windows" if os.name == "nt" else os.name,
+            "supported": os.name == "nt",
+            "applied": False,
+            "cpu_set_reason": "pending",
+            "errors": [],
+        }
 
     def _bbk_machine_bool_option_enabled(self, name: str) -> bool:
         return self._bbk_machine_bool_option_value(name, False)
@@ -960,6 +1177,14 @@ class QemuProcessBackend:
             _close_windows_job(self._process_job_handle)
             self._process_job_handle = None
             self.last_process_job_error = None
+            self.performance_priority_status = {
+                "requested": bool(self.config.performance_priority),
+                "platform": "windows" if os.name == "nt" else os.name,
+                "supported": os.name == "nt",
+                "applied": False,
+                "cpu_set_reason": "pending",
+                "errors": [],
+            }
             self.proc = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
@@ -968,12 +1193,20 @@ class QemuProcessBackend:
                 encoding="utf-8",
                 errors="replace",
                 env=qemu_subprocess_env(self.command[0]),
-                creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                creationflags=(
+                    getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0)
+                    if self.config.performance_priority
+                    else getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0)
+                ),
             )
             (
                 self._process_job_handle,
                 self.last_process_job_error,
             ) = _assign_windows_kill_on_close_job(self.proc)
+            self.performance_priority_status = _configure_windows_performance_priority(
+                self.proc,
+                self.config.performance_priority,
+            )
             self._reader_threads = [
                 threading.Thread(target=self._reader, args=("stdout", self.proc.stdout), daemon=True),
                 threading.Thread(target=self._reader, args=("stderr", self.proc.stderr), daemon=True),
@@ -7645,6 +7878,7 @@ class QemuProcessBackend:
                 ),
                 "kill_with_parent": self._process_job_handle is not None,
                 "process_job_error": self.last_process_job_error,
+                "performance_priority": dict(self.performance_priority_status),
                 "hmp_port": self.hmp_port,
                 "qmp_port": self.qmp_port,
                 "qmp_last_event": self.qmp_last_event,
@@ -7700,6 +7934,26 @@ class QemuProcessBackend:
         }
         self._last_snapshot = dict(snapshot)
         return snapshot
+
+    def set_performance_priority(self, enabled: bool) -> dict[str, object]:
+        with self._lock:
+            enabled = bool(enabled)
+            self.config = replace(self.config, performance_priority=enabled)
+            if self.proc is None or self.proc.poll() is not None:
+                self.performance_priority_status = {
+                    "requested": enabled,
+                    "platform": "windows" if os.name == "nt" else os.name,
+                    "supported": os.name == "nt",
+                    "applied": False,
+                    "cpu_set_reason": "pending-next-start",
+                    "errors": [],
+                }
+            else:
+                self.performance_priority_status = _configure_windows_performance_priority(
+                    self.proc,
+                    enabled,
+                )
+            return dict(self.performance_priority_status)
 
     def snapshot(self, *, refresh: bool = True) -> dict[str, object]:
         if refresh:
@@ -7935,6 +8189,7 @@ def build_bbk_qemu_config(
     hibernate_wakeup: bool = False,
     startup_power_key: bool = False,
     startup_power_hold_seconds: float = 0.75,
+    performance_priority: bool = True,
 ) -> QemuSystemConfig:
     firmware_patches = normalize_firmware_patches(
         firmware_patches,
@@ -8019,6 +8274,7 @@ def build_bbk_qemu_config(
         firmware_patches=firmware_patches,
         startup_power_key=bool(startup_power_key),
         startup_power_hold_seconds=max(0.0, float(startup_power_hold_seconds)),
+        performance_priority=bool(performance_priority),
     )
 
 

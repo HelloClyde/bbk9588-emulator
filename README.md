@@ -134,6 +134,10 @@ python -m emu.web.frontend `
   --qemu E:\qemu-src\build-bbk9588-win\qemu-system-mipsel.exe
 ```
 
+Windows 默认启用性能优先模式：QEMU 使用高于正常的进程优先级、关闭执行速度节流，
+并在混合架构处理器上优先使用性能核。可在 Web 的“设置 > 性能”中实时切换，或用
+`--no-performance-priority` 关闭。
+
 ## 发布
 
 `.github/workflows/release.yml` 会下载固定版本的上游 QEMU、安装 overlay、编译

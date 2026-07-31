@@ -961,6 +961,9 @@ class FrontendState:
                 bbk_machine_options=machine_options,
                 extra_args=extra_args,
                 firmware_patches=getattr(self.args, "qemu_firmware_patch", None),
+                performance_priority=bool(
+                    getattr(self.args, "performance_priority", True)
+                ),
             )
             self.qemu_backend = QemuProcessBackend(config)
             self.qemu_backend.set_frame_ready_callback(self._on_qemu_frame_ready)
@@ -1734,6 +1737,26 @@ class FrontendState:
             snapshot["usb_power_result"] = result
             return snapshot
 
+    def set_performance_priority(self, enabled: bool) -> dict[str, object]:
+        with self.lock:
+            enabled = bool(enabled)
+            self.args.performance_priority = enabled
+            backend = self.qemu_backend
+            result = (
+                {
+                    "requested": enabled,
+                    "applied": False,
+                    "cpu_set_reason": "pending-next-start",
+                    "errors": [],
+                }
+                if backend is None
+                else backend.set_performance_priority(enabled)
+            )
+            self._publish_snapshot_locked()
+            snapshot = self.snapshot()
+            snapshot["performance_priority_result"] = result
+            return snapshot
+
     def set_orientation(self, orientation: object) -> dict[str, object]:
         value = str(orientation or "").strip().lower()
         if value not in FRONTEND_ORIENTATIONS:
@@ -1798,6 +1821,16 @@ class FrontendState:
             if connected is None:
                 return {"error": "connected must be a boolean"}
             return self.set_usb_power_connected(connected)
+        if op in {
+            "performance-priority",
+            "performance_priority",
+            "set-performance-priority",
+            "set_performance_priority",
+        }:
+            enabled = self._coerce_optional_bool(msg.get("enabled"))
+            if enabled is None:
+                return {"error": "enabled must be a boolean"}
+            return self.set_performance_priority(enabled)
         if op in {"set-nand-image", "set_nand_image", "select-nand-image", "select_nand_image"}:
             reset = self._coerce_optional_bool(msg.get("reset"))
             return self.set_nand_image(msg.get("path") or msg.get("image"), reset=reset is not False)
@@ -2132,6 +2165,9 @@ class FrontendState:
                 "reason": "Legacy Python/GDB hooks are disabled; default bbk9588 behavior is modeled in QEMU.",
             },
             "frontend_input_calibration": self._frontend_input_calibration_enabled(),
+            "performance_priority": bool(
+                getattr(self.args, "performance_priority", True)
+            ),
             "usb_power_connected": self.usb_power_connected,
             "frontend_input_calibration_stage": self.frontend_input_calibration_stage,
             "frontend_input_calibration_stage_label": FRONTEND_INPUT_CALIBRATION_STAGE_LABELS.get(

@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- Windows 新增默认开启、可实时切换的性能优先模式：修正 QEMU 长期以低于正常优先级
+  启动的问题，改用高于正常优先级和 HighQoS，并在混合架构 CPU 上自动选择性能核；
+  Web 状态和反馈包会记录实际应用结果，可用 `--no-performance-priority` 关闭。
 - 新增基于 XBurstR1 的专用 `JZ4740` CPU 型号，修正 PRId、MIPS32 R1/MXU 能力、
   32 项 TLB、16 KiB I/D cache 和 CP0 Config；BBK 9588 的 CLI、Web 与测试默认值不再
   使用 MIPS32 R2、带 FPU 的 `24Kf`。

@@ -98,6 +98,10 @@ powershell -ExecutionPolicy Bypass -File .\start-web.ps1 -Port 8010 --orientatio
 前端输入校准 helper 默认关闭；它只用于 Web smoke test。需要复现实验校准流程时，
 可追加 `--frontend-input-calibration`。
 
+Windows 默认启用性能优先模式，可在 Web 的“设置 > 性能”中实时切换。该模式会提高
+QEMU 进程优先级、关闭执行速度节流，并在混合架构处理器上优先使用性能核；启动时可
+追加 `--no-performance-priority` 关闭。
+
 ## 故障排查
 
 - 提示缺少 NAND 镜像：确认 `系统/数据/loader_9588_4740.bin`、`系统/数据/u_boot_9588_4740.bin`、`系统/数据/kj409588.bin` 和 `应用/` 已放在包根目录，或手动放入预构建 NAND。
