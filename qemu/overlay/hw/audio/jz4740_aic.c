@@ -124,6 +124,12 @@ struct JZ4740AICState {
     uint32_t i2sdiv;
     uint32_t cdccr1;
     uint32_t cdccr2;
+    bool external_codec;
+    uint32_t external_sample_rate;
+    uint8_t external_sample_bits;
+    bool external_muted;
+    uint8_t external_left_attenuation;
+    uint8_t external_right_attenuation;
 
     uint32_t tx_fifo[JZ4740_AIC_FIFO_DEPTH];
     uint32_t rx_fifo[JZ4740_AIC_FIFO_DEPTH];
@@ -163,6 +169,9 @@ struct JZ4740AICState {
     uint32_t stream_sample_rate;
 };
 
+static void jz4740_aic_set_voice_active(JZ4740AICState *s);
+static void jz4740_aic_open_voices(JZ4740AICState *s);
+
 static const uint32_t jz4740_codec_sample_rates[9] = {
     8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
 };
@@ -176,12 +185,18 @@ static unsigned jz4740_aic_sample_bits(uint32_t field)
 
 static unsigned jz4740_aic_output_bits(JZ4740AICState *s)
 {
+    if (s->external_codec && !(s->aicfr & AICFR_ICDC)) {
+        return s->external_sample_bits;
+    }
     return jz4740_aic_sample_bits((s->aiccr >> AICCR_OSS_SHIFT) &
                                   AICCR_SAMPLE_MASK);
 }
 
 static unsigned jz4740_aic_input_bits(JZ4740AICState *s)
 {
+    if (s->external_codec && !(s->aicfr & AICFR_ICDC)) {
+        return s->external_sample_bits;
+    }
     return jz4740_aic_sample_bits((s->aiccr >> AICCR_ISS_SHIFT) &
                                   AICCR_SAMPLE_MASK);
 }
@@ -190,6 +205,9 @@ static uint32_t jz4740_aic_sample_rate(JZ4740AICState *s)
 {
     uint32_t index = (s->cdccr2 >> CDCCR2_SMPR_SHIFT) & CDCCR2_SMPR_MASK;
 
+    if (s->external_codec && !(s->aicfr & AICFR_ICDC)) {
+        return s->external_sample_rate;
+    }
     return index < ARRAY_SIZE(jz4740_codec_sample_rates) ?
            jz4740_codec_sample_rates[index] : 48000;
 }
@@ -210,8 +228,24 @@ static bool jz4740_aic_codec_muted(JZ4740AICState *s)
 {
     uint32_t required = CDCCR1_SW2ON | CDCCR1_EDAC;
 
+    if (s->external_codec && !(s->aicfr & AICFR_ICDC)) {
+        return s->external_muted;
+    }
     return (s->cdccr1 & required) != required ||
            (s->cdccr1 & (CDCCR1_HPMUTE | CDCCR1_SUSPD | CDCCR1_RST));
+}
+
+static unsigned jz4740_aic_output_volume(JZ4740AICState *s,
+                                          unsigned channel)
+{
+    unsigned attenuation;
+
+    if (!s->external_codec || (s->aicfr & AICFR_ICDC)) {
+        return 128 + ((s->cdccr2 & CDCCR2_HPVOL_MASK) * 42);
+    }
+    attenuation = channel ? s->external_right_attenuation :
+                            s->external_left_attenuation;
+    return attenuation >= 127 ? 0 : MAX(1u, 255u - attenuation * 2u);
 }
 
 void jz4740_aic_get_diagnostics(JZ4740AICState *s,
@@ -467,7 +501,7 @@ size_t jz4740_aic_dma_read_rx(JZ4740AICState *s, uint8_t *buf,
 static int16_t jz4740_aic_to_s16(JZ4740AICState *s, uint32_t sample)
 {
     unsigned bits = jz4740_aic_output_bits(s);
-    uint32_t mask = (1u << bits) - 1u;
+    uint32_t mask = bits == 32 ? UINT32_MAX : (1u << bits) - 1u;
     uint32_t sign = 1u << (bits - 1u);
     int32_t value;
 
@@ -497,7 +531,7 @@ static uint32_t jz4740_aic_from_s16(JZ4740AICState *s, int16_t value)
     } else {
         sample = (uint32_t)((int32_t)value >> (16 - bits));
     }
-    sample &= (1u << bits) - 1u;
+    sample &= bits == 32 ? UINT32_MAX : (1u << bits) - 1u;
     if (s->aiccr & AICCR_ASVTSU) {
         sample ^= 1u << (bits - 1u);
     }
@@ -534,7 +568,8 @@ static void jz4740_aic_stream_output(JZ4740AICState *s,
 {
     uint32_t sample_rate = jz4740_aic_sample_rate(s);
     uint32_t target_frames = MAX(1u, sample_rate / JZ4740_AIC_STREAM_HZ);
-    unsigned volume = 128 + ((s->cdccr2 & CDCCR2_HPVOL_MASK) * 42);
+    unsigned left_volume = jz4740_aic_output_volume(s, 0);
+    unsigned right_volume = jz4740_aic_output_volume(s, 1);
     bool muted = jz4740_aic_codec_muted(s);
 
     if (!s->output_callback) {
@@ -549,8 +584,11 @@ static void jz4740_aic_stream_output(JZ4740AICState *s,
         uint32_t count = MIN(frames, available);
         int16_t *dest = &s->stream_samples[s->stream_frames * 2u];
 
-        for (uint32_t i = 0; i < count * 2u; i++) {
-            dest[i] = muted ? 0 : ((int32_t)samples[i] * volume) / 255;
+        for (uint32_t i = 0; i < count; i++) {
+            dest[i * 2] = muted ? 0 :
+                ((int32_t)samples[i * 2] * left_volume) / 255;
+            dest[i * 2 + 1] = muted ? 0 :
+                ((int32_t)samples[i * 2 + 1] * right_volume) / 255;
         }
         s->stream_frames += count;
         samples += count * 2u;
@@ -569,6 +607,48 @@ void jz4740_aic_set_output_callback(JZ4740AICState *s,
     jz4740_aic_flush_stream(s);
     s->output_callback = callback;
     s->output_callback_opaque = opaque;
+}
+
+void jz4740_aic_set_external_codec_config(JZ4740AICState *s,
+                                          uint32_t sample_rate,
+                                          uint8_t sample_bits,
+                                          bool muted,
+                                          uint8_t left_attenuation,
+                                          uint8_t right_attenuation)
+{
+    bool rate_changed;
+    bool bits_changed;
+
+    if (!s) {
+        return;
+    }
+    sample_rate = sample_rate ? sample_rate : 48000;
+    switch (sample_bits) {
+    case 16:
+    case 20:
+    case 24:
+    case 32:
+        break;
+    default:
+        sample_bits = 16;
+        break;
+    }
+    rate_changed = s->external_sample_rate != sample_rate;
+    bits_changed = s->external_sample_bits != sample_bits;
+    if (rate_changed || bits_changed) {
+        jz4740_aic_flush_stream(s);
+    }
+    s->external_sample_rate = sample_rate;
+    s->external_sample_bits = sample_bits;
+    s->external_muted = muted;
+    s->external_left_attenuation = MIN(left_attenuation, 127);
+    s->external_right_attenuation = MIN(right_attenuation, 127);
+    if (rate_changed) {
+        s->frame_fraction = 0;
+        jz4740_aic_open_voices(s);
+    } else {
+        jz4740_aic_set_voice_active(s);
+    }
 }
 
 static void jz4740_aic_out_cb(void *opaque, int free_bytes)
@@ -594,8 +674,8 @@ static void jz4740_aic_set_voice_active(JZ4740AICState *s)
         audio_be_set_active_out(s->audio_be, s->out_voice, playing);
         audio_be_set_volume_out_lr(
             s->audio_be, s->out_voice, jz4740_aic_codec_muted(s),
-            128 + ((s->cdccr2 & CDCCR2_HPVOL_MASK) * 42),
-            128 + ((s->cdccr2 & CDCCR2_HPVOL_MASK) * 42));
+            jz4740_aic_output_volume(s, 0),
+            jz4740_aic_output_volume(s, 1));
     }
     if (s->in_voice) {
         audio_be_set_active_in(s->audio_be, s->in_voice, recording);
@@ -943,6 +1023,11 @@ static void jz4740_aic_reset_hold(Object *obj, ResetType type)
     s->i2sdiv = I2SDIV_RESET;
     s->cdccr1 = CDCCR1_RESET;
     s->cdccr2 = CDCCR2_RESET;
+    s->external_sample_rate = 48000;
+    s->external_sample_bits = 16;
+    s->external_muted = true;
+    s->external_left_attenuation = 127;
+    s->external_right_attenuation = 127;
     s->tx_dma_samples = 0;
     s->rx_dma_samples = 0;
     s->output_frames = 0;
@@ -969,6 +1054,9 @@ static int jz4740_aic_post_load(void *opaque, int version_id)
 {
     JZ4740AICState *s = opaque;
 
+    if (version_id < 4) {
+        s->external_sample_bits = 16;
+    }
     s->last_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->timer_running = false;
     s->pending_output_frames = 0;
@@ -981,7 +1069,7 @@ static int jz4740_aic_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_jz4740_aic = {
     .name = TYPE_JZ4740_AIC,
-    .version_id = 2,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = jz4740_aic_post_load,
     .fields = (const VMStateField[]) {
@@ -1016,6 +1104,11 @@ static const VMStateDescription vmstate_jz4740_aic = {
         VMSTATE_UINT64_V(input_frames, JZ4740AICState, 2),
         VMSTATE_UINT64_V(underruns, JZ4740AICState, 2),
         VMSTATE_UINT64_V(overruns, JZ4740AICState, 2),
+        VMSTATE_UINT32_V(external_sample_rate, JZ4740AICState, 3),
+        VMSTATE_BOOL_V(external_muted, JZ4740AICState, 3),
+        VMSTATE_UINT8_V(external_left_attenuation, JZ4740AICState, 3),
+        VMSTATE_UINT8_V(external_right_attenuation, JZ4740AICState, 3),
+        VMSTATE_UINT8_V(external_sample_bits, JZ4740AICState, 4),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1069,6 +1162,8 @@ static void jz4740_aic_finalize(Object *obj)
 
 static const Property jz4740_aic_properties[] = {
     DEFINE_AUDIO_PROPERTIES(JZ4740AICState, audio_be),
+    DEFINE_PROP_BOOL("external-codec", JZ4740AICState, external_codec,
+                     false),
 };
 
 static void jz4740_aic_class_init(ObjectClass *klass, const void *data)

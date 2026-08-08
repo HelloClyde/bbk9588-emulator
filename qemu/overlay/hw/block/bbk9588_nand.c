@@ -21,7 +21,7 @@
 #include "system/block-backend.h"
 #include "system/runstate.h"
 
-#define NAND_MMIO_SIZE            0x20000u
+#define NAND_MMIO_SIZE            0x90000u
 #define NAND_READ_BUFFER_SIZE     4096u
 
 #define NAND_ID_MAKER             0xecu
@@ -663,6 +663,7 @@ static void nand_command(Bbk9588NandState *s, uint8_t command)
         nand_prepare_page_read(s);
         memcpy(s->program_buffer, s->read_buffer,
                sizeof(s->program_buffer));
+        s->program_start = 0;
         s->program_len = sizeof(s->program_buffer);
         s->program_column = 0;
         s->program_has_data = true;
@@ -749,11 +750,13 @@ static void nand_mmio_write(void *opaque, hwaddr offset, uint64_t value,
         }
         break;
     case 0x08000:
+    case 0x40000:
         if (size == 1) {
             nand_command(s, value & 0xffu);
         }
         break;
     case 0x10000:
+    case 0x80000:
         if (size == 1) {
             nand_address(s, value & 0xffu);
         }

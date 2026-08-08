@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "hw/block/bbk9588_nand.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/mem/jz4740_ecc.h"
 #include "hw/mem/jz4740_emc.h"
 #include "migration/vmstate.h"
@@ -20,6 +21,7 @@
 #define EMC_REG_WORDS              (EMC_MMIO_SIZE / sizeof(uint32_t))
 
 #define EMC_NFCSR                  0x050u
+#define EMC_JZ4730_NFECC           0x054u
 #define EMC_NFECCR                 0x100u
 #define EMC_NFECC                  0x104u
 #define EMC_NFPAR0                 0x108u
@@ -33,6 +35,10 @@
 #define EMC_NFERR3                 0x128u
 
 #define EMC_NFCSR_RW_MASK          0x000000ffu
+#define EMC_JZ4730_NFCSR_RW_MASK   0x00000007u
+#define EMC_JZ4730_NFCSR_READY     0x00000080u
+#define EMC_JZ4730_NFCSR_ERST      0x00000008u
+#define EMC_JZ4730_NFCSR_ECCE      0x00000004u
 #define EMC_NFECCR_RW_MASK         0x0000000du
 #define EMC_NFECCR_ECCE            0x00000001u
 #define EMC_NFECCR_ERST            0x00000002u
@@ -65,6 +71,7 @@ struct JZ4740EMCState {
     uint8_t ecc_data[JZ4740_ECC_BLOCK_BYTES];
     uint32_t ecc_data_count;
     bool irq_level;
+    bool jz4730_layout;
     JZ4740EMCBoardWriteCallback board_write_callback;
     void *board_write_opaque;
 };
@@ -169,10 +176,14 @@ static void emc_nand_data(void *opaque, uint32_t value, unsigned size,
                           bool write)
 {
     JZ4740EMCState *s = opaque;
-    uint32_t control = s->regs[EMC_NFECCR / sizeof(uint32_t)];
+    uint32_t control = s->jz4730_layout ?
+        s->regs[EMC_NFCSR / sizeof(uint32_t)] :
+        s->regs[EMC_NFECCR / sizeof(uint32_t)];
+    uint32_t enable = s->jz4730_layout ? EMC_JZ4730_NFCSR_ECCE :
+                                        EMC_NFECCR_ECCE;
     bool encode = (control & EMC_NFECCR_ENCE) != 0;
 
-    if (!(control & EMC_NFECCR_ECCE) || encode != write ||
+    if (!(control & enable) || (!s->jz4730_layout && encode != write) ||
         s->ecc_data_count >= JZ4740_ECC_BLOCK_BYTES) {
         return;
     }
@@ -220,6 +231,25 @@ void jz4740_emc_set_board_write_callback(
 
 static uint32_t emc_read_reg(JZ4740EMCState *s, hwaddr offset)
 {
+    if (s->jz4730_layout) {
+        switch (offset) {
+        case EMC_NFCSR:
+            /* The NAND model completes synchronously, so FRB# is ready. */
+            return (s->regs[offset / sizeof(uint32_t)] &
+                    EMC_JZ4730_NFCSR_RW_MASK) |
+                   EMC_JZ4730_NFCSR_READY;
+        case EMC_JZ4730_NFECC:
+            if (s->regs[EMC_NFCSR / sizeof(uint32_t)] &
+                EMC_JZ4730_NFCSR_ECCE) {
+                s->regs[offset / sizeof(uint32_t)] =
+                    jz4740_hamming_encode(s->ecc_data, s->ecc_data_count);
+            }
+            return s->regs[offset / sizeof(uint32_t)] & 0x00ffffffu;
+        default:
+            return s->regs[offset / sizeof(uint32_t)];
+        }
+    }
+
     switch (offset) {
     case EMC_NFCSR:
         return s->regs[offset / sizeof(uint32_t)] & EMC_NFCSR_RW_MASK;
@@ -251,6 +281,27 @@ static uint32_t emc_read_reg(JZ4740EMCState *s, hwaddr offset)
 static void emc_write_reg(JZ4740EMCState *s, hwaddr offset, uint32_t value)
 {
     uint32_t *reg = &s->regs[offset / sizeof(uint32_t)];
+
+    if (s->jz4730_layout) {
+        switch (offset) {
+        case EMC_NFCSR:
+            if (value & EMC_JZ4730_NFCSR_ERST) {
+                emc_ecc_begin_block(s);
+                s->regs[EMC_JZ4730_NFECC / sizeof(uint32_t)] = 0;
+            }
+            *reg = value & EMC_JZ4730_NFCSR_RW_MASK;
+            break;
+        case EMC_JZ4730_NFECC:
+            break;
+        default:
+            *reg = value;
+            break;
+        }
+        if (s->board_write_callback) {
+            s->board_write_callback(s->board_write_opaque, offset, *reg);
+        }
+        return;
+    }
 
     switch (offset) {
     case EMC_NFCSR:
@@ -417,6 +468,10 @@ static void emc_reset_hold(Object *obj, ResetType type)
     JZ4740EMCState *s = JZ4740_EMC(obj);
 
     memset(s->regs, 0, sizeof(s->regs));
+    if (s->jz4730_layout) {
+        /* C200 boots from NAND, which leaves NFE asserted after reset. */
+        s->regs[EMC_NFCSR / sizeof(uint32_t)] = 1;
+    }
     s->last_read_offset = 0;
     s->last_read_value = 0;
     s->last_write_offset = 0;
@@ -439,7 +494,7 @@ static int emc_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_jz4740_emc = {
     .name = TYPE_JZ4740_EMC,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = emc_post_load,
     .fields = (const VMStateField[]) {
@@ -451,8 +506,13 @@ static const VMStateDescription vmstate_jz4740_emc = {
         VMSTATE_UINT8_ARRAY_V(ecc_data, JZ4740EMCState,
                               JZ4740_ECC_BLOCK_BYTES, 2),
         VMSTATE_UINT32_V(ecc_data_count, JZ4740EMCState, 2),
+        VMSTATE_BOOL_V(jz4730_layout, JZ4740EMCState, 3),
         VMSTATE_END_OF_LIST()
     },
+};
+
+static const Property emc_properties[] = {
+    DEFINE_PROP_BOOL("jz4730-layout", JZ4740EMCState, jz4730_layout, false),
 };
 
 static void emc_init(Object *obj)
@@ -473,6 +533,7 @@ static void emc_class_init(ObjectClass *oc, const void *data)
 
     dc->vmsd = &vmstate_jz4740_emc;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    device_class_set_props(dc, emc_properties);
     rc->phases.hold = emc_reset_hold;
 }
 

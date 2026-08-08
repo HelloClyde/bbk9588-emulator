@@ -100,6 +100,7 @@ struct JZ4740LCDState {
     uint32_t frame_bytes;
     bool descriptor_valid;
     bool framebuffer_valid;
+    bool jz4730_layout;
     bool irq_level;
     bool trace_enabled;
     uint32_t trace_count;
@@ -119,18 +120,51 @@ static void jz4740_lcd_set_reg(JZ4740LCDState *s, hwaddr offset,
     s->regs[offset / sizeof(uint32_t)] = value;
 }
 
+static bool jz4740_lcd_interrupt_enabled(JZ4740LCDState *s,
+                                         uint32_t ctrl_bit)
+{
+    bool mask_set = jz4740_lcd_reg(s, LCD_CTRL) & ctrl_bit;
+
+    /* JZ4730 names these bits masks; JZ4740 treats them as enables. */
+    return s->jz4730_layout ? !mask_set : mask_set;
+}
+
+static bool jz4740_lcd_irq_source_enabled(JZ4740LCDState *s,
+                                          uint32_t state_bit,
+                                          uint32_t ctrl_bit)
+{
+    /* C200's JZ4730 LCD ISR services EOF and FIFO faults, but not SOF. */
+    if (s->jz4730_layout && state_bit == LCD_STATE_SOF) {
+        return false;
+    }
+    return jz4740_lcd_interrupt_enabled(s, ctrl_bit);
+}
+
 static bool jz4740_lcd_irq_pending(JZ4740LCDState *s)
 {
     uint32_t state = jz4740_lcd_reg(s, LCD_STATE);
-    uint32_t ctrl = jz4740_lcd_reg(s, LCD_CTRL);
 
-    return ((state & LCD_STATE_EOF) && (ctrl & LCD_CTRL_EOFM)) ||
-           ((state & LCD_STATE_SOF) && (ctrl & LCD_CTRL_SOFM)) ||
-           ((state & LCD_STATE_OUF) && (ctrl & LCD_CTRL_OFUM)) ||
-           ((state & LCD_STATE_IFU0) && (ctrl & LCD_CTRL_IFUM0)) ||
-           ((state & LCD_STATE_IFU1) && (ctrl & LCD_CTRL_IFUM1)) ||
-           ((state & LCD_STATE_LDD) && (ctrl & LCD_CTRL_LDDM)) ||
-           ((state & LCD_STATE_QD) && (ctrl & LCD_CTRL_QDM));
+    return ((state & LCD_STATE_EOF) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_EOF,
+                                          LCD_CTRL_EOFM)) ||
+           ((state & LCD_STATE_SOF) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_SOF,
+                                          LCD_CTRL_SOFM)) ||
+           ((state & LCD_STATE_OUF) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_OUF,
+                                          LCD_CTRL_OFUM)) ||
+           ((state & LCD_STATE_IFU0) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_IFU0,
+                                          LCD_CTRL_IFUM0)) ||
+           ((state & LCD_STATE_IFU1) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_IFU1,
+                                          LCD_CTRL_IFUM1)) ||
+           ((state & LCD_STATE_LDD) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_LDD,
+                                          LCD_CTRL_LDDM)) ||
+           ((state & LCD_STATE_QD) &&
+            jz4740_lcd_irq_source_enabled(s, LCD_STATE_QD,
+                                          LCD_CTRL_QDM));
 }
 
 static void jz4740_lcd_update_irq(JZ4740LCDState *s)
@@ -146,7 +180,7 @@ static void jz4740_lcd_update_irq(JZ4740LCDState *s)
 static void jz4740_lcd_latch_iid(JZ4740LCDState *s, uint32_t state_bit,
                                  uint32_t ctrl_bit, uint32_t fid)
 {
-    if ((jz4740_lcd_reg(s, LCD_CTRL) & ctrl_bit) &&
+    if (jz4740_lcd_interrupt_enabled(s, ctrl_bit) &&
         !jz4740_lcd_irq_pending(s)) {
         jz4740_lcd_set_reg(s, LCD_IID, fid);
     }
@@ -392,8 +426,12 @@ static void jz4740_lcd_write(void *opaque, hwaddr offset, uint64_t value,
         }
         break;
     case LCD_STATE:
-        jz4740_lcd_set_reg(s, LCD_STATE,
-                           old_value & ~(new_value & LCD_STATE_MASK));
+        if (s->jz4730_layout) {
+            jz4740_lcd_set_reg(s, LCD_STATE, new_value & LCD_STATE_MASK);
+        } else {
+            jz4740_lcd_set_reg(s, LCD_STATE,
+                               old_value & ~(new_value & LCD_STATE_MASK));
+        }
         break;
     case LCD_DA0:
     case LCD_DA1:
@@ -556,6 +594,7 @@ static const VMStateDescription vmstate_jz4740_lcd = {
 };
 
 static const Property jz4740_lcd_properties[] = {
+    DEFINE_PROP_BOOL("jz4730-layout", JZ4740LCDState, jz4730_layout, false),
     DEFINE_PROP_UINT64("ram-size", JZ4740LCDState, ram_size,
                        JZ4740_LCD_DEFAULT_RAM_SIZE),
     DEFINE_PROP_UINT32("frame-bytes", JZ4740LCDState, frame_bytes,

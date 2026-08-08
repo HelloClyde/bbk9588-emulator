@@ -41,11 +41,13 @@ from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
     DEFAULT_BBK9588_FIRMWARE_PATCHES,
     DEFAULT_C200_BASE,
+    DEFAULT_QEMU_CHIP,
     DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_FIRMWARE_PATCHES,
     DEFAULT_QEMU_MACHINE,
     DEFAULT_QEMU_NAND_IMAGE,
+    DEFAULT_QEMU_RAM_MB,
     KNOWN_STALL_REGIONS,
     QEMU_BBK_AIC_PERF_PAYLOAD,
     QEMU_BBK_AUDIO_FORMAT_S16LE,
@@ -76,6 +78,7 @@ from emu.qemu.system import (
 )
 from emu.web.frontend_server import stream_upload_to_path
 from emu.web.frontend_state import (
+    DEFAULT_WEB_CHIP,
     DEFAULT_WEB_QEMU_ICOUNT,
     FRONTEND_INPUT_CALIBRATION_TARGETS,
     WS_AUDIO_HEADER,
@@ -96,6 +99,18 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _wrap_c200_kernel(payload: bytes) -> bytes:
+    header = bytearray(0x40)
+    header[:10] = b"C200KERNEL"
+    struct.pack_into("<I", header, 0x10, len(payload))
+    struct.pack_into("<I", header, 0x14, sum(payload) & 0xFFFFFFFF)
+    struct.pack_into("<I", header, 0x3C, sum(header[:0x3C]) & 0xFFFFFFFF)
+    for offset in range(0, len(header), 4):
+        word = struct.unpack_from("<I", header, offset)[0] ^ 0x4853514C
+        struct.pack_into("<I", header, offset, word)
+    return bytes(header) + payload
 
 
 def _http_json(port: int, method: str, path: str) -> dict[str, object]:
@@ -193,6 +208,7 @@ class _QTestClient:
         *,
         nand_image: Path | None = None,
         extra_args: tuple[str, ...] = (),
+        cpu: str | None = None,
         hibernate_poweroff: bool = False,
         hibernate_wakeup: bool = False,
     ) -> None:
@@ -214,6 +230,8 @@ class _QTestClient:
             "-qtest",
             "stdio",
         ]
+        if cpu is not None:
+            command.extend(["-cpu", cpu])
         if nand_image is not None:
             command.extend(["-drive", f"if=mtd,index=0,format=raw,file={nand_image.as_posix()}"])
         command.extend(extra_args)
@@ -594,6 +612,24 @@ class QemuSystemCommandTests(unittest.TestCase):
 
         self.assertEqual(DEFAULT_QEMU_CPU, "JZ4740")
         self.assertEqual(command[command.index("-cpu") + 1], DEFAULT_QEMU_CPU)
+
+    def test_bbk9588_defaults_to_32_mib_ram(self) -> None:
+        config = build_bbk_qemu_config(nand_image=Path("build") / "bbk9588_nand.bin")
+
+        command = build_qemu_command(config)
+        board_source = (
+            Path(__file__).resolve().parents[1]
+            / "qemu"
+            / "overlay"
+            / "hw"
+            / "mips"
+            / "bbk9588.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(DEFAULT_QEMU_RAM_MB, 32)
+        self.assertEqual(config.ram_mb, DEFAULT_QEMU_RAM_MB)
+        self.assertEqual(command[command.index("-m") + 1], "32")
+        self.assertIn("BBK9588_RAM_DEFAULT_SIZE   (32 * MiB)", board_source)
 
     def test_jz4740_cpu_model_matches_documented_cp0_geometry(self) -> None:
         overlay = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
@@ -1078,21 +1114,20 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("EVENT_QUEUE_SLOTS", board)
 
     def test_bbk9588_fs_probe_helper_is_storage_trace_gated(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qemu"
-            / "overlay"
-            / "target"
-            / "mips"
-            / "tcg"
-            / "op_helper.c"
-        ).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
+        source = (root / "target" / "mips" / "tcg" / "op_helper.c").read_text(
+            encoding="utf-8"
+        )
+        board = (root / "hw" / "mips" / "bbk9588.c").read_text(
+            encoding="utf-8"
+        )
         start = source.index("void helper_bbk9588_fs_probe")
         end = source.index("target_ulong helper_rotx", start)
         helper = source[start:end]
 
         self.assertIn("!env->bbk9588_storage_trace", helper)
         self.assertIn("bbk9588_probe_write_u32(BBK9588_FS_PROBE_VA + 0x00", helper)
+        self.assertIn("board->cpu->env.bbk9588_storage_trace = value;", board)
 
     def test_bbk9588_progress_trace_timer_not_named_legacy_python_resource_hook(self) -> None:
         root = Path(__file__).resolve().parents[1] / "qemu" / "overlay"
@@ -1591,7 +1626,8 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("JZ4740_INTC_IRQ_TCU2 = 21", intc_header)
         self.assertIn("s->unmasked_pending = s->pending & ~s->mask;", intc_source)
         self.assertIn("case JZ4740_INTC_ICPR:\n    default:\n        break;", intc_source)
-        self.assertIn("s->mask = JZ4740_INTC_MASK_RESET;", intc_source)
+        self.assertIn("s->mask = s->reset_mask;", intc_source)
+        self.assertIn('DEFINE_PROP_UINT32("reset-mask"', intc_source)
 
         self.assertIn('#define TYPE_JZ4740_TCU "jz4740-tcu"', tcu_header)
         self.assertIn("#define JZ4740_TCU_CHANNELS 8u", tcu_header)
@@ -1780,7 +1816,6 @@ class QemuSystemCommandTests(unittest.TestCase):
         host_bridge = (
             root / "hw" / "display" / "bbk9588_host_bridge.c"
         ).read_text(encoding="utf-8")
-
         self.assertIn('#define TYPE_JZ4740_LCD "jz4740-lcd"', header)
         self.assertIn("#define LCD_CTRL_ENA               0x00000008u", source)
         self.assertIn("#define LCD_CTRL_OFUM              0x00000800u", source)
@@ -1796,6 +1831,17 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("#define LCD_CMD_PAL                0x10000000u", source)
         self.assertIn("#define LCD_CMD_LEN_MASK           0x00ffffffu", source)
         self.assertIn("static bool jz4740_lcd_irq_pending", source)
+        self.assertIn("static bool jz4740_lcd_interrupt_enabled", source)
+        self.assertIn("static bool jz4740_lcd_irq_source_enabled", source)
+        self.assertIn("return s->jz4730_layout ? !mask_set : mask_set;", source)
+        self.assertIn(
+            "s->jz4730_layout && state_bit == LCD_STATE_SOF", source
+        )
+        self.assertIn('DEFINE_PROP_BOOL("jz4730-layout"', source)
+        self.assertIn(
+            "jz4740_lcd_set_reg(s, LCD_STATE, new_value & LCD_STATE_MASK);",
+            source,
+        )
         self.assertIn("static void jz4740_lcd_latch_iid", source)
         self.assertIn("static bool jz4740_lcd_fetch_descriptor", source)
         self.assertIn("static void jz4740_lcd_finish_channel", source)
@@ -1810,12 +1856,25 @@ class QemuSystemCommandTests(unittest.TestCase):
 
         self.assertIn("TYPE_JZ4740_LCD", board)
         self.assertIn(
+            'qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);',
+            board,
+        )
+        self.assertIn(
             "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3050000u));",
             board,
         )
         self.assertIn("JZ4740_INTC_IRQ_LCD", board)
         self.assertIn("jz4740_lcd_signal_frame_done(s->lcd);", host_bridge)
+        self.assertLess(
+            host_bridge.index("jz4740_lcd_signal_frame_done(s->lcd);"),
+            host_bridge.index("if (changed)"),
+        )
         self.assertIn("jz4740_lcd_get_frame_source(s->lcd, &fb_va)", host_bridge)
+        self.assertIn(
+            "BBK9588_LCD_VBLANK_PERIOD_MS,\n"
+            '        "LCD vblank and RGB565 panel scanout period in milliseconds"',
+            board,
+        )
         self.assertNotIn("jz4740_lcd_observe_alias_write", board)
         self.assertIn("host_guest_ram_address_valid(", host_bridge)
         self.assertIn(
@@ -1896,7 +1955,21 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("static void host_gfx_update", source)
         self.assertIn("static void host_audio_output", source)
         self.assertIn("static bool host_send_metrics", source)
+        self.assertIn(
+            "#define BBK9588_FRAME_SETTLE_MS        2u",
+            source,
+        )
+        self.assertIn(
+            "host_gfx_update(s, !settling);",
+            source,
+        )
         self.assertIn("bbk9588_host_bridge_connect_display", board)
+        self.assertIn("bbk9588_host_bridge_set_scanout_hflip", header)
+        self.assertIn(
+            "bbk9588_host_bridge_set_scanout_hflip(board->host_bridge,",
+            board,
+        )
+        self.assertIn("board->jz4730_soc);", board)
         self.assertIn("bbk9588_host_bridge_connect_audio", board)
         self.assertIn("../display/bbk9588_host_bridge.c", meson)
         self.assertNotIn("CharFrontend frame_chr;", board)
@@ -2106,6 +2179,13 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("#define GPIO_IM                    0x20u", source)
         self.assertIn("#define GPIO_FLG                   0x80u", source)
         self.assertIn("#define GPIO_IM_RESET              0xffffffffu", source)
+        self.assertIn("#define JZ4730_GPIO_PORT_STRIDE    0x0030u", source)
+        self.assertIn("#define JZ4730_GPIO_IRQ            0x28u", source)
+        self.assertIn('DEFINE_PROP_BOOL("jz4730-layout"', source)
+        self.assertIn("gpio_jz4730_recompute_levels", source)
+        self.assertIn("s->flag[port] & enabled & ~masked", source)
+        self.assertIn("(value & direction)", source)
+        self.assertIn("(s->input_level[port] & ~direction)", source)
 
         self.assertIn("case GPIO_DATS:", source)
         self.assertIn("case GPIO_DATC:", source)
@@ -2126,24 +2206,146 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('#include "hw/gpio/jz4740_gpio.h"', board)
         self.assertIn("TYPE_JZ4740_GPIO", board)
         self.assertIn(
+            'qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);',
+            board,
+        )
+        self.assertIn(
             "sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0010000u));",
             board,
         )
         self.assertIn("JZ4740_INTC_IRQ_GPIO0", board)
         self.assertIn("JZ4740_INTC_IRQ_GPIO3", board)
         self.assertIn("board->usb_power_connected ? 0x78000000u", board)
+        self.assertIn("BBK9588_JZ4730_PEN_IRQ_MASK", board)
+        self.assertIn(
+            "0x48000000u | BBK9588_JZ4730_PEN_IRQ_MASK", board
+        )
+        self.assertIn("0x2020007fu :", board)
+        self.assertIn("board->jz4730_soc ?", board)
+        self.assertIn("if (board->jz4730_soc && key_code != BBK9588_HOST_KEY_POWER)", board)
+        self.assertIn("*port = JZ4740_GPIO_PORT_D;", board)
+        self.assertIn("*mask = 1u << pin;", board)
+        self.assertIn("bbk9588_key_gpio_bits(board, key_code, &port, &mask)", board)
         self.assertIn('object_class_property_add_bool(oc, "usb-power-connected"', board)
         touch_body = board[
             board.index("static void bbk9588_touch_set_state(", board.index("static void bbk9588_touch_set_state(") + 1):
             board.index("static void bbk9588_set_usb_power_state(")
         ]
         self.assertNotIn("JZ4740_GPIO_PORT_B", touch_body)
+        self.assertIn("JZ4740_GPIO_PORT_C", touch_body)
+        self.assertNotIn("JZ4740_GPIO_PORT_A", touch_body)
+        self.assertNotIn("JZ4740_GPIO_PORT_D", touch_body)
         self.assertIn("jz4740_gpio_set_input_level(board->gpio, port, mask,", board)
-        self.assertIn("jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C", board)
+        nand_ready_body = board[
+            board.index("static void bbk9588_nand_raise_ready("):
+            board.index("static void bbk9588_progress_trace_schedule(")
+        ]
+        self.assertIn("if (!board->jz4730_soc)", nand_ready_body)
+        self.assertIn(
+            "jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C",
+            nand_ready_body,
+        )
         self.assertIn("jz4740_gpio_set_input_sample_callback(", board)
         self.assertNotIn("BBK9588_MMIO_GPIO", board)
         self.assertNotIn("uint32_t key_gpio_down_100;", board)
         self.assertNotIn("static void bbk9588_gpio_apply_write", board)
+
+    def test_qemu_jz4730_gpio_uses_compact_banks_and_write_one_irq_clear(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        gpio = 0x10010000
+        with _QTestClient(qemu, cpu="JZ4730") as client:
+            self.assertEqual(client.readl(gpio + 0x60) & 0x20, 0x20)
+            for port in range(4):
+                bank = gpio + port * 0x30
+                self.assertEqual(client.readl(bank + 0x0C), 0xFFFFFFFF)
+                client.writel(bank + 0x18, 0xFFFFFFFF)
+                client.writel(bank + 0x1C, 0xFFFFFFFF)
+                client.writel(bank + 0x20, 0xFFFFFFFF)
+                client.writel(bank + 0x28, 0xFFFFFFFF)
+                self.assertEqual(client.readl(bank + 0x28), 0)
+
+    def test_qemu_jz4730_ssi_models_tsc2100_two_word_frames(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        ssi = 0x10043000
+        with _QTestClient(qemu, cpu="JZ4730") as client:
+            self.assertEqual(client.readl(ssi + 0x0C), 0x98)
+
+            # Page 1, register 3: command followed by the register value.
+            client.writew(ssi + 0x04, 0x0002)
+            client.writel(ssi + 0x00, 0x0860)
+            client.writel(ssi + 0x00, 0x0015)
+            self.assertEqual(client.readl(ssi + 0x0C) & 0x00000284, 0x00000284)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+
+            # A read frame returns a dummy word followed by register data.
+            client.writew(ssi + 0x04, 0x0002)
+            client.writel(ssi + 0x00, 0x8860)
+            client.writel(ssi + 0x00, 0xFFFF)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            self.assertEqual(client.readl(ssi + 0x00), 0x0015)
+            self.assertEqual(client.readl(ssi + 0x0C), 0x98)
+
+            # DISREV suppresses meaningless receive words during writes.
+            client.writew(ssi + 0x04, 0x8003)
+            client.writel(ssi + 0x00, 0x0860)
+            client.writel(ssi + 0x00, 0x002A)
+            self.assertEqual(client.readl(ssi + 0x0C), 0x98)
+
+            client.writew(ssi + 0x04, 0x8002)
+            client.writel(ssi + 0x00, 0x8860)
+            client.writel(ssi + 0x00, 0xFFFF)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            self.assertEqual(client.readl(ssi + 0x00), 0x002A)
+
+            # A host-controlled BAT1 scan completes and clears on data read.
+            client.writew(ssi + 0x04, 0x8003)
+            client.writel(ssi + 0x00, 0x0800)
+            client.writel(ssi + 0x00, 0x1878)
+            time.sleep(0.02)
+            client.writew(ssi + 0x04, 0x8002)
+            client.writel(ssi + 0x00, 0x8820)
+            client.writel(ssi + 0x00, 0xFFFF)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            status = client.readl(ssi + 0x00)
+            self.assertEqual(status & 0x0840, 0x0840, hex(status))
+
+            client.writel(ssi + 0x00, 0x80A0)
+            client.writel(ssi + 0x00, 0xFFFF)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            self.assertEqual(client.readl(ssi + 0x00), 0x0880)
+            client.writel(ssi + 0x00, 0x8820)
+            client.writel(ssi + 0x00, 0xFFFF)
+            self.assertEqual(client.readl(ssi + 0x00), 0)
+            self.assertEqual(client.readl(ssi + 0x00) & 0x0840, 0)
+
+        board = (
+            Path(__file__).resolve().parents[1]
+            / "qemu/overlay/hw/mips/bbk9588.c"
+        ).read_text(encoding="utf-8")
+        panel_body = board[
+            board.index("static void bbk9588_create_panel_device("):
+            board.index("static void bbk9588_create_sadc_device(")
+        ]
+        self.assertIn("if (!board->jz4730_soc)", panel_body)
+        self.assertIn("BBK9588_KSEG_TO_PHYS(0xb0043000u)", panel_body)
+
+    def test_qemu_jz4730_ost_data_write_loads_counter(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        ost = 0x10002000
+        with _QTestClient(qemu, cpu="JZ4730") as client:
+            client.writel(ost + 0x10, 0x12345678)
+            self.assertEqual(client.readl(ost + 0x10), 0x12345678)
+            self.assertEqual(client.readl(ost + 0x14), 0x12345678)
 
     def test_bbk9588_rtc_source_follows_jz4740_register_semantics(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2206,7 +2408,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('object_class_property_add_bool(oc, "hibernate-poweroff"', board)
         self.assertIn('object_class_property_add_bool(oc, "hibernate-wakeup"', board)
         self.assertIn('qdev_prop_set_bit(dev, "hibernate-wakeup",', board)
-        self.assertIn('qdev_prop_set_uint32(dev, "input-reset-d", 0x20200000u);', board)
+        self.assertIn('qdev_prop_set_uint32(dev, "input-reset-d",', board)
+        self.assertIn("board->jz4730_soc ?", board)
+        self.assertIn("0x2020007fu :", board)
         self.assertNotIn("BBK9588_MMIO_RTC", board)
         self.assertNotIn("QEMUTimer *rtc_timer;", board)
         self.assertNotIn("static uint32_t bbk9588_rtc_read", board)
@@ -2309,7 +2513,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("static void bbk9588_dmac_try_audio_transfer", board)
         self.assertNotIn("JZ4740DMACPeripheralOps", board)
         self.assertIn("static void bbk9588_dmac_irq_handler", board)
-        self.assertIn("jz4740_intc_set_irq(board->intc, JZ4740_INTC_IRQ_DMA", board)
+        self.assertIn("bbk9588_soc_irq(board, JZ4740_INTC_IRQ_DMA)", board)
+        self.assertIn("case JZ4740_INTC_IRQ_DMA:", board)
+        self.assertIn("return JZ4730_INTC_IRQ_DMA;", board)
         self.assertIn("bbk9588_update_irq(board);", board)
         self.assertIn(
             "board->dmac_irq = qemu_allocate_irq(bbk9588_dmac_irq_handler",
@@ -2333,6 +2539,9 @@ class QemuSystemCommandTests(unittest.TestCase):
         host_bridge = (
             root / "hw" / "display" / "bbk9588_host_bridge.c"
         ).read_text(encoding="utf-8")
+        jz4730_ssi = (root / "hw" / "ssi" / "jz4730_ssi.c").read_text(
+            encoding="utf-8"
+        )
         meson = (root / "hw" / "audio" / "meson.build").read_text(
             encoding="utf-8"
         )
@@ -2374,11 +2583,51 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn("JZ4740AICOutputCallback output_callback;", source)
         self.assertIn("jz4740_aic_stream_output(s, output, actual);", source)
         self.assertIn("JZ4740_AIC_STREAM_HZ       50u", source)
+        self.assertIn("external_sample_rate", source)
+        self.assertIn("external_sample_bits", source)
+        self.assertIn("return s->external_sample_bits;", source)
+        self.assertIn("jz4740_aic_set_external_codec_config", source)
+        self.assertIn('DEFINE_PROP_BOOL("external-codec"', source)
+        self.assertIn("TSC2100_REG_DAC_GAIN", jz4730_ssi)
+        self.assertIn("TSC2100_REG_CODEC_POWER", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_dac_sample_rate", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_sample_bits", jz4730_ssi)
+        self.assertIn("16, 20, 24, 32", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_notify_audio_config", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_update_pintdav", jz4730_ssi)
+        self.assertIn("JZ4730TSC2100PintdavCallback", jz4730_ssi)
+        self.assertIn("TSC2100_MIN_CONVERSION_DELAY_MS", jz4730_ssi)
+        self.assertIn("TSC2100_SCAN_INTERVAL_MS", jz4730_ssi)
+        self.assertIn("TSC2100_TOUCH_SAMPLE_STEP", jz4730_ssi)
+        self.assertIn("TSC2100_RELEASE_SCAN_COUNT", jz4730_ssi)
+        self.assertIn("touch_release_scans_remaining", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_pintdav_mode(s) != 0", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_is_touch_scan", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_is_adc_scan", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_conversion_status_mask", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_data_status_mask", jz4730_ssi)
+        self.assertIn("TSC2100_STATUS_BAT1", jz4730_ssi)
+        self.assertIn("TSC2100_REG_BAT1", jz4730_ssi)
+        self.assertIn("if (ready_mask == 0)", jz4730_ssi)
+        self.assertIn("addr == TSC2100_REG_ADC", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_conversion_delay_ms", jz4730_ssi)
+        self.assertIn("QEMUTimer *touch_timer;", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_complete_touch_conversion", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_schedule_touch_conversion", jz4730_ssi)
+        self.assertIn("jz4730_tsc2100_approach_sample", jz4730_ssi)
+        self.assertIn("!s->touch_conversion_pending", jz4730_ssi)
 
         self.assertIn("TYPE_JZ4740_AIC", board)
         self.assertIn("sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0020000u));", board)
         self.assertIn("TYPE_JZ4740_MSC", board)
         self.assertIn("machine_add_audiodev_property(mc);", board)
+        self.assertIn(
+            'qdev_prop_set_bit(dev, "external-codec", board->jz4730_soc);',
+            board,
+        )
+        self.assertIn("jz4730_ssi_set_audio_config_callback", board)
+        self.assertIn("jz4730_ssi_set_pintdav_callback", board)
+        self.assertIn("bbk9588_tsc2100_pintdav", board)
         self.assertIn("#define BBK9588_AUDIO_MAGIC", host_bridge)
         self.assertIn("jz4740_aic_set_output_callback", host_bridge)
         self.assertIn("CONFIG_BBK9588", meson)
@@ -2623,6 +2872,36 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertNotIn("bbk9588_nand_page_is_fat_protected", source)
         self.assertNotIn("bbk9588-nand-program-protect", source)
         self.assertNotIn("bbk9588-nand-erase-protect", source)
+
+    def test_qemu_bbk9588_nand_copyback_preserves_full_raw_page(self) -> None:
+        qemu = find_qemu()
+        if qemu is None:
+            self.skipTest("qemu-system-mipsel is not installed")
+
+        stride = 2048 + 64
+        source_page = bytes((index * 29 + 7) & 0xFF for index in range(stride))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "copyback.bin"
+            image.write_bytes(source_page + b"\xff" * stride)
+            with _QTestClient(qemu, nand_image=image) as client:
+                nand_data = 0x18000000
+                nand_command = nand_data + 0x8000
+                nand_address = nand_data + 0x10000
+
+                client.writeb(nand_command, 0x00)
+                for address_byte in (0, 0, 0, 0, 0):
+                    client.writeb(nand_address, address_byte)
+                client.writeb(nand_command, 0x35)
+
+                client.writeb(nand_command, 0x85)
+                for address_byte in (0, 0, 1, 0, 0):
+                    client.writeb(nand_address, address_byte)
+                client.writeb(nand_command, 0x10)
+
+            self.assertEqual(
+                image.read_bytes()[stride : 2 * stride],
+                source_page,
+            )
 
     def test_bbk9588_nand_uses_periodic_async_and_shutdown_flushes(self) -> None:
         source = (
@@ -3988,6 +4267,56 @@ class QemuSystemCommandTests(unittest.TestCase):
         payload = data[5 * stride : 5 * stride + len(uboot_bytes)]
         self.assertEqual(payload, uboot_bytes)
 
+    def test_make_combined_nand_writes_jz4730_sector_oob_mapping(self) -> None:
+        page_size = 2048
+        spare_size = 64
+        pages_per_block = 4
+        fat_bytes = bytes((index * 13 + 7) & 0xFF for index in range(page_size * 5))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fat = root / "fat.img"
+            out = root / "nand.bin"
+            fat.write_bytes(fat_bytes)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "tools" / "make_combined_nand.py"),
+                    "--layout",
+                    "jz4730",
+                    "--fat-image",
+                    str(fat),
+                    "--fat-page-base",
+                    "4",
+                    "--output",
+                    str(out),
+                    "--pages-per-block",
+                    str(pages_per_block),
+                    "--physical-blocks",
+                    "4",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            data = out.read_bytes()
+
+        stride = page_size + spare_size
+        self.assertEqual(data[4 * stride : 4 * stride + page_size], fat_bytes[:page_size])
+        self.assertEqual(data[8 * stride : 8 * stride + page_size], fat_bytes[page_size * 4 :])
+        self.assertEqual(data[3 * stride : 4 * stride], b"\xff" * stride)
+        for page, tag in ((4, 0), (7, 0), (8, 3)):
+            oob = data[page * stride + page_size : (page + 1) * stride]
+            for sector in range(4):
+                base = sector * 16
+                self.assertEqual(oob[base + 1], 0)
+                self.assertEqual(struct.unpack_from("<H", oob, base + 6)[0], tag)
+                self.assertEqual(oob[base + 8 : base + 11], b"\0" * 3)
+                self.assertEqual(struct.unpack_from("<H", oob, base + 11)[0], tag)
+                self.assertEqual(oob[base + 13 : base + 16], b"\xff" * 3)
+
     def test_stamp_nand_ecc_preserves_ftl_tags_and_skips_erased_pages(self) -> None:
         page_size = 2048
         spare_size = 64
@@ -4120,6 +4449,105 @@ class QemuSystemCommandTests(unittest.TestCase):
         kernel_attr, _, kernel_size = data_entries[b"KJ409588BIN"]
         self.assertEqual(kernel_attr & 0x20, 0x20)
         self.assertEqual(kernel_size, len(b"KJ-KERNEL"))
+
+    def test_make_fat16_image_injects_file_into_existing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            system = root / "系统"
+            desktop = system / "Desktop"
+            desktop.mkdir(parents=True)
+            injected = root / "USB-source.bmp"
+            injected.write_bytes(b"USB-BITMAP")
+            out = root / "fat.img"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "tools" / "make_fat16_image.py"),
+                    "--output",
+                    str(out),
+                    "--free-clusters",
+                    "0",
+                    "--volume-sectors",
+                    "0",
+                    "--inject-file",
+                    f"{injected}=系统/Desktop/USB.bmp",
+                    str(system),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            fs = PyFatFS(
+                str(out),
+                encoding="gbk",
+                offset=32 * 512,
+                preserve_case=True,
+            )
+            try:
+                self.assertEqual(fs.readbytes("系统/Desktop/USB.bmp"), b"USB-BITMAP")
+            finally:
+                fs.close()
+
+    def test_make_fat16_image_supports_jz4730_recovery_bpb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            system = root / "系统"
+            system.mkdir()
+            (system / "test.bin").write_bytes(b"JZ4730")
+            out = root / "fat.img"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "tools" / "make_fat16_image.py"),
+                    "--output",
+                    str(out),
+                    "--volume-label",
+                    "9588",
+                    "--partition-offset-sectors",
+                    "0x20",
+                    "--volume-sectors",
+                    "0x1000",
+                    "--reserved-sectors",
+                    "0xe0",
+                    "--sectors-per-fat",
+                    "0x100",
+                    "--sectors-per-track",
+                    "0x20",
+                    "--heads",
+                    "0x40",
+                    "--bpb-hidden-sectors",
+                    "1",
+                    "--volume-serial",
+                    "0x362b10da",
+                    "--root-volume-label",
+                    "外语通 9588",
+                    str(system),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            image = out.read_bytes()
+
+        boot = 0x20 * 512
+        self.assertEqual(struct.unpack_from("<H", image, boot + 14)[0], 0xE0)
+        self.assertEqual(struct.unpack_from("<H", image, boot + 22)[0], 0x100)
+        self.assertEqual(struct.unpack_from("<H", image, boot + 24)[0], 0x20)
+        self.assertEqual(struct.unpack_from("<H", image, boot + 26)[0], 0x40)
+        self.assertEqual(struct.unpack_from("<I", image, boot + 28)[0], 1)
+        self.assertEqual(struct.unpack_from("<I", image, boot + 39)[0], 0x362B10DA)
+        self.assertEqual(image[boot + 43 : boot + 54], b"9588       ")
+        root = boot + (0xE0 + 2 * 0x100) * 512
+        self.assertEqual(image[root : root + 11], "外语通 9588".encode("gbk"))
+        self.assertEqual(image[root + 11], 0x08)
 
     def test_probe_dry_run_writes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4594,6 +5022,63 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertNotIn("touch-autocal=on", config.bbk_machine_options)
             assert config.boot_payload is not None
             self.assertEqual(config.boot_payload.path.resolve(), image.resolve())
+
+    def test_jz4730_c200knl_wrapper_selects_cpu_and_unwraps_payload(self) -> None:
+        payload = b"JZ4730 raw test payload" * 17
+        staged: Path | None = None
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "C200knl.bin"
+            image.write_bytes(_wrap_c200_kernel(payload))
+
+            config = build_bbk_qemu_config(
+                boot_mode="c200",
+                chip="jz4730",
+                image=image,
+            )
+            assert config.boot_payload is not None
+            staged = config.boot_payload.path
+            self.assertEqual(config.chip, "jz4730")
+            self.assertEqual(config.cpu, "JZ4730")
+            self.assertEqual(staged.read_bytes(), payload)
+            command = build_qemu_command(config)
+            self.assertEqual(command[command.index("-cpu") + 1], "JZ4730")
+
+            staged.write_bytes(b"\0" * len(payload))
+            rebuilt = build_bbk_qemu_config(
+                boot_mode="c200",
+                chip="jz4730",
+                image=image,
+            )
+            assert rebuilt.boot_payload is not None
+            self.assertEqual(rebuilt.boot_payload.path.read_bytes(), payload)
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+    def test_jz4730_rejects_invalid_c200knl_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "C200knl.bin"
+            wrapped = bytearray(_wrap_c200_kernel(b"payload"))
+            wrapped[-1] ^= 0x01
+            image.write_bytes(wrapped)
+
+            with self.assertRaisesRegex(ValueError, "payload checksum"):
+                build_bbk_qemu_config(
+                    boot_mode="c200",
+                    chip="jz4730",
+                    image=image,
+                )
+
+    def test_jz4730_rejects_non_c200_boot_mode_and_cpu_mismatch(self) -> None:
+        self.assertEqual(DEFAULT_QEMU_CHIP, "jz4740")
+        with self.assertRaisesRegex(ValueError, "requires boot_mode='c200'"):
+            build_bbk_qemu_config(boot_mode="nand", chip="jz4730")
+        with self.assertRaisesRegex(ValueError, "requires QEMU CPU 'JZ4730'"):
+            build_bbk_qemu_config(
+                boot_mode="c200",
+                chip="jz4730",
+                cpu="JZ4740",
+                image=Path("C200knl.bin"),
+            )
 
     def test_bbk9588_launcher_preserves_explicit_machine_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7564,6 +8049,10 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="powerSettingsTab"', frontend)
         self.assertIn('id="performancePriority" type="checkbox" checked', frontend)
         self.assertIn('id="usbPowerConnected" type="checkbox" checked', frontend)
+        self.assertIn('id="chipSelect"', frontend)
+        self.assertIn('id="applyChip"', frontend)
+        self.assertIn("runLifecycleCommand('set-chip'", frontend)
+        self.assertIn("['ram', `${s.ram_mb ?? 32} MiB`]", frontend)
         self.assertIn('id="keymapSettingsPane" class="settings-pane keymap-panel"', frontend)
         self.assertIn("if (settingsDialogEl.open) return;", frontend)
         self.assertIn("if (!settingsDialogEl.open) settingsDialogEl.showModal();", frontend)
@@ -7946,6 +8435,71 @@ class QemuSystemCommandTests(unittest.TestCase):
             r"Start-Process \$BrowserUrl",
         )
         self.assertNotIn("Start-Process $url", script)
+
+    def test_release_launcher_keeps_jz4730_nand_separate(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "packaging" / "start-web.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"bbk9588_jz4730_nand.bin"', script)
+        self.assertIn('$Chip -eq "jz4740"', script)
+        self.assertIn('if ($Chip -eq "jz4730")', script)
+        self.assertIn('"C200knl.bin"', script)
+        self.assertIn('[string]$Chip = "jz4730"', script)
+        self.assertIn('--jz4730-nand-image $Jz4730NandImage', script)
+        self.assertIn('--jz4740-nand-image $Jz4740NandImage', script)
+        self.assertEqual(DEFAULT_WEB_CHIP, "jz4730")
+
+    def test_frontend_chip_switch_uses_matching_boot_image_and_nand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jz4730_nand = root / "bbk9588_jz4730_nand.bin"
+            jz4740_nand = root / "bbk9588_nand.bin"
+            c200knl = root / "C200knl.bin"
+            jz4730_nand.write_bytes(b"jz4730")
+            jz4740_nand.write_bytes(b"jz4740")
+            c200knl.write_bytes(b"C200KERNEL")
+
+            state = FrontendState.__new__(FrontendState)
+            state.args = argparse.Namespace(
+                chip="jz4740",
+                qemu_cpu="JZ4740",
+                nand_image=jz4740_nand,
+                boot_mode="nand",
+                image=None,
+                payload=None,
+            )
+            state.nand_lifecycle_lock = threading.RLock()
+            state.nand_image_lease = NandImageLease()
+            state.nand_image_lease.acquire(jz4740_nand)
+            state.chip_profiles = {
+                "jz4730": {
+                    "chip": "jz4730",
+                    "nand_image": jz4730_nand,
+                    "boot_mode": "c200",
+                    "image": c200knl,
+                },
+                "jz4740": {
+                    "chip": "jz4740",
+                    "nand_image": jz4740_nand,
+                    "boot_mode": "nand",
+                    "image": None,
+                },
+            }
+            state._reset_nand_locked = lambda: {  # type: ignore[method-assign]
+                "chip": state.args.chip,
+                "boot_mode": state.args.boot_mode,
+            }
+            try:
+                with mock.patch.object(state, "_validate_chip_nand_image"):
+                    result = state.command({"op": "set-chip", "chip": "jz4730"})
+                self.assertEqual(result["chip"], "jz4730")
+                self.assertEqual(state.args.boot_mode, "c200")
+                self.assertEqual(state.args.image, c200knl)
+                self.assertEqual(state.args.nand_image, jz4730_nand)
+                self.assertIsNone(state.args.qemu_cpu)
+            finally:
+                state.nand_image_lease.release()
 
     def test_frontend_qemu_backend_status_and_stop(self) -> None:
         if find_qemu() is None:

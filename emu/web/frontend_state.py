@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from emu.core.framebuffer import png_bytes_from_rgb, rgb565_raw_to_info_rgb
 from emu.qemu.nand_fs import (
+    RAW_BLOCK_SIZE,
     extract_logical_fat_image,
     fat_file_clusters,
     join_nand_path,
@@ -27,10 +28,10 @@ from emu.qemu.nand_fs import (
 from emu.qemu.nand_lock import NandImageLease
 from emu.qemu.nand_source import import_nand_source
 from emu.qemu.system import (
-    DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
     DEFAULT_QEMU_NAND_IMAGE,
+    DEFAULT_QEMU_RAM_MB,
     TOUCH_CALIBRATION_REFERENCE_POINTS,
     QemuProcessBackend,
     build_bbk_qemu_config,
@@ -40,6 +41,16 @@ from emu.qemu.system import (
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "build"
+DEFAULT_WEB_CHIP = "jz4730"
+WEB_CHIP_LABELS = {
+    "jz4730": "JZ4730",
+    "jz4740": "JZ4740",
+}
+WEB_CHIP_NAND_FILENAMES = {
+    "jz4730": "bbk9588_jz4730_nand.bin",
+    "jz4740": "bbk9588_nand.bin",
+}
+BBK9588_RAW_NAND_BLOCKS = 4096
 COMBINED_NAND_IMAGE_CANDIDATES = (
     ROOT / DEFAULT_QEMU_NAND_IMAGE,
 )
@@ -383,6 +394,7 @@ class FrontendState:
         self.nand_files_cache_signature: tuple[str, int, int] | None = None
         self.nand_legacy_checkpoint_migrated: str | None = None
         self.nand_import_result: dict[str, object] | None = None
+        self.chip_profiles = self._initialize_chip_profiles()
 
         try:
             import_source = getattr(args, "nand_import_source", None)
@@ -399,6 +411,103 @@ class FrontendState:
         except Exception:
             self.nand_image_lease.release()
             raise
+
+    @staticmethod
+    def _optional_resolved_path(value: object) -> Path | None:
+        if value is None or not str(value).strip():
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = ROOT / path
+        return path.resolve()
+
+    @staticmethod
+    def _first_existing_path(candidates: list[Path]) -> Path:
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
+    def _initialize_chip_profiles(self) -> dict[str, dict[str, Path | str | None]]:
+        chip = str(getattr(self.args, "chip", DEFAULT_WEB_CHIP)).strip().lower()
+        if chip not in WEB_CHIP_LABELS:
+            chip = DEFAULT_WEB_CHIP
+        self.args.chip = chip
+
+        current_nand = self._optional_resolved_path(getattr(self.args, "nand_image", None))
+        runtime_dir = current_nand.parent if current_nand is not None else ROOT / "runtime"
+        profiles: dict[str, dict[str, Path | str | None]] = {}
+        for profile_chip, filename in WEB_CHIP_NAND_FILENAMES.items():
+            explicit = self._optional_resolved_path(
+                getattr(self.args, f"{profile_chip}_nand_image", None)
+            )
+            candidates = [
+                runtime_dir / filename,
+                ROOT / "runtime" / filename,
+                ROOT / filename,
+            ]
+            nand_image = (
+                explicit
+                or (current_nand if chip == profile_chip else None)
+                or self._first_existing_path(candidates)
+            )
+            profiles[profile_chip] = {
+                "chip": profile_chip,
+                "nand_image": nand_image,
+                "boot_mode": "c200" if profile_chip == "jz4730" else "nand",
+                "image": None,
+            }
+
+        explicit_jz4730_image = self._optional_resolved_path(
+            getattr(self.args, "jz4730_image", None)
+        )
+        current_image = self._optional_resolved_path(getattr(self.args, "image", None))
+        profiles["jz4730"]["image"] = (
+            explicit_jz4730_image
+            or (current_image if chip == "jz4730" else None)
+            or (ROOT / "系统" / "数据" / "C200knl.bin").resolve()
+        )
+        if (
+            chip == "jz4730"
+            and getattr(self.args, "boot_mode", "c200") == "c200"
+            and getattr(self.args, "image", None) is None
+        ):
+            self.args.image = profiles["jz4730"]["image"]
+        return profiles
+
+    def chip_options(self) -> list[dict[str, object]]:
+        options: list[dict[str, object]] = []
+        for chip, label in WEB_CHIP_LABELS.items():
+            profile = self.chip_profiles[chip]
+            nand_image = profile["nand_image"]
+            image = profile["image"]
+            missing: list[str] = []
+            if not isinstance(nand_image, Path) or not nand_image.is_file():
+                missing.append(WEB_CHIP_NAND_FILENAMES[chip])
+            if chip == "jz4730" and (not isinstance(image, Path) or not image.is_file()):
+                missing.append("C200knl.bin")
+            options.append(
+                {
+                    "value": chip,
+                    "label": label,
+                    "available": not missing,
+                    "missing": missing,
+                    "nand_image": str(nand_image) if isinstance(nand_image, Path) else "",
+                }
+            )
+        return options
+
+    @staticmethod
+    def _validate_chip_nand_image(chip: str, path: Path) -> None:
+        if chip == "jz4740":
+            validate_nand_image(path)
+            return
+        expected_size = BBK9588_RAW_NAND_BLOCKS * RAW_BLOCK_SIZE
+        actual_size = path.stat().st_size
+        if actual_size != expected_size:
+            raise ValueError(
+                f"JZ4730 NAND size is {actual_size} bytes; expected {expected_size} bytes"
+            )
 
     def _default_nand_image(self) -> Path | None:
         if bool(getattr(self.args, "no_nand", False)):
@@ -478,11 +587,63 @@ class FrontendState:
                 self.nand_image_lease = replacement
                 previous.release()
             self.args.nand_image = selected
+            chip = str(getattr(self.args, "chip", DEFAULT_WEB_CHIP)).lower()
+            if chip in self.chip_profiles:
+                self.chip_profiles[chip]["nand_image"] = selected
             if reset:
                 return self.reset()
             with self.lock:
                 self._publish_snapshot_locked()
                 return self.snapshot()
+
+    def set_chip(self, value: object) -> dict[str, object]:
+        chip = str(value or "").strip().lower()
+        if chip not in self.chip_profiles:
+            raise ValueError(f"unsupported chip: {value}")
+        if chip == str(getattr(self.args, "chip", DEFAULT_WEB_CHIP)).lower():
+            return self.snapshot()
+
+        profile = self.chip_profiles[chip]
+        nand_image = profile["nand_image"]
+        image = profile["image"]
+        if not isinstance(nand_image, Path) or not nand_image.is_file():
+            raise FileNotFoundError(
+                f"{WEB_CHIP_LABELS[chip]} NAND image does not exist: {nand_image}"
+            )
+        if chip == "jz4730" and (not isinstance(image, Path) or not image.is_file()):
+            raise FileNotFoundError(f"JZ4730 boot image does not exist: {image}")
+
+        replacement = NandImageLease()
+        replacement.acquire(nand_image)
+        try:
+            self._validate_chip_nand_image(chip, nand_image)
+        except Exception:
+            replacement.release()
+            raise
+
+        with self.nand_lifecycle_lock:
+            previous_lease = self.nand_image_lease
+            previous_values = {
+                name: getattr(self.args, name, None)
+                for name in ("chip", "qemu_cpu", "nand_image", "boot_mode", "image", "payload")
+            }
+            self.nand_image_lease = replacement
+            self.args.chip = chip
+            self.args.qemu_cpu = None
+            self.args.nand_image = nand_image
+            self.args.boot_mode = str(profile["boot_mode"])
+            self.args.image = image if chip == "jz4730" else None
+            self.args.payload = None
+            try:
+                result = self._reset_nand_locked()
+            except Exception:
+                self.nand_image_lease = previous_lease
+                replacement.release()
+                for name, previous_value in previous_values.items():
+                    setattr(self.args, name, previous_value)
+                raise
+            previous_lease.release()
+            return result
 
     def _nand_files_image(self) -> Path:
         selected = self._default_nand_image()
@@ -947,9 +1108,10 @@ class FrontendState:
                 executable=getattr(self.args, "qemu", DEFAULT_QEMU_EXECUTABLE),
                 image=getattr(self.args, "image", None),
                 payload=getattr(self.args, "payload", None),
-                ram_mb=int(getattr(self.args, "ram_mb", 160)),
+                ram_mb=int(getattr(self.args, "ram_mb", DEFAULT_QEMU_RAM_MB)),
                 machine=getattr(self.args, "qemu_machine", DEFAULT_QEMU_MACHINE),
-                cpu=getattr(self.args, "qemu_cpu", DEFAULT_QEMU_CPU),
+                chip=getattr(self.args, "chip", DEFAULT_WEB_CHIP),
+                cpu=getattr(self.args, "qemu_cpu", None),
                 accel=accel,
                 display="none",
                 serial="mon:stdio",
@@ -1801,6 +1963,8 @@ class FrontendState:
             return self.stop()
         if op in {"force-stop", "force_stop"}:
             return self.force_stop()
+        if op in {"set-chip", "set_chip", "chip"}:
+            return self.set_chip(msg.get("chip"))
         if op == "step":
             return self.step(int(msg.get("steps", 250000)))
         if op in {"set-orientation", "set_orientation", "orientation"}:
@@ -2144,6 +2308,9 @@ class FrontendState:
             "backend": "qemu",
             "running": active,
             "boot_mode": getattr(self.args, "boot_mode", "nand"),
+            "chip": getattr(self.args, "chip", DEFAULT_WEB_CHIP),
+            "chip_options": self.chip_options(),
+            "ram_mb": int(getattr(self.args, "ram_mb", DEFAULT_QEMU_RAM_MB)),
             "nand_image": str(effective_nand_image.resolve()) if effective_nand_image is not None else "",
             "nand_write_mode": "direct" if effective_nand_image is not None else "none",
             "nand_legacy_checkpoint_migrated": getattr(

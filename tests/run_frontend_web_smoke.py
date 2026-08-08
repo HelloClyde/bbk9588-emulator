@@ -393,6 +393,7 @@ def start_frontend(args: argparse.Namespace, port: int) -> subprocess.Popen[byte
         cmd += ["--profile-out", str(profile_out)]
     cmd += ["--backend", "qemu"]
     for option_name, cli_name in (
+        ("chip", "--chip"),
         ("qemu", "--qemu"),
         ("qemu_machine", "--qemu-machine"),
         ("qemu_cpu", "--qemu-cpu"),
@@ -762,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk-steps", type=int, default=250000)
     ap.add_argument("--frame-push-min-interval", type=float, default=0.04)
     ap.add_argument("--backend", choices=["qemu"], default="qemu")
+    ap.add_argument("--chip", choices=["jz4740", "jz4730"], default=None)
     ap.add_argument("--qemu", default=None)
     ap.add_argument("--qemu-machine", dest="qemu_machine", default=None)
     ap.add_argument("--qemu-cpu", dest="qemu_cpu", default=None)

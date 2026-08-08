@@ -14,9 +14,10 @@ if __package__ in (None, ""):
 
 from emu.qemu.system import (
     DEFAULT_C200_PHYS,
-    DEFAULT_QEMU_CPU,
+    DEFAULT_QEMU_CHIP,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
+    DEFAULT_QEMU_RAM_MB,
     build_bbk_qemu_config,
     build_qemu_command,
     find_default_qemu_nand_image,
@@ -38,6 +39,7 @@ def _boot_config(ns: argparse.Namespace):
         load_addr=ns.load_addr,
         pc=ns.pc,
         machine=ns.machine,
+        chip=ns.chip,
         cpu=ns.cpu,
         ram_mb=ns.ram_mb,
         accel=ns.accel,
@@ -75,8 +77,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--load-addr", type=lambda value: int(value, 0), help="Physical load address for the boot image.")
     ap.add_argument("--pc", type=lambda value: int(value, 0), help="Initial virtual PC.")
     ap.add_argument("--machine", default=DEFAULT_QEMU_MACHINE)
-    ap.add_argument("--cpu", default=DEFAULT_QEMU_CPU)
-    ap.add_argument("--ram-mb", type=int, default=160)
+    ap.add_argument("--chip", choices=["jz4740", "jz4730"], default=DEFAULT_QEMU_CHIP)
+    ap.add_argument("--cpu", default=None)
+    ap.add_argument("--ram-mb", type=int, default=DEFAULT_QEMU_RAM_MB)
     ap.add_argument("--accel", default="tcg,thread=multi,tb-size=256")
     ap.add_argument("--display", default="none")
     ap.add_argument("--serial", default="mon:stdio")

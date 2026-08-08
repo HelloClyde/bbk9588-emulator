@@ -35,17 +35,23 @@
 #include "hw/dma/bbk9588_dma_bridge.h"
 #include "hw/dma/jz4740_dmac.h"
 #include "hw/gpio/jz4740_gpio.h"
+#include "hw/i2c/jz4730_i2c.h"
 #include "hw/input/bbk9588_host_input.h"
 #include "hw/input/jz4740_sadc.h"
 #include "hw/intc/jz4740_intc.h"
 #include "hw/mem/jz4740_ecc.h"
 #include "hw/mem/jz4740_emc.h"
 #include "hw/misc/bbk9588_diag.h"
+#include "hw/misc/jz4730_harb.h"
+#include "hw/misc/jz4730_pwm.h"
 #include "hw/misc/jz4740_cim.h"
 #include "hw/misc/jz4740_cpm.h"
 #include "hw/rtc/jz4740_rtc.h"
 #include "hw/sd/jz4740_msc.h"
+#include "hw/ssi/jz4730_ssi.h"
 #include "hw/timer/jz4740_tcu.h"
+#include "hw/timer/jz4730_ost.h"
+#include "hw/timer/jz4730_wdt.h"
 #include "hw/usb/jz4740_udc.h"
 #include "qemu/error-report.h"
 #include "qemu/atomic.h"
@@ -56,7 +62,7 @@
 #include "qom/object.h"
 #include "target/mips/cpu.h"
 
-#define BBK9588_RAM_DEFAULT_SIZE   (160 * MiB)
+#define BBK9588_RAM_DEFAULT_SIZE   (32 * MiB)
 #define BBK9588_RAM_VADDR          0x80000000u
 #define BBK9588_RAM_SIZE           BBK9588_RAM_DEFAULT_SIZE
 #define BBK9588_FIRMWARE_PHYS      0x00004000
@@ -70,6 +76,7 @@
 #define BBK9588_LCD_HEIGHT         320
 #define BBK9588_HOST_KEY_POWER     11u
 #define BBK9588_USB_POWER_MASK     0x00040000u
+#define BBK9588_JZ4730_PEN_IRQ_MASK 0x00000020u
 #define BBK9588_LCD_STRIDE         (BBK9588_LCD_WIDTH * 2)
 #define BBK9588_LCD_BYTES          (BBK9588_LCD_STRIDE * BBK9588_LCD_HEIGHT)
 #define BBK9588_LCD_VBLANK_PERIOD_MS 33
@@ -117,6 +124,9 @@ struct Bbk9588MachineState {
     JZ4740LCDState *lcd;
     Bbk9588PanelState *panel;
     JZ4740INTCState *intc;
+    JZ4730HARBState *harb;
+    JZ4730PWMState *pwm;
+    JZ4730I2CState *i2c;
     JZ4740EMCState *emc;
     JZ4740CIMState *cim;
     JZ4740CPMState *cpm;
@@ -126,7 +136,10 @@ struct Bbk9588MachineState {
     JZ4740GPIOState *gpio;
     JZ4740RTCState *rtc;
     JZ4740SADCState *sadc;
+    JZ4730SSIState *ssi;
     JZ4740TCUState *tcu;
+    JZ4730OSTState *ost;
+    JZ4730WDTState *wdt;
     JZ4740UARTState *uart;
     JZ4740UDCState *udc;
     Bbk9588NandState *nand_dev;
@@ -141,6 +154,7 @@ struct Bbk9588MachineState {
     bool hibernate_poweroff_enabled;
     bool hibernate_wakeup_enabled;
     bool usb_power_connected;
+    bool jz4730_soc;
     uint32_t nand_id_code;
     uint32_t firmware_phys;
     uint32_t reset_pc;
@@ -163,6 +177,52 @@ static void bbk9588_update_irq(Bbk9588MachineState *board);
 static void bbk9588_touch_diag_record(Bbk9588MachineState *board,
                                       uint32_t reason);
 
+static unsigned bbk9588_soc_irq(Bbk9588MachineState *board,
+                                unsigned jz4740_irq)
+{
+    if (!board->jz4730_soc) {
+        return jz4740_irq;
+    }
+    switch (jz4740_irq) {
+    case JZ4740_INTC_IRQ_I2C:
+        return JZ4730_INTC_IRQ_I2C;
+    case JZ4740_INTC_IRQ_EMC:
+        return 0;
+    case JZ4740_INTC_IRQ_UHC:
+        return JZ4730_INTC_IRQ_UHC;
+    case JZ4740_INTC_IRQ_UART0:
+        return JZ4730_INTC_IRQ_UART0;
+    case JZ4740_INTC_IRQ_SADC:
+        return 16;
+    case JZ4740_INTC_IRQ_MSC:
+        return JZ4730_INTC_IRQ_MSC;
+    case JZ4740_INTC_IRQ_RTC:
+        return JZ4730_INTC_IRQ_RTC;
+    case JZ4740_INTC_IRQ_SSI:
+        return JZ4730_INTC_IRQ_SSI;
+    case JZ4740_INTC_IRQ_CIM:
+        return JZ4730_INTC_IRQ_CIM;
+    case JZ4740_INTC_IRQ_AIC:
+        return JZ4730_INTC_IRQ_AIC;
+    case JZ4740_INTC_IRQ_DMA:
+        return JZ4730_INTC_IRQ_DMA;
+    case JZ4740_INTC_IRQ_UDC:
+        return JZ4730_INTC_IRQ_UDC;
+    case JZ4740_INTC_IRQ_GPIO3:
+        return JZ4730_INTC_IRQ_GPIO3;
+    case JZ4740_INTC_IRQ_GPIO2:
+        return JZ4730_INTC_IRQ_GPIO2;
+    case JZ4740_INTC_IRQ_GPIO1:
+        return JZ4730_INTC_IRQ_GPIO1;
+    case JZ4740_INTC_IRQ_GPIO0:
+        return JZ4730_INTC_IRQ_GPIO0;
+    case JZ4740_INTC_IRQ_LCD:
+        return JZ4730_INTC_IRQ_LCD;
+    default:
+        return jz4740_irq;
+    }
+}
+
 static void bbk9588_wake_cpu(Bbk9588MachineState *board)
 {
     if (board && board->cpu) {
@@ -176,6 +236,9 @@ static void bbk9588_wake_cpu(Bbk9588MachineState *board)
 
 static void bbk9588_sync_tcu_irq_sources(Bbk9588MachineState *board)
 {
+    if (board->jz4730_soc || !board->tcu) {
+        return;
+    }
     jz4740_intc_set_irq(
         board->intc, JZ4740_INTC_IRQ_TCU0,
         jz4740_tcu_irq_level(board->tcu, JZ4740_TCU_IRQ_TCU0));
@@ -261,7 +324,10 @@ static void bbk9588_nand_raise_ready(Bbk9588MachineState *board)
         return;
     }
     bbk9588_diag_note_nand_ready(board->diag);
-    jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C, 0x40000000u);
+    if (!board->jz4730_soc) {
+        jz4740_gpio_raise_flag(board->gpio, JZ4740_GPIO_PORT_C,
+                               0x40000000u);
+    }
     bbk9588_touch_diag_record(board, 0x52);
 }
 
@@ -296,9 +362,43 @@ static void bbk9588_touch_apply_host_input(void *opaque, uint16_t raw_x,
     bbk9588_touch_set_state(board, raw_x, raw_y, down);
 }
 
-static bool bbk9588_key_gpio_bits(uint32_t key_code, unsigned *port,
+static bool bbk9588_key_gpio_bits(Bbk9588MachineState *board,
+                                  uint32_t key_code, unsigned *port,
                                   uint32_t *mask)
 {
+    if (board->jz4730_soc && key_code != BBK9588_HOST_KEY_POWER) {
+        unsigned pin;
+
+        switch (key_code) {
+        case 10:
+            pin = 0;
+            break;
+        case 5:
+            pin = 1;
+            break;
+        case 7:
+            pin = 2;
+            break;
+        case 8:
+            pin = 3;
+            break;
+        case 6:
+            pin = 4;
+            break;
+        case 9:
+            pin = 5;
+            break;
+        case 4:
+            pin = 6;
+            break;
+        default:
+            return false;
+        }
+        *port = JZ4740_GPIO_PORT_D;
+        *mask = 1u << pin;
+        return true;
+    }
+
     switch (key_code) {
     case 10:
         *port = JZ4740_GPIO_PORT_B;
@@ -339,7 +439,7 @@ static bool bbk9588_key_gpio_set_state(Bbk9588MachineState *board,
     unsigned port = 0;
     uint32_t mask = 0;
 
-    if (!bbk9588_key_gpio_bits(key_code, &port, &mask)) {
+    if (!bbk9588_key_gpio_bits(board, key_code, &port, &mask)) {
         return false;
     }
     return jz4740_gpio_set_input_level(board->gpio, port, mask,
@@ -466,7 +566,9 @@ static void bbk9588_create_nand_device(Bbk9588MachineState *board)
     }
     qdev_prop_set_uint32(dev, "id-code", board->nand_id_code);
     sysbus_realize(sbd, &error_fatal);
-    sysbus_mmio_map(sbd, 0, KSEG1_TO_PHYS(0xb8000000u));
+    sysbus_mmio_map(sbd, 0,
+                    KSEG1_TO_PHYS(board->jz4730_soc ? 0xb4000000u
+                                                    : 0xb8000000u));
     board->nand_dev = BBK9588_NAND(dev);
     bbk9588_nand_set_event_callback(board->nand_dev, bbk9588_nand_event,
                                     board);
@@ -479,11 +581,14 @@ static void bbk9588_create_emc_device(Bbk9588MachineState *board)
     DeviceState *dev = qdev_new(TYPE_JZ4740_EMC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, KSEG1_TO_PHYS(0xb3010000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_EMC));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_EMC)));
     board->emc = JZ4740_EMC(dev);
     jz4740_emc_attach_nand(board->emc, board->nand_dev);
 }
@@ -781,7 +886,9 @@ static void bbk9588_dmac_irq_handler(void *opaque, int n, int level)
 {
     Bbk9588MachineState *board = opaque;
 
-    jz4740_intc_set_irq(board->intc, JZ4740_INTC_IRQ_DMA, level != 0);
+    jz4740_intc_set_irq(board->intc,
+                        bbk9588_soc_irq(board, JZ4740_INTC_IRQ_DMA),
+                        level != 0);
     bbk9588_update_irq(board);
 }
 
@@ -809,8 +916,32 @@ static void bbk9588_aic_irq_handler(void *opaque, int n, int level)
 {
     Bbk9588MachineState *board = opaque;
 
-    jz4740_intc_set_irq(board->intc, JZ4740_INTC_IRQ_AIC, level != 0);
+    jz4740_intc_set_irq(board->intc,
+                        bbk9588_soc_irq(board, JZ4740_INTC_IRQ_AIC),
+                        level != 0);
     bbk9588_update_irq(board);
+}
+
+static void bbk9588_tsc2100_audio_config(void *opaque, uint32_t sample_rate,
+                                         uint8_t sample_bits,
+                                         bool muted,
+                                         uint8_t left_attenuation,
+                                         uint8_t right_attenuation)
+{
+    jz4740_aic_set_external_codec_config(
+        JZ4740_AIC(opaque), sample_rate, sample_bits, muted,
+        left_attenuation, right_attenuation);
+}
+
+static void bbk9588_tsc2100_pintdav(void *opaque, bool high)
+{
+    Bbk9588MachineState *board = opaque;
+
+    if (board->gpio) {
+        jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_C,
+                                    BBK9588_JZ4730_PEN_IRQ_MASK,
+                                    high, true);
+    }
 }
 
 static void bbk9588_touch_sync_latch(Bbk9588MachineState *board)
@@ -839,8 +970,12 @@ static void bbk9588_touch_set_state(Bbk9588MachineState *board,
                                     bool down)
 {
     jz4740_sadc_set_touch(board->sadc, raw_x, raw_y, down);
-    jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_C,
-                                0x08000000u, !down, false);
+    if (board->jz4730_soc) {
+        jz4730_ssi_set_touch(board->ssi, raw_x, raw_y, down);
+    } else {
+        jz4740_gpio_set_input_level(board->gpio, JZ4740_GPIO_PORT_C,
+                                    0x08000000u, !down, false);
+    }
 }
 
 static void bbk9588_set_usb_power_state(Bbk9588MachineState *board,
@@ -877,6 +1012,7 @@ static void bbk9588_create_aic_device(MachineState *machine,
     DeviceState *dev = qdev_new(TYPE_JZ4740_AIC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "external-codec", board->jz4730_soc);
     if (machine->audiodev) {
         qdev_prop_set_string(dev, "audiodev", machine->audiodev);
     }
@@ -892,6 +1028,10 @@ static void bbk9588_create_aic_device(MachineState *machine,
                        qdev_get_gpio_in(DEVICE(board->dmac),
                                         JZ4740_DMAC_REQUEST_AIC_RX));
     board->aic = JZ4740_AIC(dev);
+    if (board->jz4730_soc) {
+        jz4730_ssi_set_audio_config_callback(
+            board->ssi, bbk9588_tsc2100_audio_config, board->aic);
+    }
 }
 
 static uint64_t bbk9588_guest_insn_count(void *opaque)
@@ -962,6 +1102,10 @@ static void bbk9588_create_intc_device(Bbk9588MachineState *board)
     DeviceState *dev = qdev_new(TYPE_JZ4740_INTC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    if (board->jz4730_soc) {
+        qdev_prop_set_uint32(dev, "source-mask", JZ4730_INTC_SOURCE_MASK);
+        qdev_prop_set_uint32(dev, "reset-mask", 0);
+    }
     board->intc_irq = qemu_allocate_irq(bbk9588_intc_output_handler, board,
                                         0);
     sysbus_realize(sbd, &error_fatal);
@@ -970,6 +1114,54 @@ static void bbk9588_create_intc_device(Bbk9588MachineState *board)
     board->intc = JZ4740_INTC(dev);
     jz4740_intc_set_refresh(board->intc, bbk9588_intc_refresh, board);
     board->intc_output_level = jz4740_intc_output_level(board->intc);
+}
+
+static void bbk9588_create_jz4730_harb_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+
+    if (!board->jz4730_soc) {
+        return;
+    }
+    dev = qdev_new(TYPE_JZ4730_HARB);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3000000u));
+    board->harb = JZ4730_HARB(dev);
+}
+
+static void bbk9588_create_jz4730_pwm_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+
+    if (!board->jz4730_soc) {
+        return;
+    }
+    dev = qdev_new(TYPE_JZ4730_PWM);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0050000u));
+    board->pwm = JZ4730_PWM(dev);
+}
+
+static void bbk9588_create_jz4730_i2c_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+
+    if (!board->jz4730_soc) {
+        return;
+    }
+    dev = qdev_new(TYPE_JZ4730_I2C);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0042000u));
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(board->intc),
+                                        JZ4730_INTC_IRQ_I2C));
+    board->i2c = JZ4730_I2C(dev);
 }
 
 static void bbk9588_create_uart_device(Bbk9588MachineState *board)
@@ -984,7 +1176,9 @@ static void bbk9588_create_uart_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0030000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_UART0));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_UART0)));
     board->uart = JZ4740_UART(dev);
 }
 
@@ -997,7 +1191,9 @@ static void bbk9588_create_udc_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3040000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_UDC));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_UDC)));
     board->udc = JZ4740_UDC(dev);
 }
 
@@ -1010,7 +1206,9 @@ static void bbk9588_create_cim_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3060000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_CIM));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_CIM)));
     board->cim = JZ4740_CIM(dev);
 }
 
@@ -1031,13 +1229,16 @@ static void bbk9588_create_lcd_device(MachineState *machine,
     DeviceState *dev = qdev_new(TYPE_JZ4740_LCD);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);
     qdev_prop_set_uint64(dev, "ram-size", machine->ram_size);
     qdev_prop_set_uint32(dev, "frame-bytes", BBK9588_LCD_BYTES);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3050000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_LCD));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_LCD)));
     board->lcd = JZ4740_LCD(dev);
 }
 
@@ -1047,7 +1248,9 @@ static void bbk9588_create_panel_device(Bbk9588MachineState *board)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     sysbus_realize(sbd, &error_fatal);
-    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0043000u));
+    if (!board->jz4730_soc) {
+        sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0043000u));
+    }
     board->panel = BBK9588_PANEL(dev);
     bbk9588_panel_set_write_callback(
         board->panel, bbk9588_diag_panel_write, board->diag);
@@ -1064,7 +1267,9 @@ static void bbk9588_create_sadc_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0070000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_SADC));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_SADC)));
     board->sadc = JZ4740_SADC(dev);
     jz4740_sadc_set_trace_callback(board->sadc, bbk9588_sadc_trace, board);
 }
@@ -1080,22 +1285,53 @@ static void bbk9588_create_gpio_device(Bbk9588MachineState *board)
     DeviceState *dev = qdev_new(TYPE_JZ4740_GPIO);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);
     qdev_prop_set_uint32(dev, "input-reset-b",
                          board->usb_power_connected ? 0x78000000u :
                                                       0x78040000u);
-    qdev_prop_set_uint32(dev, "input-reset-c", 0x48000000u);
-    qdev_prop_set_uint32(dev, "input-reset-d", 0x20200000u);
+    qdev_prop_set_uint32(dev, "input-reset-c",
+                         board->jz4730_soc ?
+                         0x48000000u | BBK9588_JZ4730_PEN_IRQ_MASK :
+                         0x48000000u);
+    qdev_prop_set_uint32(dev, "input-reset-d",
+                         board->jz4730_soc ?
+                         0x2020007fu :
+                         0x20200000u);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0010000u));
     for (unsigned port = 0; port < JZ4740_GPIO_NUM_PORTS; port++) {
         sysbus_connect_irq(sbd, port,
                            qdev_get_gpio_in(DEVICE(board->intc),
-                                            irq_source[port]));
+                                            bbk9588_soc_irq(
+                                                board,
+                                                irq_source[port])));
     }
     board->gpio = JZ4740_GPIO(dev);
+    if (board->jz4730_soc) {
+        jz4730_ssi_set_pintdav_callback(
+            board->ssi, bbk9588_tsc2100_pintdav, board);
+    }
     jz4740_gpio_set_input_sample_callback(
         board->gpio, bbk9588_gpio_sample_input, board);
     jz4740_gpio_set_trace_callback(board->gpio, bbk9588_gpio_trace, board);
+}
+
+static void bbk9588_create_jz4730_ssi_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev;
+    SysBusDevice *sbd;
+
+    if (!board->jz4730_soc) {
+        return;
+    }
+    dev = qdev_new(TYPE_JZ4730_SSI);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, KSEG1_TO_PHYS(0xb0043000u));
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(board->intc),
+                                        JZ4730_INTC_IRQ_SSI));
+    board->ssi = JZ4730_SSI(dev);
 }
 
 static void bbk9588_rtc_power_down(void *opaque)
@@ -1119,7 +1355,9 @@ static void bbk9588_create_rtc_device(Bbk9588MachineState *board)
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0003000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_RTC));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_RTC)));
     board->rtc = JZ4740_RTC(dev);
     jz4740_rtc_set_power_down_callback(board->rtc,
                                        bbk9588_rtc_power_down, board);
@@ -1146,6 +1384,36 @@ static void bbk9588_create_tcu_device(Bbk9588MachineState *board)
     bbk9588_sync_tcu_irq_sources(board);
 }
 
+static void bbk9588_create_jz4730_ost_device(Bbk9588MachineState *board)
+{
+    static const unsigned irq_source[JZ4730_OST_CHANNELS] = {
+        JZ4730_INTC_IRQ_OST0,
+        JZ4730_INTC_IRQ_OST1,
+        JZ4730_INTC_IRQ_OST2,
+    };
+    DeviceState *dev = qdev_new(TYPE_JZ4730_OST);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0002000u));
+    for (unsigned channel = 0; channel < JZ4730_OST_CHANNELS; channel++) {
+        sysbus_connect_irq(sbd, channel,
+                           qdev_get_gpio_in(DEVICE(board->intc),
+                                            irq_source[channel]));
+    }
+    board->ost = JZ4730_OST(dev);
+}
+
+static void bbk9588_create_jz4730_wdt_device(Bbk9588MachineState *board)
+{
+    DeviceState *dev = qdev_new(TYPE_JZ4730_WDT);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0004000u));
+    board->wdt = JZ4730_WDT(dev);
+}
+
 static void bbk9588_create_dmac_device(MachineState *machine,
                                        Bbk9588MachineState *board)
 {
@@ -1153,6 +1421,7 @@ static void bbk9588_create_dmac_device(MachineState *machine,
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     qdev_prop_set_uint64(dev, "ram-size", machine->ram_size);
+    qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);
     board->dmac_irq = qemu_allocate_irq(bbk9588_dmac_irq_handler, board, 0);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb3020000u));
@@ -1165,11 +1434,14 @@ static void bbk9588_create_msc_device(Bbk9588MachineState *board)
     DeviceState *dev = qdev_new(TYPE_JZ4740_MSC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    qdev_prop_set_bit(dev, "jz4730-layout", board->jz4730_soc);
     sysbus_realize(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, BBK9588_KSEG_TO_PHYS(0xb0021000u));
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(board->intc),
-                                        JZ4740_INTC_IRQ_MSC));
+                                        bbk9588_soc_irq(
+                                            board,
+                                            JZ4740_INTC_IRQ_MSC)));
     board->msc = JZ4740_MSC(dev);
 }
 
@@ -1307,6 +1579,9 @@ static void bbk9588_set_storage_trace(Object *obj, bool value,
     board->storage_trace_enabled = value;
     bbk9588_diag_set_storage_enabled(board->diag, value);
     bbk9588_nand_set_trace_enabled(board->nand_dev, value);
+    if (board->cpu) {
+        board->cpu->env.bbk9588_storage_trace = value;
+    }
 }
 
 static bool bbk9588_get_graphics_trace(Object *obj, Error **errp)
@@ -1525,6 +1800,15 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->intc_irq) {
         qemu_free_irq(board->intc_irq);
     }
+    if (board->harb) {
+        object_unref(OBJECT(board->harb));
+    }
+    if (board->pwm) {
+        object_unref(OBJECT(board->pwm));
+    }
+    if (board->i2c) {
+        object_unref(OBJECT(board->i2c));
+    }
     if (board->cpm) {
         object_unref(OBJECT(board->cpm));
     }
@@ -1555,8 +1839,17 @@ static void bbk9588_instance_finalize(Object *obj)
     if (board->sadc) {
         object_unref(OBJECT(board->sadc));
     }
+    if (board->ssi) {
+        object_unref(OBJECT(board->ssi));
+    }
     if (board->tcu) {
         object_unref(OBJECT(board->tcu));
+    }
+    if (board->ost) {
+        object_unref(OBJECT(board->ost));
+    }
+    if (board->wdt) {
+        object_unref(OBJECT(board->wdt));
     }
     if (board->uart) {
         object_unref(OBJECT(board->uart));
@@ -1610,6 +1903,7 @@ static void bbk9588_init(MachineState *machine)
         error_report("bbk9588: RAM must be at least 32 MiB");
         exit(1);
     }
+    board->jz4730_soc = strstr(machine->cpu_type, "JZ4730") != NULL;
     memory_region_add_subregion(system_memory, 0, machine->ram);
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
@@ -1643,7 +1937,11 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_create_diag_device(board);
     bbk9588_create_host_input(board);
     bbk9588_create_host_bridge(board);
+    bbk9588_create_jz4730_harb_device(board);
+    bbk9588_create_jz4730_pwm_device(board);
     bbk9588_create_intc_device(board);
+    bbk9588_create_jz4730_i2c_device(board);
+    bbk9588_create_jz4730_ssi_device(board);
     bbk9588_create_uart_device(board);
     bbk9588_create_udc_device(board);
     bbk9588_create_cim_device(board);
@@ -1652,7 +1950,12 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_create_rtc_device(board);
     bbk9588_create_lcd_device(machine, board);
     bbk9588_create_panel_device(board);
-    bbk9588_create_tcu_device(board);
+    if (board->jz4730_soc) {
+        bbk9588_create_jz4730_ost_device(board);
+        bbk9588_create_jz4730_wdt_device(board);
+    } else {
+        bbk9588_create_tcu_device(board);
+    }
     bbk9588_create_cpm_device(board);
     bbk9588_create_dmac_device(machine, board);
     bbk9588_create_msc_device(board);
@@ -1665,6 +1968,8 @@ static void bbk9588_init(MachineState *machine)
     bbk9588_create_dma_bridge(board);
     bbk9588_host_bridge_connect_display(board->host_bridge, board->lcd,
                                         board->panel);
+    bbk9588_host_bridge_set_scanout_hflip(board->host_bridge,
+                                          board->jz4730_soc);
     bbk9588_host_bridge_connect_audio(board->host_bridge, board->aic,
                                       board->dmac);
 
@@ -1783,8 +2088,9 @@ static void bbk9588_machine_class_init(ObjectClass *oc, const void *data)
         "Diagnostic progress-sampling timer period in milliseconds; 0 disables it");
     bbk9588_add_period_ms_property(
         oc, "lcd-refresh-period-ms",
-        offsetof(Bbk9588MachineState, lcd_refresh_period_ms), 250,
-        "RGB565 panel scanout/frame chardev refresh period in milliseconds");
+        offsetof(Bbk9588MachineState, lcd_refresh_period_ms),
+        BBK9588_LCD_VBLANK_PERIOD_MS,
+        "LCD vblank and RGB565 panel scanout period in milliseconds");
 
     mc->desc = "BBK 9588 handheld learning computer";
     mc->init = bbk9588_init;

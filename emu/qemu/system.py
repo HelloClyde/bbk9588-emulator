@@ -25,7 +25,13 @@ from .ftl import normalize_c200_logical_tail_pages
 
 DEFAULT_QEMU_EXECUTABLE = "qemu-system-mipsel"
 DEFAULT_QEMU_MACHINE = "bbk9588"
+DEFAULT_QEMU_CHIP = "jz4740"
 DEFAULT_QEMU_CPU = "JZ4740"
+DEFAULT_QEMU_RAM_MB = 32
+QEMU_CHIP_CPUS = {
+    "jz4740": "JZ4740",
+    "jz4730": "JZ4730",
+}
 DEFAULT_BBK9588_COMPAT_MACHINE_OPTIONS: tuple[str, ...] = ()
 REMOVED_BBK9588_MACHINE_OPTIONS: tuple[str, ...] = (
     "semaphore-fastpath",
@@ -46,6 +52,9 @@ QEMU_BBK_FRAME_HEADER = struct.Struct("<IIIIIII")
 QEMU_BBK_PERF_PAYLOAD = struct.Struct("<QQ")
 QEMU_BBK_AIC_PERF_PAYLOAD = struct.Struct("<24Q")
 DEFAULT_C200_BASE = 0x80004000
+BBK_C200_WRAPPER_HEADER_SIZE = 0x40
+BBK_C200_WRAPPER_XOR_KEY = 0x4853514C
+BBK_C200_WRAPPER_MARKER = b"C200KERNEL"
 DEFAULT_UBOOT_BASE = 0x80900000
 DEFAULT_C200_PHYS = DEFAULT_C200_BASE & 0x1FFFFFFF
 DEFAULT_UBOOT_PHYS = DEFAULT_UBOOT_BASE & 0x1FFFFFFF
@@ -811,8 +820,9 @@ class QemuSystemConfig:
 
     executable: str = DEFAULT_QEMU_EXECUTABLE
     machine: str = "malta"
+    chip: str = DEFAULT_QEMU_CHIP
     cpu: str = DEFAULT_QEMU_CPU
-    ram_mb: int = 160
+    ram_mb: int = DEFAULT_QEMU_RAM_MB
     accel: str = "tcg,thread=multi,tb-size=256"
     display: str = "none"
     serial: str = "mon:stdio"
@@ -6141,12 +6151,21 @@ class QemuProcessBackend:
                             trigger_thread.start()
                         stop = _gdb_continue_wait(
                             self.gdb_sock,
-                            timeout=max(0.05, min(0.25, deadline - time.time())),
+                            timeout=max(0.05, deadline - time.time()),
                         )
                     except socket.timeout:
                         row["timeout_waiting_for_breakpoint"] = True
                         try:
                             row["timeout_interrupt_stop"] = _gdb_interrupt(self.gdb_sock)
+                            row["timeout_pc"] = (
+                                f"0x{self._read_register_paused_locked(37) & 0xFFFFFFFF:08x}"
+                            )
+                            row["timeout_sp"] = (
+                                f"0x{self._read_register_paused_locked(29) & 0xFFFFFFFF:08x}"
+                            )
+                            row["timeout_ra"] = (
+                                f"0x{self._read_register_paused_locked(31) & 0xFFFFFFFF:08x}"
+                            )
                         except Exception as exc:
                             row["timeout_interrupt_error"] = f"{type(exc).__name__}: {exc}"
                         break
@@ -6189,6 +6208,7 @@ class QemuProcessBackend:
                         return self._read_virtual_memory_paused_locked(addr, size).hex()
 
                     if pc in {
+                        0x80004D74,
                         0x8002D1B8,
                         0x8002D21C,
                         0x8002D0E8,
@@ -8057,6 +8077,55 @@ def qemu_safe_payload_path(path: Path) -> Path:
     return target.resolve()
 
 
+def qemu_c200_payload_path(path: Path) -> Path:
+    """Validate and unwrap a BBK C200KERNEL image when a wrapper is present."""
+
+    source = path.resolve()
+    wrapped = source.read_bytes()
+    if len(wrapped) < BBK_C200_WRAPPER_HEADER_SIZE:
+        return qemu_safe_payload_path(source)
+
+    decoded = bytearray(wrapped[:BBK_C200_WRAPPER_HEADER_SIZE])
+    for offset in range(0, BBK_C200_WRAPPER_HEADER_SIZE, 4):
+        word = struct.unpack_from("<I", decoded, offset)[0]
+        struct.pack_into("<I", decoded, offset, word ^ BBK_C200_WRAPPER_XOR_KEY)
+    if bytes(decoded[: len(BBK_C200_WRAPPER_MARKER)]) != BBK_C200_WRAPPER_MARKER:
+        return qemu_safe_payload_path(source)
+
+    payload = wrapped[BBK_C200_WRAPPER_HEADER_SIZE:]
+    declared_size = struct.unpack_from("<I", decoded, 0x10)[0]
+    declared_payload_sum = struct.unpack_from("<I", decoded, 0x14)[0]
+    declared_header_sum = struct.unpack_from("<I", decoded, 0x3C)[0]
+    failed: list[str] = []
+    if declared_size != len(payload):
+        failed.append("payload size")
+    if declared_payload_sum != (sum(payload) & 0xFFFFFFFF):
+        failed.append("payload checksum")
+    if declared_header_sum != (sum(decoded[:0x3C]) & 0xFFFFFFFF):
+        failed.append("header checksum")
+    if failed:
+        raise ValueError(f"invalid C200KERNEL wrapper ({', '.join(failed)}): {source}")
+
+    payload_digest = hashlib.sha256(payload).hexdigest()
+    digest = payload_digest[:12]
+    target = (
+        Path("build") / "qemu_payloads" / f"{source.stem}_{digest}.raw.bin"
+    ).resolve()
+    if target.is_file() and target.stat().st_size == len(payload):
+        if hashlib.sha256(target.read_bytes()).hexdigest() == payload_digest:
+            return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def migrate_legacy_nand_checkpoint(path: Path) -> Path | None:
     """Replace an active NAND with the old checkpoint once, then remove it."""
 
@@ -8172,8 +8241,9 @@ def build_bbk_qemu_config(
     load_addr: int | None = None,
     pc: int | None = None,
     machine: str = DEFAULT_QEMU_MACHINE,
-    cpu: str = DEFAULT_QEMU_CPU,
-    ram_mb: int = 160,
+    chip: str = DEFAULT_QEMU_CHIP,
+    cpu: str | None = None,
+    ram_mb: int = DEFAULT_QEMU_RAM_MB,
     accel: str = "tcg,thread=multi,tb-size=256",
     display: str = "none",
     serial: str = "mon:stdio",
@@ -8191,6 +8261,18 @@ def build_bbk_qemu_config(
     startup_power_hold_seconds: float = 0.75,
     performance_priority: bool = True,
 ) -> QemuSystemConfig:
+    chip = str(chip).lower()
+    if chip not in QEMU_CHIP_CPUS:
+        raise ValueError(f"unsupported Ingenic chip {chip!r}")
+    expected_cpu = QEMU_CHIP_CPUS[chip]
+    cpu = expected_cpu if cpu is None else str(cpu)
+    if machine.lower() == "bbk9588" and cpu.lower() != expected_cpu.lower():
+        raise ValueError(
+            f"chip={chip!r} requires QEMU CPU {expected_cpu!r}, found {cpu!r}"
+        )
+    if chip == "jz4730" and boot_mode != "c200":
+        raise ValueError("chip='jz4730' currently requires boot_mode='c200'")
+
     firmware_patches = normalize_firmware_patches(
         firmware_patches,
         default=default_firmware_patches_for_machine(machine),
@@ -8232,8 +8314,12 @@ def build_bbk_qemu_config(
         else:
             extra_payloads = ()
     elif boot_mode == "c200":
+        default_image_name = "C200knl.bin" if chip == "jz4730" else "C200.bin"
+        c200_image = qemu_c200_payload_path(
+            image or find_workspace_file(default_image_name)
+        )
         boot_image = qemu_patched_payload_path(
-            image or find_workspace_file("C200.bin"),
+            c200_image,
             base=DEFAULT_C200_BASE,
             patch_names=firmware_patches,
         )
@@ -8253,6 +8339,7 @@ def build_bbk_qemu_config(
     return QemuSystemConfig(
         executable=executable,
         machine=machine,
+        chip=chip,
         cpu=cpu,
         ram_mb=ram_mb,
         accel=accel,

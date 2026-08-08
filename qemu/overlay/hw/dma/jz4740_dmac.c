@@ -28,6 +28,24 @@
 #define DMAC_DDB              0x308u
 #define DMAC_DDBS             0x30cu
 
+#define JZ4730_DMAC_DIRQP     0x0f8u
+#define JZ4730_DMAC_DMACR     0x0fcu
+#define JZ4730_DCS_COMMAND_MASK 0xf8cff79fu
+#define JZ4730_DCS_SAI        0x00800000u
+#define JZ4730_DCS_DAI        0x00400000u
+#define JZ4730_DCS_SP_SHIFT   14u
+#define JZ4730_DCS_DP_SHIFT   12u
+#define JZ4730_DCS_TSZ_SHIFT  8u
+#define JZ4730_DCS_TSZ_MASK   0x00000700u
+#define JZ4730_DCS_TM         0x00000080u
+#define JZ4730_DCS_AR         0x00000010u
+#define JZ4730_DCS_CT         0x00000008u
+#define JZ4730_DCS_HLT        0x00000004u
+#define JZ4730_DCS_TIE        0x00000002u
+#define JZ4730_DCS_CTE        0x00000001u
+#define JZ4730_DCS_STATUS_MASK \
+    (JZ4730_DCS_AR | JZ4730_DCS_CT | JZ4730_DCS_HLT)
+
 #define DMAC_DMACR_DMAE       0x00000001u
 #define DMAC_DMACR_AR         0x00000004u
 #define DMAC_DMACR_HLT        0x00000008u
@@ -82,6 +100,7 @@ struct JZ4740DMACState {
     uint64_t ram_size;
     bool irq_level;
     bool transferring;
+    bool jz4730_layout;
 
     JZ4740DMACPeripheralOps ops;
     void *ops_opaque;
@@ -178,6 +197,299 @@ static void dmac_sync_irq(JZ4740DMACState *s)
         s->irq_level = level;
         qemu_set_irq(s->irq, level);
     }
+}
+
+static void dmac_trace(JZ4740DMACState *s, uint32_t event,
+                       unsigned channel, hwaddr offset, uint32_t value);
+static bool dmac_ram_range_valid(JZ4740DMACState *s, uint32_t addr,
+                                 uint32_t bytes);
+static void dmac_memory_read(uint32_t addr, void *buf, uint32_t bytes);
+static void dmac_memory_write(uint32_t addr, const void *buf, uint32_t bytes);
+
+static bool dmac4730_channel_enabled(JZ4740DMACState *s, unsigned channel)
+{
+    return channel < JZ4740_DMAC_CHANNELS &&
+           (dmac_reg(s, JZ4730_DMAC_DMACR) & DMAC_DMACR_DMAE) &&
+           (dmac_reg(s, channel * DMAC_CHANNEL_STRIDE + DMAC_DCS) &
+            JZ4730_DCS_CTE);
+}
+
+static uint32_t dmac4730_unit_bytes(uint32_t command)
+{
+    switch ((command & JZ4730_DCS_TSZ_MASK) >> JZ4730_DCS_TSZ_SHIFT) {
+    case 0:
+        return 4;
+    case 1:
+        return 1;
+    case 2:
+        return 2;
+    case 3:
+        return 16;
+    case 4:
+        return 32;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t dmac4730_port_bytes(uint32_t command, unsigned shift)
+{
+    switch ((command >> shift) & DMAC_DCM_PORT_MASK) {
+    case 0:
+        return 4;
+    case 1:
+        return 1;
+    case 2:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static void dmac4730_sync_irq(JZ4740DMACState *s)
+{
+    uint32_t pending = 0;
+    uint32_t global_status = 0;
+    bool level = false;
+
+    for (unsigned channel = 0; channel < JZ4740_DMAC_CHANNELS; channel++) {
+        uint32_t status = dmac_reg(
+            s, channel * DMAC_CHANNEL_STRIDE + DMAC_DCS);
+
+        if (status & JZ4730_DCS_STATUS_MASK) {
+            pending |= 1u << (channel + 8u);
+        }
+        if (status & JZ4730_DCS_AR) {
+            global_status |= DMAC_DMACR_AR;
+            level = true;
+        }
+        if (status & JZ4730_DCS_HLT) {
+            global_status |= DMAC_DMACR_HLT;
+            level = true;
+        }
+        if ((status & JZ4730_DCS_CT) && (status & JZ4730_DCS_TIE)) {
+            level = true;
+        }
+    }
+    dmac_set_reg(s, JZ4730_DMAC_DIRQP, pending);
+    dmac_set_reg(s, JZ4730_DMAC_DMACR,
+                 (dmac_reg(s, JZ4730_DMAC_DMACR) &
+                  ~(DMAC_DMACR_AR | DMAC_DMACR_HLT)) | global_status);
+    if (level != s->irq_level) {
+        s->irq_level = level;
+        qemu_set_irq(s->irq, level);
+    }
+}
+
+static void dmac4730_finish_transfer(JZ4740DMACState *s, unsigned channel,
+                                     uint32_t request)
+{
+    uint32_t base = channel * DMAC_CHANNEL_STRIDE;
+    uint32_t status = dmac_reg(s, base + DMAC_DCS);
+
+    dmac_set_reg(s, base + DMAC_DTC, 0);
+    dmac_set_reg(s, base + DMAC_DCS,
+                 (status & ~JZ4730_DCS_CTE) | JZ4730_DCS_CT);
+    if ((request == JZ4740_DMAC_REQUEST_AIC_TX ||
+         request == JZ4740_DMAC_REQUEST_AIC_RX) && s->ops.complete) {
+        s->ops.complete(s->ops_opaque, request);
+    }
+    dmac4730_sync_irq(s);
+}
+
+static void dmac4730_set_address_error(JZ4740DMACState *s,
+                                       unsigned channel)
+{
+    uint32_t base = channel * DMAC_CHANNEL_STRIDE;
+
+    dmac_set_reg(s, base + DMAC_DCS,
+                 dmac_reg(s, base + DMAC_DCS) | JZ4730_DCS_AR);
+    dmac4730_sync_irq(s);
+}
+
+static bool dmac4730_try_bulk_transfer(JZ4740DMACState *s,
+                                       unsigned channel)
+{
+    uint32_t base = channel * DMAC_CHANNEL_STRIDE;
+    uint32_t count;
+    uint32_t request;
+    uint32_t command;
+
+    if (!s->ops.bulk_transfer || !dmac4730_channel_enabled(s, channel)) {
+        return false;
+    }
+    count = dmac_reg(s, base + DMAC_DTC) & DMAC_DTC_MASK;
+    if (!count) {
+        return false;
+    }
+    request = dmac_reg(s, base + DMAC_DRT) & DMAC_DRT_MASK;
+    command = dmac_reg(s, base + DMAC_DCS);
+    if (!s->ops.bulk_transfer(s->ops_opaque, channel, request,
+                              dmac_reg(s, base + DMAC_DSA),
+                              dmac_reg(s, base + DMAC_DTA), count,
+                              command)) {
+        return false;
+    }
+    dmac4730_finish_transfer(s, channel, request);
+    dmac_trace(s, 3, channel, base, count * dmac4730_unit_bytes(command));
+    return true;
+}
+
+static bool dmac4730_try_auto_transfer(JZ4740DMACState *s,
+                                       unsigned channel)
+{
+    uint32_t base = channel * DMAC_CHANNEL_STRIDE;
+    uint32_t source;
+    uint32_t target;
+    uint32_t count;
+    uint32_t command;
+    uint32_t unit_bytes;
+    uint64_t bytes64;
+    uint32_t bytes;
+    uint32_t done = 0;
+
+    if (!dmac4730_channel_enabled(s, channel) ||
+        (dmac_reg(s, base + DMAC_DRT) & DMAC_DRT_MASK) != DMAC_DRT_AUTO) {
+        return false;
+    }
+    count = dmac_reg(s, base + DMAC_DTC) & DMAC_DTC_MASK;
+    command = dmac_reg(s, base + DMAC_DCS);
+    unit_bytes = dmac4730_unit_bytes(command);
+    bytes64 = (uint64_t)count * unit_bytes;
+    if (!count || !unit_bytes || !bytes64 || bytes64 > UINT32_MAX) {
+        return false;
+    }
+    bytes = bytes64;
+    source = dmac_reg(s, base + DMAC_DSA);
+    target = dmac_reg(s, base + DMAC_DTA);
+    if (!dmac_ram_range_valid(s, source, bytes) ||
+        !dmac_ram_range_valid(s, target, bytes)) {
+        dmac4730_set_address_error(s, channel);
+        return true;
+    }
+    while (done < bytes) {
+        uint8_t unit[32];
+        uint32_t source_addr = source +
+            ((command & JZ4730_DCS_SAI) ? done : 0);
+        uint32_t target_addr = target +
+            ((command & JZ4730_DCS_DAI) ? done : 0);
+
+        dmac_memory_read(source_addr, unit, unit_bytes);
+        dmac_memory_write(target_addr, unit, unit_bytes);
+        done += unit_bytes;
+    }
+    if (command & JZ4730_DCS_SAI) {
+        dmac_set_reg(s, base + DMAC_DSA, source + bytes);
+    }
+    if (command & JZ4730_DCS_DAI) {
+        dmac_set_reg(s, base + DMAC_DTA, target + bytes);
+    }
+    dmac4730_finish_transfer(s, channel, DMAC_DRT_AUTO);
+    dmac_trace(s, 4, channel, base, bytes);
+    return true;
+}
+
+static bool dmac4730_try_audio_transfer(JZ4740DMACState *s,
+                                        unsigned channel)
+{
+    uint32_t base = channel * DMAC_CHANNEL_STRIDE;
+    uint32_t source;
+    uint32_t target;
+    uint32_t count;
+    uint32_t request;
+    uint32_t command;
+    uint32_t unit_bytes;
+    uint32_t sample_bytes;
+    uint32_t transferred = 0;
+    bool transmit;
+
+    if (!dmac4730_channel_enabled(s, channel)) {
+        return false;
+    }
+    count = dmac_reg(s, base + DMAC_DTC) & DMAC_DTC_MASK;
+    request = dmac_reg(s, base + DMAC_DRT) & DMAC_DRT_MASK;
+    if (!count || (request != JZ4740_DMAC_REQUEST_AIC_TX &&
+                   request != JZ4740_DMAC_REQUEST_AIC_RX) ||
+        !(s->request_levels & (1u << request))) {
+        return false;
+    }
+    transmit = request == JZ4740_DMAC_REQUEST_AIC_TX;
+    command = dmac_reg(s, base + DMAC_DCS);
+    unit_bytes = dmac4730_unit_bytes(command);
+    sample_bytes = dmac4730_port_bytes(
+        command, transmit ? JZ4730_DCS_DP_SHIFT : JZ4730_DCS_SP_SHIFT);
+    if (!unit_bytes || !sample_bytes || unit_bytes % sample_bytes) {
+        dmac4730_set_address_error(s, channel);
+        return true;
+    }
+    source = dmac_reg(s, base + DMAC_DSA);
+    target = dmac_reg(s, base + DMAC_DTA);
+    if (!s->ops.address_valid ||
+        !s->ops.address_valid(s->ops_opaque, request,
+                              transmit ? target : source)) {
+        dmac4730_set_address_error(s, channel);
+        return true;
+    }
+    while (count) {
+        uint8_t unit[32];
+        size_t completed;
+
+        if (!(s->request_levels & (1u << request)) &&
+            !(command & JZ4730_DCS_TM)) {
+            break;
+        }
+        if (transmit) {
+            if (!dmac_ram_range_valid(s, source, unit_bytes) || !s->ops.write) {
+                dmac4730_set_address_error(s, channel);
+                return true;
+            }
+            dmac_memory_read(source, unit, unit_bytes);
+            completed = s->ops.write(s->ops_opaque, request, unit,
+                                     unit_bytes, sample_bytes);
+        } else {
+            if (!dmac_ram_range_valid(s, target, unit_bytes) || !s->ops.read) {
+                dmac4730_set_address_error(s, channel);
+                return true;
+            }
+            completed = s->ops.read(s->ops_opaque, request, unit,
+                                    unit_bytes, sample_bytes);
+            if (completed == unit_bytes) {
+                dmac_memory_write(target, unit, unit_bytes);
+            }
+        }
+        if (completed != unit_bytes) {
+            break;
+        }
+        count--;
+        transferred += unit_bytes;
+        if (command & JZ4730_DCS_SAI) {
+            source += unit_bytes;
+        }
+        if (command & JZ4730_DCS_DAI) {
+            target += unit_bytes;
+        }
+    }
+    dmac_set_reg(s, base + DMAC_DTC, count);
+    dmac_set_reg(s, base + DMAC_DSA, source);
+    dmac_set_reg(s, base + DMAC_DTA, target);
+    if (!count) {
+        dmac4730_finish_transfer(s, channel, request);
+    }
+    if (transferred) {
+        dmac_trace(s, 3, channel, base, transferred);
+    }
+    return transferred != 0;
+}
+
+static void dmac4730_try_channel(JZ4740DMACState *s, unsigned channel)
+{
+    if (dmac4730_try_bulk_transfer(s, channel)) {
+        return;
+    }
+    if (dmac4730_try_auto_transfer(s, channel)) {
+        return;
+    }
+    dmac4730_try_audio_transfer(s, channel);
 }
 
 static void dmac_trace(JZ4740DMACState *s, uint32_t event,
@@ -689,10 +1001,18 @@ void jz4740_dmac_kick(JZ4740DMACState *s)
     }
     s->transferring = true;
     for (unsigned channel = 0; channel < JZ4740_DMAC_CHANNELS; channel++) {
-        dmac_try_channel(s, channel, true);
+        if (s->jz4730_layout) {
+            dmac4730_try_channel(s, channel);
+        } else {
+            dmac_try_channel(s, channel, true);
+        }
     }
     s->transferring = false;
-    dmac_sync_irq(s);
+    if (s->jz4730_layout) {
+        dmac4730_sync_irq(s);
+    } else {
+        dmac_sync_irq(s);
+    }
 }
 
 void jz4740_dmac_set_request(JZ4740DMACState *s, unsigned request,
@@ -730,7 +1050,23 @@ void jz4740_dmac_set_peripheral_ops(JZ4740DMACState *s,
 
 bool jz4740_dmac_irq_pending(JZ4740DMACState *s)
 {
-    return s && dmac_irq_pending_internal(s);
+    if (!s) {
+        return false;
+    }
+    if (s->jz4730_layout) {
+        for (unsigned channel = 0; channel < JZ4740_DMAC_CHANNELS; channel++) {
+            uint32_t status = dmac_reg(
+                s, channel * DMAC_CHANNEL_STRIDE + DMAC_DCS);
+
+            if ((status & (JZ4730_DCS_AR | JZ4730_DCS_HLT)) ||
+                ((status & JZ4730_DCS_CT) &&
+                 (status & JZ4730_DCS_TIE))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return dmac_irq_pending_internal(s);
 }
 
 uint32_t jz4740_dmac_get_reg(JZ4740DMACState *s, hwaddr offset)
@@ -799,6 +1135,29 @@ static void dmac_write(void *opaque, hwaddr offset, uint64_t value,
     }
     reg = (old_reg & ~mask) | (((uint32_t)value << shift) & mask);
     dmac_set_reg(s, aligned, reg);
+
+    if (s->jz4730_layout) {
+        if (aligned == JZ4730_DMAC_DMACR) {
+            dmac_set_reg(s, aligned,
+                         reg & (DMAC_DMACR_DMAE | DMAC_DMACR_PM_MASK));
+            jz4740_dmac_kick(s);
+        } else if (aligned == JZ4730_DMAC_DIRQP) {
+            dmac4730_sync_irq(s);
+        } else if (dmac_channel_offset(aligned, &channel, &channel_reg) &&
+                   channel_reg <= DMAC_DCS) {
+            if (channel_reg == DMAC_DCS) {
+                dmac_set_reg(s, aligned, reg & JZ4730_DCS_COMMAND_MASK);
+            } else if (channel_reg == DMAC_DTC) {
+                dmac_set_reg(s, aligned, reg & DMAC_DTC_MASK);
+            } else if (channel_reg == DMAC_DRT) {
+                dmac_set_reg(s, aligned, reg & DMAC_DRT_MASK);
+            }
+            dmac_trace(s, 1, channel, aligned, dmac_reg(s, aligned));
+            dmac4730_sync_irq(s);
+            jz4740_dmac_kick(s);
+        }
+        return;
+    }
 
     if (aligned == DMAC_DMACR) {
         dmac_set_reg(s, aligned, reg & (DMAC_DMACR_DMAE | DMAC_DMACR_PM_MASK));
@@ -878,7 +1237,11 @@ static int dmac_post_load(void *opaque, int version_id)
 
     s->irq_level = false;
     s->transferring = false;
-    dmac_sync_irq(s);
+    if (s->jz4730_layout) {
+        dmac4730_sync_irq(s);
+    } else {
+        dmac_sync_irq(s);
+    }
     return 0;
 }
 
@@ -909,6 +1272,7 @@ static const VMStateDescription vmstate_jz4740_dmac = {
 static const Property dmac_properties[] = {
     DEFINE_PROP_UINT64("ram-size", JZ4740DMACState, ram_size,
                        160u * 1024u * 1024u),
+    DEFINE_PROP_BOOL("jz4730-layout", JZ4740DMACState, jz4730_layout, false),
 };
 
 static void dmac_init(Object *obj)

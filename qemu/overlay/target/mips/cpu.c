@@ -215,6 +215,33 @@ static const mips_def_t jz4740_cpu_def = {
     .mmu_type = MMU_TYPE_R4000,
 };
 
+/*
+ * JZ4730 uses the same first-generation XBurst CP0/cache geometry as the
+ * early JZ4740, but predates MXU.  Keeping this as a separate CPU model is
+ * important: exposing MXU makes unsupported opcodes appear valid to guest
+ * software and hides firmware portability bugs.
+ */
+static const mips_def_t jz4730_cpu_def = {
+    .name = "JZ4730",
+    .CP0_PRid = 0x0ad0024f,
+    .CP0_Config0 = MIPS_CONFIG0 | (MMU_TYPE_R4000 << CP0C0_MT),
+    .CP0_Config1 = MIPS_CONFIG1 | (31 << CP0C1_MMU) |
+                   (1 << CP0C1_IS) | (4 << CP0C1_IL) | (3 << CP0C1_IA) |
+                   (1 << CP0C1_DS) | (4 << CP0C1_DL) | (3 << CP0C1_DA) |
+                   (0 << CP0C1_CA),
+    .CP0_Config2 = MIPS_CONFIG2,
+    .CP0_Config3 = MIPS_CONFIG3,
+    .CP0_LLAddr_rw_bitmask = 0,
+    .CP0_LLAddr_shift = 4,
+    .SYNCI_Step = 32,
+    .CCRes = 2,
+    .CP0_Status_rw_bitmask = 0x1278FF17,
+    .SEGBITS = 32,
+    .PABITS = 32,
+    .insn_flags = CPU_MIPS32R1,
+    .mmu_type = MMU_TYPE_R4000,
+};
+
 static void mips_cpu_reset_hold(Object *obj, ResetType type)
 {
     CPUState *cs = CPU(obj);
@@ -698,6 +725,7 @@ static void mips_cpu_register_types(void)
         mips_register_cpudef_type(&mips_defs[i]);
     }
     mips_register_cpudef_type(&jz4740_cpu_def);
+    mips_register_cpudef_type(&jz4730_cpu_def);
 }
 
 type_init(mips_cpu_register_types)

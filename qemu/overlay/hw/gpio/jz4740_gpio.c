@@ -47,11 +47,25 @@
 
 #define GPIO_IM_RESET              0xffffffffu
 
+#define JZ4730_GPIO_MODELED_SIZE   0x00c0u
+#define JZ4730_GPIO_PORT_STRIDE    0x0030u
+#define JZ4730_GPIO_DAT            0x00u
+#define JZ4730_GPIO_DIR            0x04u
+#define JZ4730_GPIO_PE             0x0cu
+#define JZ4730_GPIO_FSL            0x10u
+#define JZ4730_GPIO_FSH            0x14u
+#define JZ4730_GPIO_ITL            0x18u
+#define JZ4730_GPIO_ITH            0x1cu
+#define JZ4730_GPIO_IE             0x20u
+#define JZ4730_GPIO_IM             0x24u
+#define JZ4730_GPIO_IRQ            0x28u
+
 struct JZ4740GPIOState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq[JZ4740_GPIO_NUM_PORTS];
+    bool jz4730_layout;
     uint32_t regs[GPIO_REG_WORDS];
     uint32_t input_level[JZ4740_GPIO_NUM_PORTS];
     uint32_t input_reset[JZ4740_GPIO_NUM_PORTS];
@@ -76,6 +90,60 @@ static void gpio_notify_trace(JZ4740GPIOState *s, uint32_t reason)
     }
 }
 
+static uint32_t *gpio_jz4730_reg(JZ4740GPIOState *s, unsigned port,
+                                 hwaddr reg_offset)
+{
+    hwaddr offset = port * JZ4730_GPIO_PORT_STRIDE + reg_offset;
+
+    return &s->regs[offset / sizeof(uint32_t)];
+}
+
+static unsigned gpio_jz4730_trigger(JZ4740GPIOState *s, unsigned port,
+                                    unsigned pin)
+{
+    uint32_t value;
+
+    if (pin < 16) {
+        value = *gpio_jz4730_reg(s, port, JZ4730_GPIO_ITL);
+        return (value >> (pin * 2)) & 3u;
+    }
+    value = *gpio_jz4730_reg(s, port, JZ4730_GPIO_ITH);
+    return (value >> ((pin - 16) * 2)) & 3u;
+}
+
+static uint32_t gpio_jz4730_edge_mask(JZ4740GPIOState *s, unsigned port)
+{
+    uint32_t mask = 0;
+
+    for (unsigned pin = 0; pin < JZ4740_GPIO_PINS_PER_PORT; pin++) {
+        if (gpio_jz4730_trigger(s, port, pin) >= 2) {
+            mask |= 1u << pin;
+        }
+    }
+    return mask;
+}
+
+static void gpio_jz4730_recompute_levels(JZ4740GPIOState *s, unsigned port)
+{
+    uint32_t input = s->input_level[port];
+    uint32_t enabled = *gpio_jz4730_reg(s, port, JZ4730_GPIO_IE);
+
+    for (unsigned pin = 0; pin < JZ4740_GPIO_PINS_PER_PORT; pin++) {
+        uint32_t bit = 1u << pin;
+        unsigned trigger = gpio_jz4730_trigger(s, port, pin);
+
+        if (!(enabled & bit) || trigger >= 2) {
+            continue;
+        }
+        if ((trigger == 0 && !(input & bit)) ||
+            (trigger == 1 && (input & bit))) {
+            s->flag[port] |= bit;
+        } else {
+            s->flag[port] &= ~bit;
+        }
+    }
+}
+
 static void gpio_update_irq(JZ4740GPIOState *s, unsigned port)
 {
     bool level;
@@ -83,7 +151,15 @@ static void gpio_update_irq(JZ4740GPIOState *s, unsigned port)
     if (port >= JZ4740_GPIO_NUM_PORTS) {
         return;
     }
-    level = s->flag[port] != 0;
+    if (s->jz4730_layout) {
+        uint32_t enabled = *gpio_jz4730_reg(s, port, JZ4730_GPIO_IE);
+        uint32_t masked = *gpio_jz4730_reg(s, port, JZ4730_GPIO_IM);
+
+        gpio_jz4730_recompute_levels(s, port);
+        level = (s->flag[port] & enabled & ~masked) != 0;
+    } else {
+        level = s->flag[port] != 0;
+    }
     s->irq_level[port] = level;
     qemu_set_irq(s->irq[port], level);
 }
@@ -106,7 +182,27 @@ bool jz4740_gpio_set_input_level(JZ4740GPIOState *s, unsigned port,
     }
     changed = previous ^ s->input_level[port];
     if (changed && latch_flag) {
-        s->flag[port] |= changed;
+        if (s->jz4730_layout) {
+            uint32_t enabled = *gpio_jz4730_reg(s, port, JZ4730_GPIO_IE);
+
+            for (unsigned pin = 0; pin < JZ4740_GPIO_PINS_PER_PORT; pin++) {
+                uint32_t bit = 1u << pin;
+                unsigned trigger;
+
+                if (!(changed & enabled & bit)) {
+                    continue;
+                }
+                trigger = gpio_jz4730_trigger(s, port, pin);
+                if ((trigger == 2 && (previous & bit) &&
+                     !(s->input_level[port] & bit)) ||
+                    (trigger == 3 && !(previous & bit) &&
+                     (s->input_level[port] & bit))) {
+                    s->flag[port] |= bit;
+                }
+            }
+        } else {
+            s->flag[port] |= changed;
+        }
         gpio_update_irq(s, port);
     }
     if (changed) {
@@ -208,6 +304,36 @@ static uint64_t gpio_read(void *opaque, hwaddr offset, unsigned size)
     hwaddr reg_offset;
     uint32_t value;
 
+    if (s->jz4730_layout) {
+        if (aligned_offset >= JZ4730_GPIO_MODELED_SIZE) {
+            return 0;
+        }
+        port = aligned_offset / JZ4730_GPIO_PORT_STRIDE;
+        reg_offset = aligned_offset % JZ4730_GPIO_PORT_STRIDE;
+        value = s->regs[aligned_offset / sizeof(uint32_t)];
+        if (reg_offset == JZ4730_GPIO_DAT) {
+            uint32_t direction = *gpio_jz4730_reg(
+                s, port, JZ4730_GPIO_DIR);
+
+            value = (value & direction) |
+                    (s->input_level[port] & ~direction);
+            if (s->input_sample_callback) {
+                value = s->input_sample_callback(s->input_sample_opaque,
+                                                 port, value);
+            }
+            s->last_read_offset = offset;
+            s->last_read_value = value;
+            gpio_notify_trace(s, 11u);
+        } else if (reg_offset == JZ4730_GPIO_IRQ) {
+            gpio_jz4730_recompute_levels(s, port);
+            value = s->flag[port];
+            s->last_flag_offset = offset;
+            s->last_flag_value = value;
+            gpio_notify_trace(s, 12u);
+        }
+        return gpio_extract32(value, offset, size);
+    }
+
     if (aligned_offset >= GPIO_MODELED_SIZE) {
         return 0;
     }
@@ -254,7 +380,10 @@ static void gpio_write(void *opaque, hwaddr offset, uint64_t value,
     uint32_t *write_only;
     uint32_t *reg = NULL;
 
-    if (aligned_offset >= GPIO_MODELED_SIZE) {
+    if (s->jz4730_layout && aligned_offset >= JZ4730_GPIO_MODELED_SIZE) {
+        return;
+    }
+    if (!s->jz4730_layout && aligned_offset >= GPIO_MODELED_SIZE) {
         return;
     }
     switch (size) {
@@ -270,6 +399,39 @@ static void gpio_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     }
     lane_value = ((uint32_t)value << shift) & mask;
+
+    if (s->jz4730_layout) {
+        uint32_t *target;
+
+        port = aligned_offset / JZ4730_GPIO_PORT_STRIDE;
+        reg_offset = aligned_offset % JZ4730_GPIO_PORT_STRIDE;
+        target = &s->regs[aligned_offset / sizeof(uint32_t)];
+        switch (reg_offset) {
+        case JZ4730_GPIO_DAT:
+        case JZ4730_GPIO_DIR:
+        case JZ4730_GPIO_PE:
+        case JZ4730_GPIO_FSL:
+        case JZ4730_GPIO_FSH:
+        case JZ4730_GPIO_ITL:
+        case JZ4730_GPIO_ITH:
+        case JZ4730_GPIO_IE:
+        case JZ4730_GPIO_IM:
+            *target = (*target & ~mask) | lane_value;
+            break;
+        case JZ4730_GPIO_IRQ:
+            s->flag[port] &= ~(lane_value &
+                               gpio_jz4730_edge_mask(s, port));
+            break;
+        default:
+            return;
+        }
+        gpio_update_irq(s, port);
+        s->last_write_offset = offset;
+        s->last_write_value = lane_value;
+        gpio_notify_trace(s, 8u);
+        return;
+    }
+
     write_only = &s->regs[aligned_offset / sizeof(uint32_t)];
     *write_only = (*write_only & ~mask) | lane_value;
     port = aligned_offset / GPIO_PORT_STRIDE;
@@ -384,7 +546,11 @@ static void gpio_reset_hold(Object *obj, ResetType type)
     s->last_write_offset = 0;
     s->last_write_value = 0;
     for (unsigned port = 0; port < JZ4740_GPIO_NUM_PORTS; port++) {
-        *gpio_canonical_reg(s, port, GPIO_IM) = GPIO_IM_RESET;
+        if (s->jz4730_layout) {
+            *gpio_jz4730_reg(s, port, JZ4730_GPIO_PE) = 0xffffffffu;
+        } else {
+            *gpio_canonical_reg(s, port, GPIO_IM) = GPIO_IM_RESET;
+        }
         qemu_set_irq(s->irq[port], 0);
     }
 }
@@ -422,6 +588,8 @@ static const VMStateDescription vmstate_jz4740_gpio = {
 };
 
 static const Property gpio_properties[] = {
+    DEFINE_PROP_BOOL("jz4730-layout", JZ4740GPIOState,
+                     jz4730_layout, false),
     DEFINE_PROP_UINT32("input-reset-a", JZ4740GPIOState,
                        input_reset[JZ4740_GPIO_PORT_A], 0),
     DEFINE_PROP_UINT32("input-reset-b", JZ4740GPIOState,

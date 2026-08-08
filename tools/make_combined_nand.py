@@ -21,6 +21,7 @@ DEFAULT_BOOTROM_BACKUP_ADDR = 0x2000
 ECC_BLOCK_BYTES = 512
 BOOT_ECC_OOB_OFFSET = 6
 DATA_ECC_OOB_OFFSET = 4
+JZ4730_FAT_PAGE_BASE = 0x1740
 
 
 def page_oob_ecc(data: bytes, *, offset: int) -> bytes:
@@ -31,6 +32,12 @@ def page_oob_ecc(data: bytes, *, offset: int) -> bytes:
 
 def ranges_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
     return start_a < end_b and start_b < end_a
+
+
+def jz4730_ftl_tag(logical_block: int) -> int:
+    if logical_block < 0 or logical_block >= 0x8000:
+        raise ValueError("JZ4730 logical block does not fit the 15-bit OOB tag")
+    return (logical_block << 1) | (logical_block.bit_count() & 1)
 
 
 def write_page_with_ecc(
@@ -51,6 +58,33 @@ def write_page_with_ecc(
     output.write(data)
     output.write(oob_ecc)
     output.write(b"\xff" * (spare_size - len(oob_ecc)))
+
+
+def write_jz4730_data_page(
+    output,
+    *,
+    page: int,
+    data: bytes,
+    logical_block: int,
+    page_size: int,
+    spare_size: int,
+) -> None:
+    if len(data) != page_size:
+        raise ValueError("page data must match the configured NAND page size")
+    sectors = page_size // ECC_BLOCK_BYTES
+    if spare_size < sectors * 16:
+        raise ValueError("JZ4730 layout requires 16 OOB bytes per 512-byte sector")
+    tag = jz4730_ftl_tag(logical_block)
+    oob = bytearray(b"\xff" * spare_size)
+    for sector in range(sectors):
+        base = sector * 16
+        oob[base + 1] = 0
+        struct.pack_into("<H", oob, base + 6, tag)
+        oob[base + 8 : base + 11] = b"\0\0\0"
+        struct.pack_into("<H", oob, base + 11, tag)
+    output.seek(page * (page_size + spare_size))
+    output.write(data)
+    output.write(oob)
 
 
 def main() -> None:
@@ -83,7 +117,8 @@ def main() -> None:
     ap.add_argument("--uboot-entry", type=lambda text: int(text, 0), default=0x80900000)
     ap.add_argument("--fat-image", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
-    ap.add_argument("--fat-page-base", type=lambda text: int(text, 0), default=0x1C40)
+    ap.add_argument("--layout", choices=("jz4740", "jz4730"), default="jz4740")
+    ap.add_argument("--fat-page-base", type=lambda text: int(text, 0), default=None)
     ap.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
     ap.add_argument("--spare-size", type=int, default=DEFAULT_SPARE_SIZE)
     ap.add_argument(
@@ -103,6 +138,13 @@ def main() -> None:
         ),
     )
     args = ap.parse_args()
+
+    if args.fat_page_base is None:
+        args.fat_page_base = JZ4730_FAT_PAGE_BASE if args.layout == "jz4730" else 0x1C40
+    if args.layout == "jz4730" and (args.loader_image or args.uboot_image or args.base_nand):
+        raise SystemExit("JZ4730 direct-boot data NAND does not accept boot-stage images")
+    if args.layout == "jz4730" and args.fat_page_base % args.pages_per_block:
+        raise SystemExit("JZ4730 FAT page base must be block-aligned")
 
     stride = args.page_size + args.spare_size
     if args.page_size <= 0 or args.spare_size < 0 or args.pages_per_block <= 0:
@@ -299,16 +341,26 @@ def main() -> None:
             chunk = fat[page * args.page_size : (page + 1) * args.page_size]
             if len(chunk) < args.page_size:
                 chunk += b"\x00" * (args.page_size - len(chunk))
-            write_page_with_ecc(
-                f,
-                page=args.fat_page_base + page,
-                data=chunk,
-                page_size=args.page_size,
-                spare_size=args.spare_size,
-                ecc_oob_offset=DATA_ECC_OOB_OFFSET,
-            )
+            if args.layout == "jz4730":
+                write_jz4730_data_page(
+                    f,
+                    page=args.fat_page_base + page,
+                    data=chunk,
+                    logical_block=page // args.pages_per_block,
+                    page_size=args.page_size,
+                    spare_size=args.spare_size,
+                )
+            else:
+                write_page_with_ecc(
+                    f,
+                    page=args.fat_page_base + page,
+                    data=chunk,
+                    page_size=args.page_size,
+                    spare_size=args.spare_size,
+                    ecc_oob_offset=DATA_ECC_OOB_OFFSET,
+                )
             programmed_pages.add(args.fat_page_base + page)
-        if args.spare_size >= 5:
+        if args.layout == "jz4740" and args.spare_size >= 5:
             erased_ecc = page_oob_ecc(
                 b"\xff" * args.page_size,
                 offset=BOOT_ECC_OOB_OFFSET,
@@ -331,6 +383,7 @@ def main() -> None:
 
     print(
         f"wrote {args.output} size=0x{out_size:x} "
+        f"layout={args.layout} "
         f"os_page_base=0x{args.os_page_base:x} os_pages=0x{os_pages:x} "
         f"fat_page_base=0x{args.fat_page_base:x} pages=0x{page_count:x} "
         f"free_blocks=0x{max(0, args.free_blocks):x} "

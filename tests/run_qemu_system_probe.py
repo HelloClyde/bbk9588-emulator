@@ -20,6 +20,7 @@ from emu.qemu.system import (
     DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
+    DEFAULT_QEMU_RAM_MB,
     TOUCH_CALIBRATION_REFERENCE_POINTS,
     QemuProcessBackend,
     _gdb_continue_wait,
@@ -7475,7 +7476,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pc", type=lambda value: int(value, 0))
     ap.add_argument("--machine", default=DEFAULT_QEMU_MACHINE)
     ap.add_argument("--cpu", default=DEFAULT_QEMU_CPU)
-    ap.add_argument("--ram-mb", type=int, default=160)
+    ap.add_argument("--ram-mb", type=int, default=DEFAULT_QEMU_RAM_MB)
     ap.add_argument("--accel", default="tcg,thread=multi,tb-size=256")
     ap.add_argument("--display", default="none")
     ap.add_argument("--serial", default="mon:stdio")

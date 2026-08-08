@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/sd/jz4740_msc.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -20,6 +21,7 @@
 
 #define MSC_STRPCL                 0x0000u
 #define MSC_STAT                   0x0004u
+#define MSC_CMDAT                  0x000cu
 #define MSC_RESTO                  0x0010u
 #define MSC_RDTO                   0x0014u
 #define MSC_IMASK                  0x0024u
@@ -37,6 +39,15 @@
 #define MSC_STRPCL_START_COMPAT    0x00000006u
 #define MSC_STAT_CLOCK_EN          0x00000800u
 #define MSC_STAT_CLOCK_STOP        0x00000100u
+#define MSC_STAT_FIFO_ALMOST_FULL  0x00000400u
+#define MSC_STAT_FIFO_EMPTY        0x00000040u
+#define MSC_STAT_END_CMD_RES       0x00000800u
+#define MSC_IREG_END_CMD_RES       0x00000004u
+#define MSC_IREG_RXFIFO_RD_REQ     0x00000020u
+#define MSC_IREG_TXFIFO_WR_REQ     0x00000040u
+#define MSC_CMDAT_DATA_EN          0x00000008u
+#define MSC_CMDAT_WRITE            0x00000010u
+#define MSC_CMDAT_DMA_EN           0x00000100u
 #define MSC_DMA_PHYS_MASK          0x1fffffffu
 #define MSC_READ_SINGLE_BLOCK      0x11u
 #define MSC_READ_MULTIPLE_BLOCK    0x12u
@@ -63,6 +74,7 @@ struct JZ4740MSCState {
     uint32_t last_dma_phys;
     uint32_t last_dma_words;
     uint32_t dma_complete_count;
+    bool jz4730_layout;
 
     JZ4740MSCKickCallback kick_callback;
     void *kick_opaque;
@@ -105,6 +117,8 @@ static void msc_prepare_response(JZ4740MSCState *s)
 {
     uint32_t command = msc_reg(s, MSC_CMD) & 0xffu;
     uint32_t argument = msc_reg(s, MSC_ARG);
+    uint32_t command_data = msc_reg(s, MSC_CMDAT);
+    uint32_t interrupt_status;
 
     memset(s->response, 0, sizeof(s->response));
     s->response[0] = command;
@@ -115,8 +129,12 @@ static void msc_prepare_response(JZ4740MSCState *s)
     s->read_pending = false;
     s->write_pending = false;
     s->data_ready = false;
-    msc_set_reg(s, MSC_IREG,
-                msc_reg(s, MSC_IREG) & ~MSC_DATA_READY_MASK);
+    interrupt_status = msc_reg(s, MSC_IREG) & ~MSC_DATA_READY_MASK;
+    if (s->jz4730_layout) {
+        interrupt_status |= MSC_IREG_END_CMD_RES;
+        msc_set_reg(s, MSC_STAT,
+                    msc_reg(s, MSC_STAT) | MSC_STAT_END_CMD_RES);
+    }
 
     switch (command) {
     case MSC_READ_SINGLE_BLOCK:
@@ -132,6 +150,25 @@ static void msc_prepare_response(JZ4740MSCState *s)
     default:
         break;
     }
+
+    if (s->jz4730_layout && (command_data & MSC_CMDAT_DATA_EN)) {
+        bool write = (command_data & MSC_CMDAT_WRITE) != 0;
+
+        s->read_pending = !write;
+        s->write_pending = write;
+        if (write) {
+            s->write_lba = argument >> 9;
+            interrupt_status |= MSC_IREG_TXFIFO_WR_REQ;
+        } else {
+            s->read_lba = argument >> 9;
+            interrupt_status |= MSC_IREG_RXFIFO_RD_REQ;
+        }
+        if (!(command_data & MSC_CMDAT_DMA_EN)) {
+            s->data_ready = true;
+            interrupt_status |= MSC_DATA_READY_MASK;
+        }
+    }
+    msc_set_reg(s, MSC_IREG, interrupt_status);
 
     if (s->command_callback) {
         s->command_callback(s->command_opaque, command, argument);
@@ -186,6 +223,9 @@ static uint64_t msc_read(void *opaque, hwaddr offset, unsigned size)
     }
     value = reg_offset == MSC_IREG ?
             msc_interrupt_status(s) : msc_reg(s, reg_offset);
+    if (s->jz4730_layout && reg_offset == MSC_STAT && s->data_ready) {
+        value = (value & ~MSC_STAT_FIFO_EMPTY) | MSC_STAT_FIFO_ALMOST_FULL;
+    }
     value >>= shift;
     switch (size) {
     case 1:
@@ -374,7 +414,7 @@ static int msc_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_jz4740_msc = {
     .name = TYPE_JZ4740_MSC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = msc_post_load,
     .fields = (const VMStateField[]) {
@@ -392,8 +432,13 @@ static const VMStateDescription vmstate_jz4740_msc = {
         VMSTATE_UINT32(last_dma_phys, JZ4740MSCState),
         VMSTATE_UINT32(last_dma_words, JZ4740MSCState),
         VMSTATE_UINT32(dma_complete_count, JZ4740MSCState),
+        VMSTATE_BOOL_V(jz4730_layout, JZ4740MSCState, 2),
         VMSTATE_END_OF_LIST()
     },
+};
+
+static const Property msc_properties[] = {
+    DEFINE_PROP_BOOL("jz4730-layout", JZ4740MSCState, jz4730_layout, false),
 };
 
 static void msc_init(Object *obj)
@@ -414,6 +459,7 @@ static void msc_class_init(ObjectClass *oc, const void *data)
 
     dc->vmsd = &vmstate_jz4740_msc;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    device_class_set_props(dc, msc_properties);
     rc->phases.hold = msc_reset_hold;
 }
 

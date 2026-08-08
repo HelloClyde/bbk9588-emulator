@@ -131,7 +131,7 @@ def assign_short_names(node: FsNode) -> None:
             assign_short_names(child)
 
 
-def build_tree(paths: list[Path]) -> FsNode:
+def build_tree(paths: list[Path], injected_files: list[tuple[Path, str]] | None = None) -> FsNode:
     root = FsNode(name="", source=None, is_dir=True)
     for source in paths:
         source = source.resolve()
@@ -140,6 +140,8 @@ def build_tree(paths: list[Path]) -> FsNode:
         node = read_node(source, source.name)
         root.children.append(node)
     add_bbk_compat_aliases(root)
+    for source, destination in injected_files or []:
+        add_injected_file(root, source, destination)
     assign_short_names(root)
     return root
 
@@ -156,6 +158,50 @@ def find_child(node: FsNode, name: str) -> FsNode | None:
         if child.name == name:
             return child
     return None
+
+
+def parse_injected_file(value: str) -> tuple[Path, str]:
+    source_text, separator, destination = value.partition("=")
+    if not separator or not source_text or not destination:
+        raise argparse.ArgumentTypeError("expected SOURCE=DESTINATION")
+    return Path(source_text), destination
+
+
+def add_injected_file(root: FsNode, source: Path, destination: str) -> None:
+    source = source.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+
+    normalized = destination.replace("\\", "/")
+    parts = normalized.split("/")
+    if (
+        not parts
+        or any(part in ("", ".", "..") for part in parts)
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+    ):
+        raise ValueError(f"invalid injected FAT path: {destination!r}")
+
+    parent = root
+    for part in parts[:-1]:
+        child = find_child(parent, part)
+        if child is None or not child.is_dir:
+            raise ValueError(f"injected FAT parent directory does not exist: {part!r}")
+        parent = child
+
+    replacement = FsNode(
+        name=parts[-1],
+        source=source,
+        is_dir=False,
+        size=source.stat().st_size,
+    )
+    existing = find_child(parent, parts[-1])
+    if existing is not None:
+        if existing.is_dir:
+            raise ValueError(f"injected FAT destination is a directory: {destination!r}")
+        parent.children[parent.children.index(existing)] = replacement
+    else:
+        parent.children.append(replacement)
 
 
 def add_systp_compat_alias(root: FsNode) -> None:
@@ -257,6 +303,16 @@ def make_dot_entry(name: bytes, target_cluster: int) -> bytes:
     return make_short_entry(node)
 
 
+def make_root_volume_label_entry(label: str) -> bytes:
+    raw = label.encode("gbk")
+    if not raw or len(raw) > 11:
+        raise ValueError("--root-volume-label must encode to 1..11 GBK bytes")
+    entry = bytearray(32)
+    entry[:11] = raw.ljust(11, b" ")
+    entry[11] = 0x08
+    return bytes(entry)
+
+
 def directory_entries(node: FsNode, parent_cluster: int) -> bytes:
     entries: list[bytes] = []
     if node.first_cluster:
@@ -331,13 +387,39 @@ def resolve_fat_layout(
     sectors_per_cluster: int,
     free_clusters: int,
     requested_volume_sectors: int,
+    reserved_sectors: int,
+    requested_sectors_per_fat: int,
 ) -> tuple[int, int, int, int]:
     root_dir_sectors = (ROOT_ENTRIES * 32 + BYTES_PER_SECTOR - 1) // BYTES_PER_SECTOR
     if requested_volume_sectors > 0:
+        if requested_sectors_per_fat > 0:
+            first_data_sector = (
+                reserved_sectors
+                + FAT_COPIES * requested_sectors_per_fat
+                + root_dir_sectors
+            )
+            if requested_volume_sectors <= first_data_sector:
+                raise ValueError("--volume-sectors is too small for FAT metadata")
+            available_clusters = (
+                requested_volume_sectors - first_data_sector
+            ) // sectors_per_cluster
+            fat_capacity = (
+                requested_sectors_per_fat * BYTES_PER_SECTOR // 2
+            ) - 2
+            if available_clusters > fat_capacity:
+                raise ValueError("--sectors-per-fat is too small for the selected volume")
+            if available_clusters < used_cluster_count:
+                raise ValueError("--volume-sectors is too small for the selected files")
+            return (
+                available_clusters,
+                requested_sectors_per_fat,
+                first_data_sector,
+                requested_volume_sectors,
+            )
         cluster_count = max(used_cluster_count, used_cluster_count + max(0, free_clusters))
         while True:
             sectors_per_fat = math.ceil(((cluster_count + 2) * 2) / BYTES_PER_SECTOR)
-            first_data_sector = RESERVED_SECTORS + FAT_COPIES * sectors_per_fat + root_dir_sectors
+            first_data_sector = reserved_sectors + FAT_COPIES * sectors_per_fat + root_dir_sectors
             if requested_volume_sectors <= first_data_sector:
                 raise ValueError("--volume-sectors is too small for FAT metadata")
             available_clusters = (requested_volume_sectors - first_data_sector) // sectors_per_cluster
@@ -348,8 +430,13 @@ def resolve_fat_layout(
             cluster_count = available_clusters
 
     cluster_count = used_cluster_count + max(0, free_clusters)
-    sectors_per_fat = math.ceil(((cluster_count + 2) * 2) / BYTES_PER_SECTOR)
-    first_data_sector = RESERVED_SECTORS + FAT_COPIES * sectors_per_fat + root_dir_sectors
+    sectors_per_fat = requested_sectors_per_fat or math.ceil(
+        ((cluster_count + 2) * 2) / BYTES_PER_SECTOR
+    )
+    fat_capacity = (sectors_per_fat * BYTES_PER_SECTOR // 2) - 2
+    if cluster_count > fat_capacity:
+        raise ValueError("--sectors-per-fat is too small for the selected files")
+    first_data_sector = reserved_sectors + FAT_COPIES * sectors_per_fat + root_dir_sectors
     volume_sectors = first_data_sector + cluster_count * sectors_per_cluster
     return cluster_count, sectors_per_fat, first_data_sector, volume_sectors
 
@@ -362,6 +449,13 @@ def build_image(
     free_clusters: int,
     sectors_per_cluster: int,
     volume_sectors: int,
+    reserved_sectors: int = RESERVED_SECTORS,
+    sectors_per_fat: int = 0,
+    sectors_per_track: int = 63,
+    heads: int = 255,
+    bpb_hidden_sectors: int | None = None,
+    volume_serial: int = 0x95884740,
+    root_volume_label: str | None = None,
 ) -> bytes:
     if sectors_per_cluster <= 0 or sectors_per_cluster > 128:
         raise ValueError("--sectors-per-cluster must be between 1 and 128")
@@ -372,6 +466,8 @@ def build_image(
         sectors_per_cluster,
         free_clusters,
         volume_sectors,
+        reserved_sectors,
+        sectors_per_fat,
     )
     if cluster_count > 0xFFF5:
         raise ValueError("FAT16 cluster count exceeds firmware-compatible range")
@@ -384,19 +480,26 @@ def build_image(
     boot[3:11] = b"MSWIN4.1"
     struct.pack_into("<H", boot, 11, BYTES_PER_SECTOR)
     boot[13] = sectors_per_cluster
-    struct.pack_into("<H", boot, 14, RESERVED_SECTORS)
+    struct.pack_into("<H", boot, 14, reserved_sectors)
     boot[16] = FAT_COPIES
     struct.pack_into("<H", boot, 17, ROOT_ENTRIES)
     struct.pack_into("<H", boot, 19, volume_sectors if volume_sectors < 0x10000 else 0)
     boot[21] = MEDIA_DESCRIPTOR
     struct.pack_into("<H", boot, 22, sectors_per_fat)
-    struct.pack_into("<H", boot, 24, 63)
-    struct.pack_into("<H", boot, 26, 255)
-    struct.pack_into("<I", boot, 28, partition_offset_sectors)
+    struct.pack_into("<H", boot, 24, sectors_per_track)
+    struct.pack_into("<H", boot, 26, heads)
+    struct.pack_into(
+        "<I",
+        boot,
+        28,
+        partition_offset_sectors
+        if bpb_hidden_sectors is None
+        else bpb_hidden_sectors,
+    )
     struct.pack_into("<I", boot, 32, volume_sectors if volume_sectors >= 0x10000 else 0)
     boot[36] = 0x80
     boot[38] = 0x29
-    struct.pack_into("<I", boot, 39, 0x95884740)
+    struct.pack_into("<I", boot, 39, volume_serial & 0xFFFFFFFF)
     boot[43:54] = volume_label.upper().encode("ascii", errors="replace")[:11].ljust(11)
     boot[54:62] = b"FAT16   "
     boot[510:512] = b"\x55\xAA"
@@ -417,13 +520,15 @@ def build_image(
 
     fat = build_fat(root, cluster_count, sectors_per_cluster)
     fat = fat + b"\x00" * (sectors_per_fat * BYTES_PER_SECTOR - len(fat))
-    fat_start = volume_base + RESERVED_SECTORS * BYTES_PER_SECTOR
+    fat_start = volume_base + reserved_sectors * BYTES_PER_SECTOR
     for copy in range(FAT_COPIES):
         start = fat_start + copy * sectors_per_fat * BYTES_PER_SECTOR
         image[start : start + len(fat)] = fat
 
     root_data = directory_entries(root, 0)
-    root_start = volume_base + (RESERVED_SECTORS + FAT_COPIES * sectors_per_fat) * BYTES_PER_SECTOR
+    if root_volume_label:
+        root_data = make_root_volume_label_entry(root_volume_label) + root_data
+    root_start = volume_base + (reserved_sectors + FAT_COPIES * sectors_per_fat) * BYTES_PER_SECTOR
     image[root_start : root_start + min(len(root_data), root_dir_sectors * BYTES_PER_SECTOR)] = root_data[
         : root_dir_sectors * BYTES_PER_SECTOR
     ]
@@ -454,7 +559,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--partition-offset-sectors",
-        type=int,
+        type=lambda text: int(text, 0),
         default=DEFAULT_PARTITION_OFFSET_SECTORS,
         help="Sector offset for the FAT16 volume. BBK firmware probes boot sector at LBA 0x20.",
     )
@@ -476,10 +581,38 @@ def main() -> int:
         default=DEFAULT_VOLUME_SECTORS,
         help="FAT volume sector count. Use 0 to size the image from file data plus --free-clusters.",
     )
+    ap.add_argument("--reserved-sectors", type=lambda text: int(text, 0), default=RESERVED_SECTORS)
+    ap.add_argument(
+        "--sectors-per-fat",
+        type=lambda text: int(text, 0),
+        default=0,
+        help="Fixed FAT16 sectors per FAT; 0 computes the smallest valid value.",
+    )
+    ap.add_argument("--sectors-per-track", type=lambda text: int(text, 0), default=63)
+    ap.add_argument("--heads", type=lambda text: int(text, 0), default=255)
+    ap.add_argument(
+        "--bpb-hidden-sectors",
+        type=lambda text: int(text, 0),
+        default=None,
+        help="Override BPB hidden-sector count without changing the physical volume offset.",
+    )
+    ap.add_argument("--volume-serial", type=lambda text: int(text, 0), default=0x95884740)
+    ap.add_argument(
+        "--root-volume-label",
+        help="Optional GBK FAT root-directory volume label, separate from the ASCII BPB label.",
+    )
+    ap.add_argument(
+        "--inject-file",
+        action="append",
+        default=[],
+        type=parse_injected_file,
+        metavar="SOURCE=DESTINATION",
+        help="Inject or replace one host file at an existing FAT directory path; may be repeated.",
+    )
     ap.add_argument("paths", type=Path, nargs="+", help="Top-level directories/files to place in the FAT root.")
     ns = ap.parse_args()
 
-    root = build_tree(ns.paths)
+    root = build_tree(ns.paths, ns.inject_file)
     image = build_image(
         root,
         ns.volume_label,
@@ -488,6 +621,13 @@ def main() -> int:
         ns.free_clusters,
         ns.sectors_per_cluster,
         ns.volume_sectors,
+        ns.reserved_sectors,
+        ns.sectors_per_fat,
+        ns.sectors_per_track,
+        ns.heads,
+        ns.bpb_hidden_sectors,
+        ns.volume_serial,
+        ns.root_volume_label,
     )
     ns.output.parent.mkdir(parents=True, exist_ok=True)
     ns.output.write_bytes(image)

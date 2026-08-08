@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/intc/jz4740_intc.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -31,6 +32,8 @@ struct JZ4740INTCState {
     uint32_t last_read_value;
     uint32_t last_write_offset;
     uint32_t last_write_value;
+    uint32_t source_mask;
+    uint32_t reset_mask;
     bool output_level;
 
     JZ4740INTCRefreshFn refresh;
@@ -41,7 +44,7 @@ static void jz4740_intc_update(JZ4740INTCState *s)
 {
     bool level;
 
-    s->pending &= JZ4740_INTC_SOURCE_MASK;
+    s->pending &= s->source_mask;
     s->unmasked_pending = s->pending & ~s->mask;
     level = s->unmasked_pending != 0;
     s->update_count++;
@@ -59,7 +62,7 @@ void jz4740_intc_set_irq(JZ4740INTCState *s, unsigned irq, bool level)
         return;
     }
     bit = 1u << irq;
-    if (!(JZ4740_INTC_SOURCE_MASK & bit)) {
+    if (!(s->source_mask & bit)) {
         return;
     }
     if (level) {
@@ -76,7 +79,7 @@ void jz4740_intc_set_pending_mask(JZ4740INTCState *s, uint32_t mask,
     if (!s) {
         return;
     }
-    mask &= JZ4740_INTC_SOURCE_MASK;
+    mask &= s->source_mask;
     s->pending = (s->pending & ~mask) | (levels & mask);
     jz4740_intc_update(s);
 }
@@ -225,7 +228,7 @@ static void jz4740_intc_reset_hold(Object *obj, ResetType type)
     JZ4740INTCState *s = JZ4740_INTC(obj);
 
     s->pending = 0;
-    s->mask = JZ4740_INTC_MASK_RESET;
+    s->mask = s->reset_mask;
     s->unmasked_pending = 0;
     s->update_count = 0;
     s->last_read_offset = 0;
@@ -257,6 +260,13 @@ static const VMStateDescription vmstate_jz4740_intc = {
     },
 };
 
+static const Property jz4740_intc_properties[] = {
+    DEFINE_PROP_UINT32("source-mask", JZ4740INTCState, source_mask,
+                       JZ4740_INTC_SOURCE_MASK),
+    DEFINE_PROP_UINT32("reset-mask", JZ4740INTCState, reset_mask,
+                       JZ4740_INTC_MASK_RESET),
+};
+
 static void jz4740_intc_init(Object *obj)
 {
     JZ4740INTCState *s = JZ4740_INTC(obj);
@@ -276,6 +286,7 @@ static void jz4740_intc_class_init(ObjectClass *oc, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     dc->vmsd = &vmstate_jz4740_intc;
+    device_class_set_props(dc, jz4740_intc_properties);
     rc->phases.hold = jz4740_intc_reset_hold;
 }
 

@@ -15191,6 +15191,7 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     case 0x8017b6ac:
     case 0x8017fbc0:
     case 0x8017fce0:
+    case 0x80182414:
     case 0x80182a90:
     case 0x80182b70:
     case 0x80182d6c:

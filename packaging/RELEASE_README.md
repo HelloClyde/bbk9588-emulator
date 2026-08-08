@@ -32,7 +32,10 @@ http://127.0.0.1:8000/
 
 启动脚本会等待 Web 服务就绪后再自动打开浏览器。
 
-Web 固定读取默认 NAND 镜像；界面只提供恢复基础镜像操作，不再切换本机路径。
+Web 默认启动 JZ4730，左侧“模拟器”面板可在 JZ4730/JZ4740 之间切换并重启；
+两种芯片分别使用自己的固件和 NAND，不会混用数据盘。
+模拟器按真机固件的 SDRAM 配置使用 32 MiB RAM。
+界面只提供恢复基础镜像操作，不再切换任意本机路径。
 右侧“文件”标签支持新建目录、导入、导出、改名和删除，可用于安装 `.bda` 应用。
 写操作期间模拟器会自动停止并重启。
 
@@ -41,7 +44,7 @@ Web 固定读取默认 NAND 镜像；界面只提供恢复基础镜像操作，�
 标准模拟器 ZIP 不内嵌固件、NAND 镜像、BDA 应用或商业资源。项目可以把经过授权的
 NAND 作为同仓库的独立 Release asset 发布。
 
-默认启动路径由 QEMU BootROM 从 NAND address `0` 按 JZ4740 spare valid flag 读取
+JZ4740 启动路径由 QEMU BootROM 从 NAND address `0` 按 JZ4740 spare valid flag 读取
 `loader_9588_4740.bin`，入口为 `0x80000004`，
 再由 loader/U-Boot 通过 FAT/FTL 读取 `系统/数据/kj409588.bin` 并进入系统固件。
 运行时只需要：
@@ -68,6 +71,11 @@ NAND 作为同仓库的独立 Release asset 发布。
 ```
 
 `C200.bin` 只用于 `-BootMode c200` direct-boot 兼容诊断模式。
+默认的 JZ4730 配置从
+`系统\数据\C200knl.bin` 自动校验、解包和 direct boot。
+JZ4730 需要匹配固件的 raw NAND dump，可用 `-Nand` 首次导入；它会保存为
+`runtime\bbk9588_jz4730_nand.bin`，不会与 JZ4740 数据盘混用。
+需要从命令行直接启动 JZ4740 时使用 `.\start-web.cmd -Chip jz4740`。
 
 生成的 FAT 卷匹配真机规格：495 MB、FAT16、16 KiB allocation unit。
 

@@ -32,6 +32,13 @@ parser；解析后的 typed 事件才进入 machine 的 GPIO/SADC 板级接线�
 `emu/qemu/system.py` 负责构建 QEMU 命令、启动进程、管理 HMP/QMP 风格的诊断通道和
 frontend backend 状态。它不应承担真实设备行为的长期替代实现。
 
+BBK 9588 的默认 RAM 为 32 MiB。JZ4730 固件的待机路径向 EMC DMCR
+`0xb3010080` 写入 `0x059a0a0d`；按 JZ4730 EMC 手册解码为 32-bit bus、
+9 column bits、12 row bits 和 4 banks，即 32 MiB。固件还使用
+`0x81f81000`/`0x81f82000` 的顶部 framebuffer，因此 16 MiB 线性 RAM 不成立。
+BDA 可申请约 11 MiB 是扣除内核、系统服务和显存预留后的应用可用量，
+不是物理 RAM 总量。
+
 已删除的 Python/GDB storage fastpath 只保留禁用状态和诊断提示；新的兼容性工作应落到
 QEMU C machine / SoC 模型中。
 

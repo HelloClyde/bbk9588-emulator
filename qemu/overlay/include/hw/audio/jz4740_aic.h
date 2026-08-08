@@ -61,5 +61,11 @@ void jz4740_aic_get_diagnostics(JZ4740AICState *s,
 void jz4740_aic_set_output_callback(JZ4740AICState *s,
                                     JZ4740AICOutputCallback callback,
                                     void *opaque);
+void jz4740_aic_set_external_codec_config(JZ4740AICState *s,
+                                          uint32_t sample_rate,
+                                          uint8_t sample_bits,
+                                          bool muted,
+                                          uint8_t left_attenuation,
+                                          uint8_t right_attenuation);
 
 #endif

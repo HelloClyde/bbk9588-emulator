@@ -26,6 +26,8 @@ void bbk9588_host_bridge_configure(
 void bbk9588_host_bridge_connect_display(Bbk9588HostBridgeState *s,
                                          JZ4740LCDState *lcd,
                                          Bbk9588PanelState *panel);
+void bbk9588_host_bridge_set_scanout_hflip(Bbk9588HostBridgeState *s,
+                                           bool enabled);
 void bbk9588_host_bridge_connect_audio(Bbk9588HostBridgeState *s,
                                        JZ4740AICState *aic,
                                        JZ4740DMACState *dmac);

@@ -42,6 +42,7 @@
 #define BBK9588_AIC_PERF_PAYLOAD_BYTES \
     (BBK9588_AIC_PERF_WORDS * sizeof(uint64_t))
 #define BBK9588_PERF_PERIOD_MS         1000u
+#define BBK9588_FRAME_SETTLE_MS        2u
 
 struct Bbk9588HostBridgeState {
     DeviceState parent_obj;
@@ -54,6 +55,7 @@ struct Bbk9588HostBridgeState {
     uint8_t last_framebuffer[BBK9588_LCD_BYTES];
     JZ4740LCDState *lcd;
     Bbk9588PanelState *panel;
+    bool scanout_hflip;
     JZ4740AICState *aic;
     JZ4740DMACState *dmac;
     Bbk9588GuestInsnCallback guest_insns;
@@ -93,9 +95,27 @@ static bool host_copy_framebuffer(Bbk9588HostBridgeState *s)
         !host_guest_ram_address_valid(fb_va, sizeof(s->framebuffer))) {
         return false;
     }
-
     cpu_physical_memory_read(BBK9588_KSEG_TO_PHYS(fb_va), s->framebuffer,
                              sizeof(s->framebuffer));
+    if (s->scanout_hflip) {
+        unsigned y;
+
+        for (y = 0; y < BBK9588_LCD_HEIGHT; y++) {
+            uint8_t *row = s->framebuffer + y * BBK9588_LCD_STRIDE;
+            unsigned left;
+
+            for (left = 0; left < BBK9588_LCD_WIDTH / 2; left++) {
+                unsigned right = BBK9588_LCD_WIDTH - 1 - left;
+                uint8_t lo = row[left * 2];
+                uint8_t hi = row[left * 2 + 1];
+
+                row[left * 2] = row[right * 2];
+                row[left * 2 + 1] = row[right * 2 + 1];
+                row[right * 2] = lo;
+                row[right * 2 + 1] = hi;
+            }
+        }
+    }
     return true;
 }
 
@@ -237,9 +257,9 @@ static bool host_frame_changed(Bbk9588HostBridgeState *s)
     return false;
 }
 
-static void host_gfx_update(void *opaque)
+static void host_gfx_update(Bbk9588HostBridgeState *s,
+                            bool signal_frame_done)
 {
-    Bbk9588HostBridgeState *s = opaque;
     bool changed;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
@@ -248,17 +268,22 @@ static void host_gfx_update(void *opaque)
         return;
     }
     changed = host_frame_changed(s);
-    if (changed) {
+    if (signal_frame_done) {
         bbk9588_panel_set_frame_done(s->panel);
         jz4740_lcd_signal_frame_done(s->lcd);
+    }
+    if (changed) {
         s->frame_chardev_sent_valid = false;
-        s->frame_stable_not_before_ms = now;
+        s->frame_stable_not_before_ms = now + BBK9588_FRAME_SETTLE_MS;
     }
     host_maybe_send_metrics(s, now);
     if (qemu_chr_fe_backend_connected(&s->frame_chr) &&
         !s->frame_chardev_sent_valid &&
         s->frame_stable_not_before_ms <= now) {
         s->frame_chardev_sent_valid = host_send_frame(s);
+        if (s->frame_chardev_sent_valid) {
+            s->frame_stable_not_before_ms = 0;
+        }
     }
     if (!changed || !s->console) {
         return;
@@ -275,12 +300,12 @@ static void host_gfx_update(void *opaque)
 
 static void host_invalidate(void *opaque)
 {
-    host_gfx_update(opaque);
+    host_gfx_update(opaque, false);
 }
 
 static const GraphicHwOps host_lcd_ops = {
     .invalidate = host_invalidate,
-    .gfx_update = host_gfx_update,
+    .gfx_update = host_invalidate,
 };
 
 static void host_schedule_refresh(Bbk9588HostBridgeState *s)
@@ -303,6 +328,7 @@ static void host_schedule_vblank(Bbk9588HostBridgeState *s)
 static void host_refresh_timer_cb(void *opaque)
 {
     Bbk9588HostBridgeState *s = opaque;
+    bool settling;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
     if (s->scanout_not_before_ms > now) {
@@ -310,7 +336,10 @@ static void host_refresh_timer_cb(void *opaque)
         return;
     }
 
-    host_gfx_update(s);
+    settling = s->frame_chardev_configured &&
+               !s->frame_chardev_sent_valid &&
+               s->frame_stable_not_before_ms != 0;
+    host_gfx_update(s, !settling);
     host_maybe_send_metrics(s, now);
     if (s->frame_chardev_configured && !s->frame_chardev_sent_valid) {
         now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -390,6 +419,12 @@ void bbk9588_host_bridge_connect_display(Bbk9588HostBridgeState *s,
     s->lcd = lcd;
     s->panel = panel;
     jz4740_lcd_set_frame_source_callback(lcd, host_frame_source_changed, s);
+}
+
+void bbk9588_host_bridge_set_scanout_hflip(Bbk9588HostBridgeState *s,
+                                           bool enabled)
+{
+    s->scanout_hflip = enabled;
 }
 
 void bbk9588_host_bridge_connect_audio(Bbk9588HostBridgeState *s,

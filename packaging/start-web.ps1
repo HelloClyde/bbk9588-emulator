@@ -3,6 +3,8 @@ param(
     [int]$Port = 8000,
     [ValidateSet("nand", "c200", "uboot")]
     [string]$BootMode = "nand",
+    [ValidateSet("jz4740", "jz4730")]
+    [string]$Chip = "jz4730",
     [string]$Nand = "",
     [switch]$NoOpenBrowser,
     [switch]$NoNandPicker,
@@ -12,6 +14,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Chip -eq "jz4730") {
+    $BootMode = "c200"
+}
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
@@ -67,9 +73,13 @@ if (-not (Test-Path -LiteralPath $Qemu)) {
 
 $RuntimeDir = Join-Path $Root "runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
-$NandImage = Join-Path $RuntimeDir "bbk9588_nand.bin"
-$LocalNandImage = Join-Path $Root "bbk9588_nand.bin"
-$LocalNandArchives = @(Get-ChildItem -LiteralPath $Root -Filter "bbk9588_nand*.zip" -File -ErrorAction SilentlyContinue)
+$Jz4730NandImage = Join-Path $RuntimeDir "bbk9588_jz4730_nand.bin"
+$Jz4740NandImage = Join-Path $RuntimeDir "bbk9588_nand.bin"
+$NandFileName = if ($Chip -eq "jz4730") { "bbk9588_jz4730_nand.bin" } else { "bbk9588_nand.bin" }
+$NandArchivePattern = if ($Chip -eq "jz4730") { "bbk9588_jz4730_nand*.zip" } else { "bbk9588_nand*.zip" }
+$NandImage = if ($Chip -eq "jz4730") { $Jz4730NandImage } else { $Jz4740NandImage }
+$LocalNandImage = Join-Path $Root $NandFileName
+$LocalNandArchives = @(Get-ChildItem -LiteralPath $Root -Filter $NandArchivePattern -File -ErrorAction SilentlyContinue)
 $NandImportSource = ""
 if ($Nand) {
     $NandImportSource = Resolve-NandSource $Nand
@@ -78,14 +88,17 @@ if ($Nand) {
 } elseif (-not (Test-Path -LiteralPath $NandImage) -and $LocalNandArchives.Count -eq 1) {
     $NandImportSource = Resolve-NandSource $LocalNandArchives[0].FullName
 }
-$FallbackNandImages = @(
-    (Join-Path $Root "build\bbk9588_nand_loader0_uboot40_fat_page1c40_root512_ftloob.bin"),
-    (Join-Path $Root "build\bbk9588_nand_loader0_uboot40_fat_page1c40_root256_ftloob.bin"),
-    (Join-Path $Root "build\bbk9588_nand_fat_page1c40_root512_ftloob.bin"),
-    (Join-Path $Root "build\bbk9588_nand_fat_page1c40_root256_ftloob.bin"),
-    (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root512_ftloob.bin"),
-    (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root256_ftloob.bin")
-)
+$FallbackNandImages = @()
+if ($Chip -eq "jz4740") {
+    $FallbackNandImages = @(
+        (Join-Path $Root "build\bbk9588_nand_loader0_uboot40_fat_page1c40_root512_ftloob.bin"),
+        (Join-Path $Root "build\bbk9588_nand_loader0_uboot40_fat_page1c40_root256_ftloob.bin"),
+        (Join-Path $Root "build\bbk9588_nand_fat_page1c40_root512_ftloob.bin"),
+        (Join-Path $Root "build\bbk9588_nand_fat_page1c40_root256_ftloob.bin"),
+        (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root512_ftloob.bin"),
+        (Join-Path $Root "build\bbk9588_nand_uboot40_fat_page1c40_root256_ftloob.bin")
+    )
+}
 if (-not $RebuildImages -and -not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource) {
     foreach ($candidate in $FallbackNandImages) {
         if (Test-Path -LiteralPath $candidate) {
@@ -112,11 +125,13 @@ if (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource -and -n
 $SystemDir = Join-Path $Root $SystemDirName
 $AppsDir = Join-Path $Root $AppsDirName
 $DataDir = Join-Path $SystemDir $DataDirName
-$C200Image = Join-Path $DataDir "C200.bin"
+$Jz4730C200Image = Join-Path $DataDir "C200knl.bin"
+$C200FileName = if ($Chip -eq "jz4730") { "C200knl.bin" } else { "C200.bin" }
+$C200Image = Join-Path $DataDir $C200FileName
 $LoaderImage = Join-Path $DataDir "loader_9588_4740.bin"
 $Kj409588Image = Join-Path $DataDir "kj409588.bin"
 $UBootImage = Join-Path $DataDir "u_boot_9588_4740.bin"
-if ($RebuildImages -or (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource)) {
+if ($Chip -eq "jz4740" -and ($RebuildImages -or (-not (Test-Path -LiteralPath $NandImage) -and -not $NandImportSource))) {
     if (
         (Test-Path -LiteralPath $LoaderImage) -and
         (Test-Path -LiteralPath $Kj409588Image) -and
@@ -158,11 +173,14 @@ Place the firmware/resource dump next to this script and run again:
 Optional for C200 direct-boot compatibility mode:
   系统\数据\C200.bin
 
-Or pass a raw image/archive explicitly:
-  .\start-web.cmd -Nand C:\path\to\bbk9588_nand.bin
-  .\start-web.cmd -Nand C:\path\to\bbk9588_nand.zip
+For JZ4730 direct boot:
+  系统\数据\C200knl.bin
+  $NandFileName (a matching JZ4730 raw NAND dump)
 
-You may also place bbk9588_nand.bin or bbk9588_nand*.zip next to start-web.cmd.
+Or pass a matching raw image/archive explicitly:
+  .\start-web.cmd -Chip $Chip -Nand C:\path\to\$NandFileName
+
+You may also place $NandFileName or $NandArchivePattern next to start-web.cmd.
 "@
 }
 
@@ -218,8 +236,12 @@ $FrontendExitCode = 1
 try {
     & $Python -m emu.web.frontend `
         --boot-mode $BootMode `
+        --chip $Chip `
         --qemu $Qemu `
         --nand-image $NandImage `
+        --jz4730-nand-image $Jz4730NandImage `
+        --jz4740-nand-image $Jz4740NandImage `
+        --jz4730-image $Jz4730C200Image `
         --host $HostName `
         --port $Port `
         @NandImportArgs `

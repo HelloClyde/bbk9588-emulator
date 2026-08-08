@@ -15,6 +15,7 @@ if __package__ in (None, ""):
 
 from emu.qemu.system import (
     DEFAULT_QEMU_CPU,
+    DEFAULT_QEMU_RAM_MB,
     build_bbk_qemu_config,
     classify_guest_pc,
     find_qemu,
@@ -66,6 +67,7 @@ def qemu_web_probe(ns: argparse.Namespace) -> dict[str, object]:
     values = vars(ns).copy()
     values.update(
         backend="qemu",
+        chip="jz4740",
         port=port,
         use_existing=False,
         frame_push_min_interval=0.04,
@@ -160,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--qemu-timeout", type=float, default=2.0)
     ap.add_argument("--qemu-firmware-patch", action="append", default=None)
     ap.add_argument("--hmp-sample", type=float, action="append", default=[0.2, 1.0])
-    ap.add_argument("--ram-mb", type=int, default=160)
+    ap.add_argument("--ram-mb", type=int, default=DEFAULT_QEMU_RAM_MB)
     ap.add_argument("--out-dir", type=Path, default=BUILD)
     ap.add_argument("--prefix", default="qemu_backend_benchmark")
     ns = ap.parse_args(argv)

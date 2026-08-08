@@ -14,12 +14,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from emu.qemu.system import (
-    DEFAULT_QEMU_CPU,
     DEFAULT_QEMU_EXECUTABLE,
     DEFAULT_QEMU_MACHINE,
+    DEFAULT_QEMU_RAM_MB,
 )
 from emu.web.frontend_server import FrontendHandler as Handler
 from emu.web.frontend_state import (
+    DEFAULT_WEB_CHIP,
     DEFAULT_WEB_QEMU_ICOUNT,
     FrontendState,
     display_to_panel_point,
@@ -158,6 +159,8 @@ HTML = r"""<!doctype html>
     .operation-status { width: 100%; min-height: 18px; color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; }
     .operation-status.error { color: #ff9f9f; }
     .feedback-actions { margin-top: 8px; }
+    .chip-select { flex: 1 1 120px; min-width: 0; }
+    .chip-switch { width: 100%; margin-top: 8px; }
     .mobile-drawer-button, .drawer-header, .drawer-backdrop { display: none; }
     .drawer-header { min-height: 38px; align-items: center; justify-content: space-between; margin-bottom: 12px; color: #cbd3dd; font-size: 13px; font-weight: 600; }
     .drawer-close { width: 32px; height: 32px; padding: 0; background: #343941; font-size: 22px; line-height: 1; }
@@ -213,6 +216,14 @@ HTML = r"""<!doctype html>
       </section>
       <section class="panel">
         <h2>模拟器</h2>
+        <div class="row">
+          <label for="chipSelect">芯片</label>
+          <select id="chipSelect" class="chip-select" aria-label="模拟芯片">
+            <option value="jz4730">JZ4730</option>
+            <option value="jz4740">JZ4740</option>
+          </select>
+        </div>
+        <button id="applyChip" class="secondary chip-switch" disabled>切换并重启</button>
         <div class="row">
           <button id="stop" class="secondary">安全关机</button>
           <button id="reset" class="secondary">重新启动</button>
@@ -336,6 +347,8 @@ const frontendInputCalibrationEl = document.getElementById('frontendInputCalibra
 const performancePriorityEl = document.getElementById('performancePriority');
 const usbPowerConnectedEl = document.getElementById('usbPowerConnected');
 const imageStatusEl = document.getElementById('imageStatus');
+const chipSelectEl = document.getElementById('chipSelect');
+const applyChipEl = document.getElementById('applyChip');
 const openSettingsEl = document.getElementById('openSettings');
 const settingsDialogEl = document.getElementById('settingsDialog');
 const closeSettingsEl = document.getElementById('closeSettings');
@@ -384,6 +397,8 @@ let poller = null;
 let framePoller = null;
 let framePollInFlight = false;
 let lifecycleRequestPending = false;
+let currentChip = 'jz4730';
+let chipSelectionDirty = false;
 let feedbackRequestPending = false;
 let ws = null;
 let wsOpenPromise = null;
@@ -1007,12 +1022,31 @@ function requestRotation(delta) {
     });
   }, 1200);
 }
+function updateChipControls(s) {
+  const reportedChip = String(s.chip || 'jz4730').toLowerCase();
+  currentChip = reportedChip;
+  const availability = new Map((s.chip_options || []).map(item => [item.value, item]));
+  for (const option of chipSelectEl.options) {
+    const state = availability.get(option.value);
+    const missing = state?.missing || [];
+    option.disabled = state ? state.available === false && option.value !== reportedChip : false;
+    option.textContent = `${state?.label || option.value.toUpperCase()}${missing.length ? `（缺少 ${missing.join('、')}）` : ''}`;
+  }
+  if (!chipSelectionDirty || chipSelectEl.value === reportedChip) {
+    chipSelectEl.value = reportedChip;
+    chipSelectionDirty = false;
+  }
+  const selected = chipSelectEl.selectedOptions[0];
+  chipSelectEl.disabled = lifecycleRequestPending;
+  applyChipEl.disabled = lifecycleRequestPending || !chipSelectionDirty || selected?.disabled === true;
+}
 function renderStatus(s) {
   applyFrontendOrientation(s.orientation || currentOrientation);
   frontendInputCalibrationEl.checked = Boolean(s.frontend_input_calibration);
   performancePriorityEl.checked = s.performance_priority !== false;
   usbPowerConnectedEl.checked = Boolean(s.usb_power_connected);
   imageStatusEl.textContent = basename(s.nand_image) || 'bbk9588_nand.bin';
+  updateChipControls(s);
   const qemuPerf = s.qemu?.performance || {};
   const qemuAudio = qemuPerf.audio || {};
   const audioTransport = s.audio_transport || {};
@@ -1020,6 +1054,8 @@ function renderStatus(s) {
   renderLifecycle(s);
   const rows = [
     ['running', s.running],
+    ['chip', String(s.chip || '').toUpperCase()],
+    ['ram', `${s.ram_mb ?? 32} MiB`],
     ['since reset', formatElapsed(s.reset_elapsed_seconds ?? s.emulator_elapsed_seconds)],
     ['qemu fps', formatRate(firstNumber(qemuPerf.frame_chardev_fps, qemuPerf.frame_chardev_average_fps), 'fps')],
     ['web fps', formatRate(frontendPerf.websocket_fps, 'fps')],
@@ -1547,7 +1583,7 @@ async function saveFeedbackBundle() {
     saveFeedbackEl.disabled = false;
   }
 }
-async function runLifecycleCommand(op, pendingLabel) {
+async function runLifecycleCommand(op, pendingLabel, payload = {}) {
   if (lifecycleRequestPending) return;
   lifecycleRequestPending = true;
   setOperationStatus(pendingLabel);
@@ -1555,8 +1591,11 @@ async function runLifecycleCommand(op, pendingLabel) {
   resetEl.disabled = true;
   forceStopEl.disabled = true;
   powerKeyEl.disabled = true;
+  chipSelectEl.disabled = true;
+  applyChipEl.disabled = true;
   try {
-    const status = await api('/api/command', jsonRequest({op}));
+    const status = await api('/api/command', jsonRequest({op, ...payload}));
+    if (status.error) throw new Error(status.error);
     renderStatus(status);
     setOperationStatus(status.lifecycle_notice || '');
   } catch (err) {
@@ -1579,6 +1618,17 @@ stopEl.onclick = requestStop;
 forceStopEl.onclick = () => {
   if (!window.confirm('强制停止可能中断 NAND 写入并损坏文件系统，确定继续？')) return;
   runLifecycleCommand('force-stop', '正在强制停止');
+};
+chipSelectEl.onchange = () => {
+  chipSelectionDirty = chipSelectEl.value !== currentChip;
+  const selected = chipSelectEl.selectedOptions[0];
+  applyChipEl.disabled = lifecycleRequestPending || !chipSelectionDirty || selected?.disabled === true;
+};
+applyChipEl.onclick = () => {
+  const chip = chipSelectEl.value;
+  if (!chip || chip === currentChip) return;
+  stopScheduledAudio();
+  runLifecycleCommand('set-chip', `正在切换到 ${chip.toUpperCase()} 并重新启动`, {chip});
 };
 saveFeedbackEl.onclick = saveFeedbackBundle;
 frontendInputCalibrationEl.onchange = () => {
@@ -2271,7 +2321,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Serve a local BBK 9588 QEMU frontend.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--ram-mb", type=int, default=160)
+    ap.add_argument("--ram-mb", type=int, default=DEFAULT_QEMU_RAM_MB)
     ap.add_argument(
         "--frame-push-min-interval",
         type=float,
@@ -2284,7 +2334,7 @@ def main(argv: list[str] | None = None) -> int:
         default=1.0,
         help="Minimum seconds between full framebuffer-stat rescans for status JSON.",
     )
-    ap.add_argument("--boot-mode", choices=["nand", "c200", "uboot"], default="nand", help="QEMU cold-boot path.")
+    ap.add_argument("--boot-mode", choices=["nand", "c200", "uboot"], help="QEMU cold-boot path.")
     ap.add_argument(
         "--image",
         type=Path,
@@ -2296,6 +2346,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional legacy C200 RAM preload for uboot mode.",
     )
     ap.add_argument("--nand-image", type=Path, help="Raw NAND image backing the frontend emulator.")
+    ap.add_argument("--jz4730-nand-image", type=Path, help="JZ4730 NAND image used by the Web chip selector.")
+    ap.add_argument("--jz4740-nand-image", type=Path, help="JZ4740 NAND image used by the Web chip selector.")
+    ap.add_argument("--jz4730-image", type=Path, help="C200knl.bin used by the JZ4730 Web profile.")
     ap.add_argument(
         "--nand-import-source",
         type=Path,
@@ -2325,7 +2378,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--backend", choices=["qemu"], default="qemu", help=argparse.SUPPRESS)
     ap.add_argument("--qemu", default=DEFAULT_QEMU_EXECUTABLE, help="QEMU executable.")
     ap.add_argument("--qemu-machine", default=DEFAULT_QEMU_MACHINE, help="QEMU machine.")
-    ap.add_argument("--qemu-cpu", default=DEFAULT_QEMU_CPU, help="QEMU CPU model.")
+    ap.add_argument("--chip", choices=["jz4740", "jz4730"], default=DEFAULT_WEB_CHIP, help="Ingenic SoC model.")
+    ap.add_argument("--qemu-cpu", default=None, help="Override the CPU implied by --chip.")
     ap.add_argument("--qemu-accel", default="tcg,thread=multi,tb-size=256", help="QEMU accelerator options.")
     ap.add_argument(
         "--performance-priority",
@@ -2381,6 +2435,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
     args.backend = "qemu"
+    if args.boot_mode is None:
+        args.boot_mode = "c200" if args.chip == "jz4730" else "nand"
 
     state = FrontendState(args)
     Handler.state = state

@@ -26,7 +26,9 @@ NAND 启动 loader、U-Boot 和系统固件，并通过本地 Web 界面提供�
    下载官方测试镜像。也可以[直接下载 `bbk9588_nand-v1.2.0.zip`](https://github.com/HelloClyde/bbk9588-emulator/releases/download/nand-v1.2.0/bbk9588_nand-v1.2.0.zip)，
    无需解压，放到模拟器解压目录即可。首次启动也可以直接在文件选择窗口中选择
    `.bin` 或 `.zip`。
-3. 双击 `start-web.cmd`，Web 服务就绪后浏览器会打开 <http://127.0.0.1:8000/>。
+3. 上述 Release 镜像属于 JZ4740，运行 `start-web.cmd -Chip jz4740`；Web 服务就绪后
+   浏览器会打开 <http://127.0.0.1:8000/>。准备好匹配的 JZ4730 固件和 NAND 后，直接
+   双击 `start-web.cmd` 即使用默认的 JZ4730。
 
 启动器会把 NAND 校验并导入到 `runtime/bbk9588_nand.bin`。以后直接双击启动即可。
 也可以显式指定镜像：
@@ -48,6 +50,7 @@ Web 默认启用自适应 instruction clock，使 TCU 定时在视频解码等�
 版本更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 - BootROM → NAND loader → U-Boot → C200 系统冷启动。
+- 按固件 SDRAM 配置建模 32 MiB RAM，不把 BDA 可用堆或 512 MiB NAND 误当物理内存。
 - 专用 JZ4740/XBurstR1 CPU 型号，以及 INTC、TCU、CPM、DMAC、AIC/internal codec
   等独立 QEMU 设备模型。
 - LCD RGB565 frame chardev、本地 WebSocket 显示和左右 90° 旋转。
@@ -132,6 +135,22 @@ python -m emu.web.frontend `
   --boot-mode nand `
   --nand-image .\runtime\bbk9588_nand.bin `
   --qemu E:\qemu-src\build-bbk9588-win\qemu-system-mipsel.exe
+```
+
+Web 默认使用 JZ4730，左侧“模拟器”面板可在 JZ4730/JZ4740 之间切换并重启。
+JZ4730 使用 `C200knl.bin` direct boot；启动器会校验并自动解开
+`C200KERNEL` 封装，然后选择专用的 `JZ4730` CPU 和外设布局。JZ4740 也可在启动时显式选择：
+
+```powershell
+.\start-web.cmd -Chip jz4740
+```
+
+固件放在 `系统\数据\C200knl.bin`；JZ4730 当前只支持 `c200` 启动模式。
+数据盘必须使用匹配 JZ4730 固件的 raw NAND dump，启动器会单独保存为
+`runtime\bbk9588_jz4730_nand.bin`，不会复用 JZ4740 的标准镜像：
+
+```powershell
+.\start-web.cmd -Chip jz4730 -Nand C:\path\to\bbk9588_jz4730_nand.bin
 ```
 
 Windows 默认启用性能优先模式：QEMU 使用高于正常的进程优先级、关闭执行速度节流，
