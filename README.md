@@ -75,6 +75,8 @@ checkpoint 或会话 work copy；测试必须自行提供临时 NAND fixture。�
 每个 Web 实例会持有该路径的跨进程独占锁，同一 NAND 不能被两个模拟器
 同时打开。文件管理和 `-Nand` 导入都先构造临时候选镜像，校验 FTL、FAT
 和目标内容后再原子替换；校验失败时原镜像保持不变。
+进入 Web “文件”标签时需确认安全关机；之后可连续管理 NAND 文件，
+不会在每次操作后自动重启。
 
 维护者可以用以下命令生成带 SHA256 manifest 的 NAND Release ZIP：
 

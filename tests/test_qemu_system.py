@@ -5454,6 +5454,38 @@ class QemuSystemCommandTests(unittest.TestCase):
             self.assertTrue(reset_entered.is_set())
             self.assertEqual(failures, [])
 
+    def test_nand_file_mutation_requires_stopped_emulator_and_does_not_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "bbk9588_nand.bin"
+            image.write_bytes(b"\xff")
+            state = FrontendState.__new__(FrontendState)
+            state.nand_lifecycle_lock = threading.RLock()
+            state.nand_files_lock = state.nand_lifecycle_lock
+            state.nand_image_lease = NandImageLease()
+            state.qemu_backend = mock.Mock()
+            state.qemu_backend.snapshot.return_value = {"running": True}
+            state._nand_files_image = lambda: image  # type: ignore[method-assign]
+            state._invalidate_nand_files_cache = mock.Mock()  # type: ignore[method-assign]
+            state.snapshot = lambda: {"running": False}  # type: ignore[method-assign]
+            state.stop = mock.Mock(side_effect=AssertionError("unexpected stop"))  # type: ignore[method-assign]
+            state.reset = mock.Mock(side_effect=AssertionError("unexpected reset"))  # type: ignore[method-assign]
+
+            operation = mock.Mock()
+            with mock.patch("emu.web.frontend_state.mutate_nand_files") as mutation:
+                with self.assertRaisesRegex(RuntimeError, "请先安全关机"):
+                    state._mutate_nand_files(operation)
+                mutation.assert_not_called()
+
+                state.qemu_backend.snapshot.return_value = {"running": False}
+                result = state._mutate_nand_files(operation)
+
+            mutation.assert_called_once_with(image, operation, validator=None)
+            state.stop.assert_not_called()
+            state.reset.assert_not_called()
+            self.assertFalse(result["running"])
+            self.assertTrue(result["nand_files_changed"])
+            state.nand_image_lease.release()
+
     def test_backend_status_exposes_direct_active_nand(self) -> None:
         image = Path("runtime") / "bbk9588_nand.bin"
         backend = QemuProcessBackend(QemuSystemConfig(nand_image=image))
@@ -8053,6 +8085,11 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="applyChip"', frontend)
         self.assertIn("runLifecycleCommand('set-chip'", frontend)
         self.assertIn("['ram', `${s.ram_mb ?? 32} MiB`]", frontend)
+        self.assertIn("async function openNandFileManager()", frontend)
+        self.assertIn("管理 NAND 文件需要停止模拟器", frontend)
+        self.assertIn("status = await runLifecycleCommand('stop'", frontend)
+        self.assertIn("filesTabButtonEl.onclick = () => openNandFileManager()", frontend)
+        self.assertNotIn("模拟器将重启", frontend)
         self.assertIn('id="keymapSettingsPane" class="settings-pane keymap-panel"', frontend)
         self.assertIn("if (settingsDialogEl.open) return;", frontend)
         self.assertIn("if (!settingsDialogEl.open) settingsDialogEl.showModal();", frontend)
@@ -8109,7 +8146,7 @@ class QemuSystemCommandTests(unittest.TestCase):
         self.assertIn('id="forceStop" class="warn">强制停止</button>', frontend)
         self.assertIn("runLifecycleCommand('stop', '正在等待固件安全关机')", frontend)
         self.assertIn("runLifecycleCommand('reset', '正在安全关机并重新启动')", frontend)
-        self.assertIn("setOperationStatus(status.lifecycle_notice || '')", frontend)
+        self.assertIn("setOperationStatus(result.lifecycle_notice || '')", frontend)
         self.assertIn("runLifecycleCommand('force-stop', '正在强制停止')", frontend)
         self.assertIn("wsSend({op:'set-usb-power', connected:usbPowerConnectedEl.checked})", frontend)
         self.assertIn(

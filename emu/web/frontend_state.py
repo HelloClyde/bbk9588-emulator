@@ -678,31 +678,33 @@ class FrontendState:
         if isinstance(cache_path, Path):
             cache_path.unlink(missing_ok=True)
 
+    def _require_nand_files_stopped(self) -> None:
+        backend = self.qemu_backend
+        if backend is not None and self._backend_snapshot(backend, refresh=False).get("running"):
+            raise RuntimeError(
+                "模拟器运行时不能操作 NAND 文件，请先安全关机"
+            )
+
     def nand_files_list(self, directory: object = "/") -> dict[str, object]:
         with self.nand_files_lock:
+            self._require_nand_files_stopped()
             result = list_fat_directory(self._nand_files_fat_snapshot(), directory)
         result["image"] = str(self._default_nand_image() or "")
         return result
 
     def nand_file_export(self, file_path: object) -> tuple[str, bytes]:
         with self.nand_files_lock:
+            self._require_nand_files_stopped()
             return read_fat_file(self._nand_files_fat_snapshot(), file_path)
 
     def _mutate_nand_files(self, operation, *, validator=None) -> dict[str, object]:
         with self.nand_files_lock:
-            backend = self.qemu_backend
-            if backend is not None:
-                self.stop()
+            self._require_nand_files_stopped()
             image = self._nand_files_image()
             self.nand_image_lease.acquire(image)
-            try:
-                mutate_nand_files(image, operation, validator=validator)
-                self._invalidate_nand_files_cache()
-            except Exception:
-                if backend is not None:
-                    self.reset()
-                raise
-            status = self.reset() if backend is not None else self.snapshot()
+            mutate_nand_files(image, operation, validator=validator)
+            self._invalidate_nand_files_cache()
+            status = self.snapshot()
         status["nand_files_changed"] = True
         return status
 

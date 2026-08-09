@@ -755,6 +755,20 @@ function setSidebarTab(tab) {
   filesTabEl.hidden = !filesActive;
   if (filesActive) loadNandFiles(currentNandDirectory).catch(showFileManagerError);
 }
+async function openNandFileManager() {
+  if (currentSidebarTab === 'files' || lifecycleRequestPending || nandFilesBusy) return;
+  let status = await api('/api/status');
+  if (status.running) {
+    const confirmed = window.confirm(
+      '管理 NAND 文件需要停止模拟器。停机后可以连续导入、删除、改名或新建文件夹，确定安全关机吗？'
+    );
+    if (!confirmed) return;
+    stopScheduledAudio();
+    status = await runLifecycleCommand('stop', '正在安全关机以管理 NAND 文件');
+    if (!status || status.running) return;
+  }
+  setSidebarTab('files');
+}
 function setSettingsTab(tab) {
   currentSettingsTab = ['keymap', 'touch', 'performance', 'power'].includes(tab) ? tab : 'keymap';
   const touchActive = currentSettingsTab === 'touch';
@@ -882,12 +896,11 @@ async function loadNandFiles(path = '/') {
 }
 async function runNandFileMutation(url, options, message) {
   if (nandFilesBusy) return;
-  setNandFilesBusy(true, `${message}，模拟器将重启...`);
+  setNandFilesBusy(true, `${message}...`);
   try {
     const status = await api(url, options);
     renderStatus(status);
     await loadNandFilesAfterMutation();
-    connectWs().catch(console.error);
   } catch (error) {
     showFileManagerError(error);
   } finally {
@@ -1133,6 +1146,7 @@ function lifecyclePresentation(s) {
   return {title:'模拟器异常退出', message:`QEMU 未正常运行${suffix}。${error}`, action:'重新启动', error:true};
 }
 function renderLifecycle(s) {
+  if (s.running && currentSidebarTab === 'files') setSidebarTab('status');
   const presentation = lifecyclePresentation(s);
   screenStopOverlayEl.hidden = !presentation;
   stopEl.disabled = !s.running || lifecycleRequestPending;
@@ -1585,6 +1599,7 @@ async function saveFeedbackBundle() {
 }
 async function runLifecycleCommand(op, pendingLabel, payload = {}) {
   if (lifecycleRequestPending) return;
+  let result = null;
   lifecycleRequestPending = true;
   setOperationStatus(pendingLabel);
   stopEl.disabled = true;
@@ -1594,11 +1609,12 @@ async function runLifecycleCommand(op, pendingLabel, payload = {}) {
   chipSelectEl.disabled = true;
   applyChipEl.disabled = true;
   try {
-    const status = await api('/api/command', jsonRequest({op, ...payload}));
-    if (status.error) throw new Error(status.error);
-    renderStatus(status);
-    setOperationStatus(status.lifecycle_notice || '');
+    result = await api('/api/command', jsonRequest({op, ...payload}));
+    if (result.error) throw new Error(result.error);
+    renderStatus(result);
+    setOperationStatus(result.lifecycle_notice || '');
   } catch (err) {
+    result = null;
     console.error(err);
     setOperationStatus(err?.message || String(err), true);
   } finally {
@@ -1606,9 +1622,11 @@ async function runLifecycleCommand(op, pendingLabel, payload = {}) {
     ensurePolling();
     try { renderStatus(await api('/api/status')); } catch (err) { console.error(err); }
   }
+  return result;
 }
 function requestStop() { return runLifecycleCommand('stop', '正在等待固件安全关机'); }
 async function restartEmulator() {
+  setSidebarTab('status');
   stopScheduledAudio();
   return runLifecycleCommand('reset', '正在安全关机并重新启动');
 }
@@ -1627,6 +1645,7 @@ chipSelectEl.onchange = () => {
 applyChipEl.onclick = () => {
   const chip = chipSelectEl.value;
   if (!chip || chip === currentChip) return;
+  setSidebarTab('status');
   stopScheduledAudio();
   runLifecycleCommand('set-chip', `正在切换到 ${chip.toUpperCase()} 并重新启动`, {chip});
 };
@@ -1670,7 +1689,10 @@ if (typeof mobileLayoutQuery.addEventListener === 'function') {
 }
 syncDrawerState();
 statusTabButtonEl.onclick = () => setSidebarTab('status');
-filesTabButtonEl.onclick = () => setSidebarTab('files');
+filesTabButtonEl.onclick = () => openNandFileManager().catch(error => {
+  console.error(error);
+  setOperationStatus(error?.message || String(error), true);
+});
 document.getElementById('fileUp').onclick = () => {
   loadNandFiles(parentNandDirectory(currentNandDirectory)).catch(showFileManagerError);
 };
